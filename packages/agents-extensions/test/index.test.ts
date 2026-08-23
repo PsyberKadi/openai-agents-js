@@ -1,7 +1,10 @@
 import { describe, test, expect, vi } from 'vitest';
 import { EventEmitter } from 'events';
 import { TwilioRealtimeTransportLayer } from '../src';
-import type { MessageEvent as NodeMessageEvent } from 'ws';
+import type {
+  MessageEvent as NodeMessageEvent,
+  WebSocket as NodeWebSocket,
+} from 'ws';
 
 vi.mock('ws', () => {
   class FakeWebSocket {
@@ -29,34 +32,35 @@ vi.mock('ws', () => {
 class FakeTwilioWebSocket extends EventEmitter {
   send = vi.fn();
   close = vi.fn();
+
+  addEventListener(
+    type: string,
+    listener: (evt: MessageEvent | NodeMessageEvent) => void,
+  ) {
+    this.on(type, (evt) => listener(type === 'message' ? { data: evt } : evt));
+  }
 }
 
-// @ts-expect-error - we're making the node event emitter compatible with the browser event emitter
-FakeTwilioWebSocket.prototype.addEventListener = function (
-  type: string,
-  listener: (evt: MessageEvent | NodeMessageEvent) => void,
-) {
-  this.on(type, (evt) => listener(type === 'message' ? { data: evt } : evt));
-};
+const asTwilioWebSocket = (
+  socket: FakeTwilioWebSocket,
+): WebSocket | NodeWebSocket => socket as unknown as WebSocket | NodeWebSocket;
 
 describe('TwilioRealtimeTransportLayer', () => {
   test('should be available', () => {
     const transport = new TwilioRealtimeTransportLayer({
-      twilioWebSocket: {} as any,
+      twilioWebSocket: asTwilioWebSocket(new FakeTwilioWebSocket()),
     });
     expect(transport).toBeDefined();
   });
 
-  test('malformed mark name does not produce NaN', async () => {
+  test('ignores malformed mark names', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const twilio = new FakeTwilioWebSocket();
     const transport = new TwilioRealtimeTransportLayer({
-      twilioWebSocket: twilio as any,
+      twilioWebSocket: asTwilioWebSocket(twilio),
     });
 
-    const sendEventSpy = vi.spyOn(
-      transport as TwilioRealtimeTransportLayer,
-      'sendEvent',
-    );
+    const sendEventSpy = vi.spyOn(transport as any, 'sendEvent');
 
     await transport.connect({ apiKey: 'ek_test' });
     sendEventSpy.mockClear();
@@ -65,41 +69,13 @@ describe('TwilioRealtimeTransportLayer', () => {
     twilio.emit('message', { toString: () => JSON.stringify(payload) });
 
     transport._interrupt(0, false);
-    // @ts-expect-error - we're testing protected fields
-    transport._audioLengthMs = 500;
-    transport._interrupt(0, true);
-
-    const call = sendEventSpy.mock.calls
-      .filter((c) => c[0]?.type === 'conversation.item.truncate')
-      .at(-1);
-    expect(call?.[0].audio_end_ms).toBe(50);
-  });
-
-  test('interrupt clamps overshoot and emits integer audio_end_ms', async () => {
-    const twilio = new FakeTwilioWebSocket();
-    const transport = new TwilioRealtimeTransportLayer({
-      twilioWebSocket: twilio as any,
-    });
-
-    const sendEventSpy = vi.spyOn(
-      transport as TwilioRealtimeTransportLayer,
-      'sendEvent',
+    expect(
+      sendEventSpy.mock.calls.filter(
+        (call) => (call[0] as any)?.type === 'conversation.item.truncate',
+      ),
+    ).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledWith(
+      'Invalid mark name received. Mark data is redacted.',
     );
-
-    await transport.connect({
-      apiKey: 'ek_test',
-      initialSessionConfig: { speed: 1.1 },
-    });
-    sendEventSpy.mockClear();
-
-    // @ts-expect-error - we're testing protected fields.
-    transport._audioLengthMs = 20;
-    transport._interrupt(0, true);
-
-    const call = sendEventSpy.mock.calls
-      .filter((c) => c[0]?.type === 'conversation.item.truncate')
-      .at(-1);
-    expect(call?.[0].audio_end_ms).toBe(20);
-    expect(Number.isInteger(call?.[0].audio_end_ms)).toBe(true);
   });
 });

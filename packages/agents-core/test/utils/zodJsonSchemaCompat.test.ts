@@ -1,7 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { z as zod3 } from 'zod/v3';
-import { zodJsonSchemaCompat } from '../../src/utils/zodJsonSchemaCompat';
+import {
+  zodJsonSchemaCompat,
+  zodJsonSchemaCompatForOpenAIStrict,
+} from '../../src/utils/zodJsonSchemaCompat';
 
 describe('utils/zodJsonSchemaCompat', () => {
   it('builds schema for basic object with optional property', () => {
@@ -133,6 +136,49 @@ describe('utils/zodJsonSchemaCompat', () => {
     });
   });
 
+  it('lowers closed object intersections for OpenAI strict schemas', () => {
+    const schema = z.object({
+      list: z.array(
+        z
+          .intersection(
+            z.object({ left: z.string() }).describe('Left.'),
+            z.object({ right: z.number() }).describe('Right.'),
+          )
+          .describe('Wrapper.'),
+      ),
+    });
+
+    const converted = zodJsonSchemaCompatForOpenAIStrict(schema);
+    expect(converted?.loweredObjectIntersection).toBe(true);
+    expect(converted?.schema.properties.list).toMatchObject({
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          left: { type: 'string' },
+          right: { type: 'number' },
+        },
+        required: ['left', 'right'],
+        additionalProperties: false,
+        description: 'Wrapper.',
+      },
+    });
+  });
+
+  it('rejects strict whole-schema fallbacks that would lose constraints', () => {
+    const schema = z.object({
+      combined: z.intersection(
+        z.object({ left: z.string().min(3) }),
+        z.object({ right: z.number() }),
+      ),
+      sibling: z.string().email(),
+    });
+
+    expect(() => zodJsonSchemaCompatForOpenAIStrict(schema)).toThrow(
+      'without losing constraints',
+    );
+  });
+
   it('converts nested record and array structures', () => {
     const schema = z.object({
       record: z.record(z.string(), z.number()),
@@ -226,6 +272,35 @@ describe('utils/zodJsonSchemaCompat', () => {
       type: ['string', 'number'],
       enum: ['label', 1, 'px'],
     });
+  });
+
+  it('fails the whole union when a member cannot be converted', () => {
+    // A silently dropped union member would emit a schema that forbids
+    // outputs the Zod schema accepts: a model constrained by the emitted
+    // schema could never produce the dropped variant.
+    const schema = z.object({
+      action: z.discriminatedUnion('type', [
+        z.object({
+          type: z.literal('replace'),
+          // z.preprocess is not convertible by this fallback converter.
+          id: z.preprocess(
+            (value) => (typeof value === 'string' ? value : null),
+            z.string().nullable(),
+          ),
+        }),
+        z.object({ type: z.literal('none'), reason: z.string() }),
+      ]),
+    });
+
+    expect(zodJsonSchemaCompat(schema)).toBeUndefined();
+  });
+
+  it('fails the whole tuple when a member cannot be converted', () => {
+    const schema = z.object({
+      pair: z.tuple([z.string(), z.date()]),
+    });
+
+    expect(zodJsonSchemaCompat(schema)).toBeUndefined();
   });
 
   it('returns undefined when schema shape cannot be introspected', () => {

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { UserError } from '../../errors';
-import { tool, type Tool } from '../../tool';
+import { tool, type Tool, type ToolCallDetails } from '../../tool';
 import type { ExecCommandArgs, WriteStdinArgs } from '../session';
 import { withSandboxSpan } from '../runtime/spans';
 import {
@@ -88,28 +88,34 @@ class ShellCapability extends Capability {
               'Maximum number of tokens to return. Excess output will be truncated.',
             ),
         }),
-        execute: async ({
-          cmd,
-          workdir,
-          shell,
-          login,
-          tty,
-          yield_time_ms,
-          max_output_tokens,
-        }: {
-          cmd: string;
-          workdir?: string;
-          shell?: string;
-          login: boolean;
-          tty: boolean;
-          yield_time_ms: number;
-          max_output_tokens?: number;
-        }): Promise<string> =>
-          await withSandboxSpan(
+        execute: async (
+          {
+            cmd,
+            workdir,
+            shell,
+            login,
+            tty,
+            yield_time_ms,
+            max_output_tokens,
+          }: {
+            cmd: string;
+            workdir?: string;
+            shell?: string;
+            login: boolean;
+            tty: boolean;
+            yield_time_ms: number;
+            max_output_tokens?: number;
+          },
+          _context,
+          details?: ToolCallDetails,
+        ): Promise<string> => {
+          const effectiveWorkdir =
+            this._workspaceScope?.anchor(workdir) ?? workdir;
+          return await withSandboxSpan(
             'sandbox.exec',
             {
               cmd,
-              workdir,
+              workdir: effectiveWorkdir,
               shell,
               login,
               tty,
@@ -118,7 +124,7 @@ class ShellCapability extends Capability {
             async () =>
               await session.execCommand!({
                 cmd,
-                workdir,
+                workdir: effectiveWorkdir,
                 shell,
                 login,
                 tty,
@@ -126,7 +132,9 @@ class ShellCapability extends Capability {
                 maxOutputTokens: max_output_tokens,
                 runAs: this._runAs,
               } satisfies ExecCommandArgs),
-          ),
+            this.tracingParent(details),
+          );
+        },
       }),
     ];
 
@@ -162,17 +170,21 @@ class ShellCapability extends Capability {
                 'Maximum number of tokens to return. Excess output will be truncated.',
               ),
           }),
-          execute: async ({
-            session_id,
-            chars,
-            yield_time_ms,
-            max_output_tokens,
-          }: {
-            session_id: number;
-            chars: string;
-            yield_time_ms: number;
-            max_output_tokens?: number;
-          }): Promise<string> =>
+          execute: async (
+            {
+              session_id,
+              chars,
+              yield_time_ms,
+              max_output_tokens,
+            }: {
+              session_id: number;
+              chars: string;
+              yield_time_ms: number;
+              max_output_tokens?: number;
+            },
+            _context,
+            details?: ToolCallDetails,
+          ): Promise<string> =>
             await withSandboxSpan(
               'sandbox.write_stdin',
               {
@@ -185,6 +197,7 @@ class ShellCapability extends Capability {
                   yieldTimeMs: yield_time_ms,
                   maxOutputTokens: max_output_tokens,
                 } satisfies WriteStdinArgs),
+              this.tracingParent(details),
             ),
         }),
       );

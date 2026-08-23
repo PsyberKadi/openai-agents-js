@@ -1,12 +1,13 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
   DockerSandboxClient,
   inContainerMountStrategy,
   Manifest,
+  NoopSnapshotSpec,
 } from '../../src/sandbox/local';
 
 const ONE_BY_ONE_PNG = Uint8Array.from(
@@ -28,14 +29,6 @@ describe('DockerSandboxClient', () => {
   let rootDir: string;
   const cleanupContainerIds = new Set<string>();
 
-  beforeAll(() => {
-    if (!dockerAvailable) {
-      console.warn(
-        'Skipping Docker sandbox tests because Docker is unavailable.',
-      );
-    }
-  });
-
   afterEach(async () => {
     for (const containerId of cleanupContainerIds) {
       removeDockerContainer(containerId);
@@ -47,8 +40,8 @@ describe('DockerSandboxClient', () => {
     }
   });
 
-  itIfDocker(
-    'applies in-container command mounts inside Docker',
+  it(
+    'rejects custom command mount credential exposure before Docker side effects',
     async () => {
       rootDir = await mkdtemp(
         join(tmpdir(), 'agents-core-docker-sandbox-test-'),
@@ -57,52 +50,24 @@ describe('DockerSandboxClient', () => {
         workspaceBaseDir: rootDir,
         image: DOCKER_TEST_IMAGE,
       });
-      const session = await client.create(
-        new Manifest({
-          entries: {
-            mounted: {
-              type: 'mount',
-              source: 'memory://initial',
-              mountStrategy: inContainerMountStrategy({
-                pattern: {
-                  type: 'fuse',
-                  command:
-                    'printf initial > "$OPENAI_AGENTS_MOUNT_PATH/marker.txt"',
-                },
-              }),
+      await expect(
+        client.create(
+          new Manifest({
+            entries: {
+              mounted: {
+                type: 'mount',
+                source: 'memory://initial',
+                mountStrategy: inContainerMountStrategy({
+                  pattern: {
+                    type: 'fuse',
+                    command: 'custom-mount',
+                  },
+                }),
+              },
             },
-          },
-        }),
-      );
-      cleanupContainerIds.add(session.state.containerId);
-
-      const initialOutput = await session.execCommand({
-        cmd: 'cat mounted/marker.txt',
-      });
-      expect(initialOutput).toContain('initial');
-
-      await session.applyManifest(
-        new Manifest({
-          entries: {
-            applied: {
-              type: 'mount',
-              source: 'memory://applied',
-              mountStrategy: inContainerMountStrategy({
-                pattern: {
-                  type: 'fuse',
-                  command:
-                    'printf applied > "$OPENAI_AGENTS_MOUNT_PATH/marker.txt"',
-                },
-              }),
-            },
-          },
-        }),
-      );
-
-      const appliedOutput = await session.execCommand({
-        cmd: 'cat applied/marker.txt',
-      });
-      expect(appliedOutput).toContain('applied');
+          }).withInContainerMountCredentialExposureAcknowledged('mounted'),
+        ),
+      ).rejects.toThrow(/SDK-supported strategy/u);
     },
     DOCKER_TEST_TIMEOUT_MS,
   );
@@ -242,6 +207,46 @@ describe('DockerSandboxClient', () => {
         baseDir: rootDir,
       });
       expect(restoredOutput).toContain('after');
+    },
+    DOCKER_TEST_TIMEOUT_MS,
+  );
+
+  itIfDocker(
+    'reuses a running container when bind mount authority is unchanged',
+    async () => {
+      rootDir = await mkdtemp(
+        join(tmpdir(), 'agents-core-docker-sandbox-test-'),
+      );
+      const sharedPath = join(rootDir, 'shared');
+      await mkdir(sharedPath);
+      const client = new DockerSandboxClient({
+        workspaceBaseDir: rootDir,
+        image: DOCKER_TEST_IMAGE,
+        snapshot: new NoopSnapshotSpec(),
+      });
+      const session = await client.create(
+        new Manifest({
+          extraPathGrants: [{ path: sharedPath, readOnly: true }],
+        }),
+      );
+      cleanupContainerIds.add(session.state.containerId);
+      await session.execCommand({
+        cmd: 'printf retained > /tmp/container-only-state',
+      });
+      const serialized = await client.serializeSessionState(session.state);
+
+      const resumed = await client.resume(
+        await client.deserializeSessionState(
+          JSON.parse(JSON.stringify(serialized)) as Record<string, unknown>,
+        ),
+      );
+
+      expect(resumed.state.containerId).toBe(session.state.containerId);
+      expect(
+        await resumed.execCommand({
+          cmd: 'cat /tmp/container-only-state',
+        }),
+      ).toContain('retained');
     },
     DOCKER_TEST_TIMEOUT_MS,
   );

@@ -15,9 +15,12 @@ import {
   assertSandboxEntryMetadataSupported,
   assertSandboxManifestMetadataSupported,
   assertRunAsUnsupported,
+  addPtyWebSocketListener,
   applyInlineManifestEntryToState,
+  appendPtyOutput,
   cloneManifestWithRoot,
   cloneManifestWithoutMountEntries,
+  createRunAsRemoteEditor,
   createPtyProcessEntry,
   deserializePersistedEnvironmentForRuntime,
   deserializeManifest,
@@ -34,25 +37,45 @@ import {
   mergeManifestDelta,
   mergeMaterializedEnvironment,
   normalizeGitRepository,
+  openPtyWebSocket,
+  parseExposedPortEndpoint,
   persistRemoteWorkspaceTar,
+  prepareManifestMounts,
   PtyProcessRegistry,
   RemoteSandboxEditor,
+  assertConfiguredExposedPort,
+  decodeNativeSnapshotRef,
+  encodeNativeSnapshotRef,
   deserializeRemoteSandboxSessionStateValues,
+  getCachedExposedPortEndpoint,
+  rehydrateRemoteSandboxSessionStateValues,
+  requireNativeSnapshotRef,
+  recordResolvedExposedPortEndpoint,
+  readRunAsRemoteFile,
+  resolveRemoteSandboxEffectivePath,
   resolveSandboxAbsolutePath,
+  resolveSandboxRelativePath,
   resolveSandboxWorkdir,
+  runAsRemoteDirectoryExists,
+  runAsRemotePathExists,
+  sandboxUserShellCommand,
   serializeRemoteSandboxSessionState,
   serializeRuntimeEnvironmentForPersistence,
   serializeManifestRecord,
+  shellCommandForPty,
   sniffImageMediaType,
   toUint8Array,
   truncateOutput,
   validateRemoteSandboxPath,
   validateRemoteSandboxPathForManifest,
   validateWorkspaceTarArchive,
+  watchPtyProcess,
   withSandboxSpan,
+  writePtyStdin,
   writeRunAsRemoteText,
   workspaceTarExcludeArgs,
 } from '../../src/sandbox/shared';
+import { collectPtyOutput } from '../../src/sandbox/shared/pty';
 import {
   applyLocalSourceManifestEntryToState,
   applyLocalSourceManifestToState,
@@ -62,13 +85,26 @@ import {
 import {
   isRcloneCloudBucketMountEntry,
   mountRcloneCloudBucket,
+  rcloneArchiveArch,
+  rcloneInstallCommand,
   unmountRcloneMount,
 } from '../../src/sandbox/shared/inContainerMounts';
-import { makeTarArchive } from './tarFixture';
+import { makePaxRecord, makeTarArchive } from './tarFixture';
 import {
+  ONE_BY_ONE_GIF,
+  ONE_BY_ONE_JPEG,
+  ONE_BY_ONE_PNG,
+  ONE_BY_ONE_WEBP,
+} from './imageFixture';
+import {
+  EnvValueReference,
   Manifest,
   SandboxArchiveError,
+  SandboxConfigurationError,
+  SandboxMountError,
   SandboxPathResolutionError,
+  SandboxProviderError,
+  SandboxSnapshotError,
   SandboxUnsupportedFeatureError,
   boxMount,
   file,
@@ -76,6 +112,8 @@ import {
   localDir,
   localFile,
   mount,
+  registerEnvValueReference,
+  type SandboxSessionState,
   type AzureBlobMount,
   type GCSMount,
   type R2Mount,
@@ -93,6 +131,7 @@ const execFileAsync = promisify(execFile);
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   await Promise.all(
     tempDirs
       .splice(0)
@@ -114,7 +153,575 @@ function onlyMountWrite(writes: Map<string, string>): string {
   return [...writes.values()][0]!;
 }
 
+describe('exposed port helpers', () => {
+  test('requires configured ports unless on-demand resolution is allowed', () => {
+    expect(
+      assertConfiguredExposedPort({
+        providerName: 'TestProvider',
+        port: 3000,
+        configuredPorts: [3000],
+      }),
+    ).toBe(3000);
+    expect(
+      assertConfiguredExposedPort({
+        providerName: 'TestProvider',
+        port: 8080,
+        allowOnDemand: true,
+      }),
+    ).toBe(8080);
+
+    expect(() =>
+      assertConfiguredExposedPort({
+        providerName: 'TestProvider',
+        port: 4000,
+        configuredPorts: [3000],
+      }),
+    ).toThrow(SandboxConfigurationError);
+
+    try {
+      assertConfiguredExposedPort({
+        providerName: 'TestProvider',
+        port: 4000,
+        configuredPorts: [3000],
+      });
+      throw new Error('Expected assertConfiguredExposedPort to throw.');
+    } catch (error) {
+      expect(error).toBeInstanceOf(SandboxConfigurationError);
+      expect((error as SandboxConfigurationError).details).toEqual({
+        provider: 'TestProvider',
+        port: 4000,
+        configuredPorts: [3000],
+      });
+    }
+  });
+
+  test('parses exposed port endpoints with schemes, inferred TLS, and merged queries', () => {
+    expect(
+      parseExposedPortEndpoint(
+        ' https://preview.example.test:8443/app?token=a ',
+        {
+          providerName: 'TestProvider',
+          source: 'preview URL',
+          query: 'workspace=abc',
+        },
+      ),
+    ).toEqual({
+      host: 'preview.example.test',
+      port: 8443,
+      tls: true,
+      query: 'token=a&workspace=abc',
+      url: 'https://preview.example.test:8443/app?token=a',
+    });
+
+    expect(
+      parseExposedPortEndpoint('preview.example.test', {
+        providerName: 'TestProvider',
+        source: 'preview host',
+      }),
+    ).toEqual({
+      host: 'preview.example.test',
+      port: 443,
+      tls: true,
+      query: '',
+      url: undefined,
+    });
+
+    expect(
+      parseExposedPortEndpoint('preview.example.test:8080/path?token=a', {
+        providerName: 'TestProvider',
+        source: 'preview host',
+        query: 'workspace=abc',
+      }),
+    ).toEqual({
+      host: 'preview.example.test',
+      port: 8080,
+      tls: false,
+      query: 'token=a&workspace=abc',
+      url: undefined,
+    });
+  });
+
+  test('reports provider errors for invalid exposed port endpoint values', () => {
+    for (const [value, details] of [
+      [
+        '   ',
+        {
+          provider: 'TestProvider',
+          source: 'preview URL',
+        },
+      ],
+      [
+        'http://[::1',
+        {
+          provider: 'TestProvider',
+          source: 'preview URL',
+          value: 'http://[::1',
+          cause: expect.any(String),
+        },
+      ],
+      [
+        'file:///tmp/preview',
+        {
+          provider: 'TestProvider',
+          source: 'preview URL',
+          value: 'file:///tmp/preview',
+        },
+      ],
+    ] as const) {
+      try {
+        parseExposedPortEndpoint(value, {
+          providerName: 'TestProvider',
+          source: 'preview URL',
+        });
+        throw new Error('Expected parseExposedPortEndpoint to throw.');
+      } catch (error) {
+        expect(error).toBeInstanceOf(SandboxProviderError);
+        expect((error as SandboxProviderError).details).toMatchObject(details);
+      }
+    }
+  });
+
+  test('records and reads cached exposed port endpoints', () => {
+    const state = {} as SandboxSessionState;
+    const endpoint = {
+      host: 'preview.example.test',
+      port: 443,
+      tls: true,
+      query: 'token=a',
+      url: 'https://preview.example.test?token=a',
+    };
+
+    expect(getCachedExposedPortEndpoint(state, 3000)).toBeUndefined();
+    expect(recordResolvedExposedPortEndpoint(state, 3000, endpoint)).toEqual(
+      endpoint,
+    );
+    expect(getCachedExposedPortEndpoint(state, 3000)).toEqual(endpoint);
+    expect(state.exposedPorts).toEqual({
+      '3000': endpoint,
+    });
+  });
+});
+
 describe('remote sandbox path helpers', () => {
+  test.each([
+    ['x86_64', 'amd64'],
+    ['amd64', 'amd64'],
+    ['i386', '386'],
+    ['i686', '386'],
+    ['aarch64', 'arm64'],
+    ['arm64', 'arm64'],
+    ['armv7l', 'arm-v7'],
+    ['armv6l', 'arm-v6'],
+    ['armv5l', 'arm'],
+  ])('maps rclone architecture %s to %s', (machine, expected) => {
+    expect(rcloneArchiveArch(machine)).toBe(expected);
+  });
+
+  test('rejects unsupported rclone architectures', () => {
+    expect(rcloneArchiveArch('mips64')).toBeUndefined();
+  });
+
+  test('pins and verifies the rclone archive before atomic installation', () => {
+    const command = rcloneInstallCommand('amd64');
+
+    expect(command).toContain(
+      'https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip',
+    );
+    expect(command).toContain(
+      'fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d',
+    );
+    expect(command).toContain('sha256sum --check --strict -');
+    expect(command).toContain('mktemp /usr/local/bin/.rclone.XXXXXX');
+    expect(command).toContain('mv -f "$target_tmp" /usr/local/bin/rclone');
+    expect(command).not.toContain('https://rclone.org/install.sh');
+  });
+
+  test('reports rclone archive checksum failures', async () => {
+    const entry: S3Mount = {
+      type: 's3_mount',
+      bucket: 'agent-logs',
+      mountStrategy: {
+        type: 'test_cloud_bucket',
+        pattern: {
+          type: 'rclone',
+          mode: 'nfs',
+          remoteName: 'logs',
+        },
+      },
+    };
+
+    let caught: unknown;
+    try {
+      await mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        pattern: {
+          type: 'rclone',
+          mode: 'nfs',
+          remoteName: 'logs',
+        },
+        installRcloneViaScript: true,
+        runCommand: async (command) => {
+          if (
+            command ===
+            'command -v rclone >/dev/null 2>&1 || test -x /usr/local/bin/rclone'
+          ) {
+            return { status: 1 };
+          }
+          if (command === 'uname -m') {
+            return { status: 0, stdout: 'x86_64\n' };
+          }
+          if (command.includes('sha256sum --check --strict -')) {
+            return {
+              status: 86,
+              stdout: 'MOUNT_SECRET_SENTINEL',
+              stderr: 'MOUNT_SECRET_SENTINEL',
+            };
+          }
+          return { status: 0 };
+        },
+        writeFile: recordMountWrite(new Map<string, string>()),
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(SandboxMountError);
+    expect((caught as SandboxMountError).message).toContain(
+      'checksum verification failed',
+    );
+    expect((caught as SandboxMountError).details).toMatchObject({
+      provider: 'test',
+      package: 'rclone',
+      version: '1.74.4',
+      architecture: 'amd64',
+      status: 86,
+    });
+    expect(JSON.stringify(caught)).not.toContain('MOUNT_SECRET_SENTINEL');
+  });
+
+  test('redacts unsupported rclone architecture command output', async () => {
+    const entry: S3Mount = {
+      type: 's3_mount',
+      bucket: 'agent-logs',
+      mountStrategy: { type: 'test_cloud_bucket' },
+    };
+
+    const error = await mountRcloneCloudBucket({
+      providerName: 'TestSandboxClient',
+      providerId: 'test',
+      strategyType: 'test_cloud_bucket',
+      entry,
+      mountPath: '/workspace/logs',
+      installRcloneViaScript: true,
+      runCommand: async (command) => {
+        if (command.includes('command -v rclone')) {
+          return { status: 1 };
+        }
+        if (command === 'uname -m') {
+          return { status: 0, stdout: 'MOUNT_SECRET_SENTINEL' };
+        }
+        return { status: 0 };
+      },
+      writeFile: recordMountWrite(new Map<string, string>()),
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(SandboxMountError);
+    expect((error as SandboxMountError).details).toMatchObject({
+      architecture: 'unsupported',
+      status: 0,
+    });
+    expect(JSON.stringify(error)).not.toContain('MOUNT_SECRET_SENTINEL');
+  });
+
+  test('removes a credential config when writing it fails', async () => {
+    const commands: string[] = [];
+    const entry: S3Mount = {
+      type: 's3_mount',
+      bucket: 'agent-logs',
+      accessKeyId: 'access-key',
+      secretAccessKey: 'secret-key',
+      mountStrategy: { type: 'test_cloud_bucket' },
+    };
+
+    await expect(
+      mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        runCommand: async (command) => {
+          commands.push(command);
+          return { status: 0, stdout: '' };
+        },
+        writeFile: async () => {
+          throw new Error('write failed');
+        },
+      }),
+    ).rejects.toThrow(/failed while trying to write rclone config/u);
+
+    expect(commands.at(-1)).toMatch(
+      /^rm -f -- '\/tmp\/openai-agents-test-.+\.conf'$/u,
+    );
+  });
+
+  test.each(['rejects', 'returns nonzero'] as const)(
+    'rejects a successful rclone mount when config cleanup %s',
+    async (cleanupFailure) => {
+      const commands: string[] = [];
+      const entry: S3Mount = {
+        type: 's3_mount',
+        bucket: 'agent-logs',
+        accessKeyId: 'access-key',
+        secretAccessKey: 'secret-key',
+        mountStrategy: { type: 'test_cloud_bucket' },
+      };
+
+      const error = await mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        runCommand: async (command) => {
+          commands.push(command);
+          if (
+            /^rm -f -- '\/tmp\/openai-agents-test-.+\.conf'$/u.test(command)
+          ) {
+            if (cleanupFailure === 'rejects') {
+              throw new Error('MOUNT_SECRET_SENTINEL');
+            }
+            return { status: 1, stderr: 'MOUNT_SECRET_SENTINEL' };
+          }
+          return { status: 0, stdout: '' };
+        },
+        writeFile: recordMountWrite(new Map<string, string>()),
+      }).then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+
+      expect(error).toBeInstanceOf(SandboxMountError);
+      expect(String(error)).toContain('remove rclone config');
+      expect(JSON.stringify(error)).not.toContain('MOUNT_SECRET_SENTINEL');
+      expect(
+        commands.some(
+          (command) =>
+            command.includes("'rclone' 'mount'") ||
+            command.includes('rclone mount'),
+        ),
+      ).toBe(true);
+    },
+  );
+
+  test('reports both rclone mount and credential cleanup failures safely', async () => {
+    const entry: S3Mount = {
+      type: 's3_mount',
+      bucket: 'agent-logs',
+      accessKeyId: 'access-key',
+      secretAccessKey: 'secret-key',
+      mountStrategy: { type: 'test_cloud_bucket' },
+    };
+
+    const error = await mountRcloneCloudBucket({
+      providerName: 'TestSandboxClient',
+      providerId: 'test',
+      strategyType: 'test_cloud_bucket',
+      entry,
+      mountPath: '/workspace/logs',
+      runCommand: async (command) => {
+        if (/^rm -f -- '\/tmp\/openai-agents-test-.+\.conf'$/u.test(command)) {
+          return { status: 1, stderr: 'CLEANUP_SECRET_SENTINEL' };
+        }
+        if (
+          command.includes("'rclone' 'mount'") ||
+          command.includes('rclone mount')
+        ) {
+          return { status: 1, stderr: 'MOUNT_SECRET_SENTINEL' };
+        }
+        return { status: 0, stdout: '' };
+      },
+      writeFile: recordMountWrite(new Map<string, string>()),
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(SandboxMountError);
+    expect(String(error)).toContain(
+      'cloud bucket mount failed and credential cleanup could not complete',
+    );
+    expect((error as SandboxMountError).details).toMatchObject({
+      provider: 'test',
+      cleanupFailed: true,
+    });
+    expect(JSON.stringify(error)).not.toContain('MOUNT_SECRET_SENTINEL');
+    expect(JSON.stringify(error)).not.toContain('CLEANUP_SECRET_SENTINEL');
+  });
+
+  test('rejects symlink-aliased mount credentials during remote preflight', async () => {
+    const manifest = new Manifest({
+      entries: {
+        'secret.conf': {
+          type: 'file',
+          content: '[custom]\npassword = serialized\n',
+        },
+        data: {
+          type: 's3_mount',
+          bucket: 'agent-logs',
+          mountStrategy: {
+            type: 'daytona_cloud_bucket',
+            pattern: {
+              type: 'rclone',
+              remoteName: 'custom',
+              configFilePath: '/tmp/config',
+            },
+          },
+        },
+      },
+    }).withInContainerMountBroadCredentialExposureAcknowledged('data');
+
+    await expect(
+      prepareManifestMounts(manifest, async (path) => `/workspace/${path}`, {
+        credentialBoundaryManifest: manifest,
+        resolveCredentialPath: async () => '/workspace/secret.conf',
+      }),
+    ).rejects.toThrow(/resolve to a serialized manifest entry/u);
+  });
+
+  test('revalidates credential file paths before mount materialization', async () => {
+    const materializeMount = vi.fn();
+    let credentialPathResolutions = 0;
+    const manifest = new Manifest({
+      entries: {
+        data: {
+          type: 's3_mount',
+          bucket: 'agent-logs',
+          mountStrategy: {
+            type: 'daytona_cloud_bucket',
+            pattern: {
+              type: 'rclone',
+              remoteName: 'custom',
+              configFilePath: '/run/rclone.conf',
+            },
+          },
+        },
+      },
+    }).withInContainerMountBroadCredentialExposureAcknowledged('data');
+
+    await expect(
+      materializeInlineManifest(
+        { mkdir: vi.fn(), writeFile: vi.fn() },
+        manifest,
+        'test',
+        async (path) => `/workspace/${path}`,
+        {
+          materializeMount,
+          resolveCredentialPath: async () =>
+            credentialPathResolutions++ === 0
+              ? '/run/rclone-a.conf'
+              : '/run/rclone-b.conf',
+        },
+      ),
+    ).rejects.toThrow(/mount authority changed after validation/u);
+
+    expect(credentialPathResolutions).toBe(2);
+    expect(materializeMount).not.toHaveBeenCalled();
+  });
+
+  test('revalidates credential file authority immediately before reading it', async () => {
+    const commands: string[] = [];
+    const writeFile = vi.fn();
+    const entry: S3Mount = {
+      type: 's3_mount',
+      bucket: 'agent-logs',
+      mountStrategy: {
+        type: 'test_cloud_bucket',
+        pattern: {
+          type: 'rclone',
+          remoteName: 'custom',
+          configFilePath: '/run/rclone.conf',
+        },
+      },
+    };
+
+    await expect(
+      mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        runCommand: async (command) => {
+          commands.push(command);
+          return { status: 0, stdout: '' };
+        },
+        writeFile,
+        revalidateMountAuthority: async () => {
+          throw new SandboxMountError(
+            'Sandbox mount authority changed after validation.',
+          );
+        },
+      }),
+    ).rejects.toThrow(/mount authority changed after validation/u);
+
+    expect(commands).not.toContain("cat -- '/run/rclone.conf'");
+    expect(writeFile).not.toHaveBeenCalled();
+  });
+
+  test('revalidates mount authority immediately before writing rclone credentials', async () => {
+    const commands: string[] = [];
+    const writeFile = vi.fn();
+    let revalidationCount = 0;
+    const entry: S3Mount = {
+      type: 's3_mount',
+      bucket: 'agent-logs',
+      accessKeyId: 'access-key',
+      secretAccessKey: 'secret-key',
+      mountStrategy: { type: 'test_cloud_bucket' },
+    };
+
+    await expect(
+      mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        runCommand: async (command) => {
+          commands.push(command);
+          return { status: 0, stdout: '' };
+        },
+        writeFile,
+        revalidateMountAuthority: async () => {
+          revalidationCount += 1;
+          if (revalidationCount === 2) {
+            throw new SandboxMountError(
+              'Sandbox mount authority changed after validation.',
+            );
+          }
+        },
+      }),
+    ).rejects.toThrow(/mount authority changed after validation/u);
+
+    expect(revalidationCount).toBe(2);
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(
+      commands.some(
+        (command) =>
+          command.includes("'rclone' 'mount'") ||
+          command.includes('rclone mount'),
+      ),
+    ).toBe(false);
+  });
+
   test('mounts Box entries through the shared rclone helper', async () => {
     const commands: string[] = [];
     const writes = new Map<string, string>();
@@ -202,6 +809,200 @@ describe('remote sandbox path helpers', () => {
     expect(mountCommand).not.toContain("'--read-only'");
   });
 
+  test('rejects unsupported rclone mount strategies and patterns', async () => {
+    const entry: S3Mount = {
+      type: 's3_mount',
+      bucket: 'agent-logs',
+      mountStrategy: {
+        type: 'other_cloud_bucket',
+        pattern: {
+          type: 'rclone',
+          remoteName: 'logs',
+        },
+      },
+    };
+
+    expect(isRcloneCloudBucketMountEntry(file({ content: 'x' }), 'test')).toBe(
+      false,
+    );
+    expect(isRcloneCloudBucketMountEntry(entry, 'test_cloud_bucket')).toBe(
+      false,
+    );
+
+    await expect(
+      mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        runCommand: async () => ({ status: 0, stdout: '' }),
+        writeFile: recordMountWrite(new Map<string, string>()),
+      }),
+    ).rejects.toThrow(/only supports test_cloud_bucket mount entries/);
+
+    await expect(
+      mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'other_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        pattern: { type: 'bind' } as any,
+        runCommand: async () => ({ status: 0, stdout: '' }),
+        writeFile: recordMountWrite(new Map<string, string>()),
+      }),
+    ).rejects.toThrow(/require a rclone mount pattern/);
+
+    await expect(
+      mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'other_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        pattern: { type: 'rclone', mode: 'sshfs' } as any,
+        runCommand: async () => ({ status: 0, stdout: '' }),
+        writeFile: recordMountWrite(new Map<string, string>()),
+      }),
+    ).rejects.toThrow(/support rclone fuse and nfs modes only/);
+  });
+
+  test('rejects invalid rclone remote names and missing config file sections', async () => {
+    const entry: S3Mount = {
+      type: 's3_mount',
+      bucket: 'agent-logs',
+      mountStrategy: {
+        type: 'test_cloud_bucket',
+        pattern: {
+          type: 'rclone',
+          remoteName: 'logs',
+        },
+      },
+    };
+
+    await expect(
+      mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        pattern: { type: 'rclone', remoteName: 'bad remote!' },
+        runCommand: async () => ({ status: 0, stdout: '' }),
+        writeFile: recordMountWrite(new Map<string, string>()),
+      }),
+    ).rejects.toThrow(/remoteName to contain only/);
+
+    const configReadError = await mountRcloneCloudBucket({
+      providerName: 'TestSandboxClient',
+      providerId: 'test',
+      strategyType: 'test_cloud_bucket',
+      entry,
+      mountPath: '/workspace/logs',
+      pattern: {
+        type: 'rclone',
+        remoteName: 'logs',
+        configFilePath: '/workspace/rclone.conf',
+      },
+      runCommand: async (command) => {
+        if (command === "cat -- '/workspace/rclone.conf'") {
+          return { status: 1, stderr: 'MOUNT_SECRET_SENTINEL' };
+        }
+        return { status: 0, stdout: '' };
+      },
+      writeFile: recordMountWrite(new Map<string, string>()),
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+    expect(configReadError).toBeInstanceOf(SandboxMountError);
+    expect(String(configReadError)).toMatch(
+      /failed to read rclone config file/u,
+    );
+    expect((configReadError as SandboxMountError).details).toMatchObject({
+      status: 1,
+    });
+    expect(JSON.stringify(configReadError)).not.toContain(
+      'MOUNT_SECRET_SENTINEL',
+    );
+    expect(JSON.stringify(configReadError)).not.toContain(
+      '/workspace/rclone.conf',
+    );
+
+    const thrownCommandError = await mountRcloneCloudBucket({
+      providerName: 'TestSandboxClient',
+      providerId: 'test',
+      strategyType: 'test_cloud_bucket',
+      entry,
+      mountPath: '/workspace/logs',
+      pattern: { type: 'rclone', remoteName: 'logs' },
+      runCommand: async () => {
+        throw new Error('MOUNT_SECRET_SENTINEL');
+      },
+      writeFile: recordMountWrite(new Map<string, string>()),
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+    expect(thrownCommandError).toBeInstanceOf(SandboxMountError);
+    expect((thrownCommandError as SandboxMountError).details).toMatchObject({
+      provider: 'test',
+      operation: 'check /dev/fuse',
+    });
+    expect(JSON.stringify(thrownCommandError)).not.toContain(
+      'MOUNT_SECRET_SENTINEL',
+    );
+
+    await expect(
+      mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        pattern: {
+          type: 'rclone',
+          remoteName: 'logs',
+          configFilePath: '/workspace/rclone.conf',
+        },
+        runCommand: async (command) => {
+          if (command === "cat -- '/workspace/rclone.conf'") {
+            return { status: 0, stdout: '[other]\ntype = s3\n' };
+          }
+          return { status: 0, stdout: '' };
+        },
+        writeFile: recordMountWrite(new Map<string, string>()),
+      }),
+    ).rejects.toThrow(/missing the required remote section/);
+  });
+
+  test('rejects Azure Blob rclone mounts without an account name', async () => {
+    const entry: AzureBlobMount = {
+      type: 'azure_blob_mount',
+      container: 'container-name',
+      mountStrategy: {
+        type: 'test_cloud_bucket',
+        pattern: {
+          type: 'rclone',
+          remoteName: 'azure',
+        },
+      },
+    } as any;
+
+    await expect(
+      mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/azure',
+        runCommand: async () => ({ status: 0, stdout: '' }),
+        writeFile: recordMountWrite(new Map<string, string>()),
+      }),
+    ).rejects.toThrow(/Azure Blob mounts require account or accountName/);
+  });
+
   test('validates rclone NFS pidfiles before cleanup kill commands', async () => {
     const commands: string[] = [];
 
@@ -209,6 +1010,9 @@ describe('remote sandbox path helpers', () => {
       providerName: 'TestSandboxClient',
       providerId: 'test',
       mountPath: '/workspace/data',
+      handle: {
+        nfsPidPath: '/tmp/openai-agents-test-logs.nfs.pid',
+      },
       runCommand: async (command) => {
         commands.push(command);
         return { status: 0 };
@@ -217,14 +1021,67 @@ describe('remote sandbox path helpers', () => {
 
     expect(commands).toHaveLength(1);
     expect(commands[0]).toContain('openai_agents_kill_pidfile()');
-    expect(commands[0]).toContain("''|0|*[!0-9]*) return 0");
+    expect(commands[0]).toContain('require_termination=$1');
     expect(commands[0]).toContain(
       "cmdline=$(tr '\\000' ' ' < \"/proc/$pid/cmdline\"",
     );
     expect(commands[0]).toContain(
-      "openai_agents_kill_pidfile $pidfile 'rclone' 'serve' 'nfs'",
+      "openai_agents_kill_pidfile 1 '/tmp/openai-agents-test-logs.nfs.pid' 'rclone' 'serve' 'nfs'",
     );
+    expect(commands[0]).not.toContain('*.nfs.pid');
+    expect(commands[0]).toContain('helper_status=$?');
     expect(commands[0]).not.toContain('kill "$(cat "$pidfile")"');
+  });
+
+  test('preserves an unsuccessful rclone unmount status after pid cleanup', async () => {
+    let command = '';
+
+    await expect(
+      unmountRcloneMount({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        mountPath: '/workspace/data',
+        runCommand: async (receivedCommand) => {
+          command = receivedCommand;
+          return { status: 32, stderr: 'target is busy' };
+        },
+      }),
+    ).rejects.toThrow(/failed while trying to unmount cloud bucket/u);
+
+    expect(command).toContain('unmount_status=$?');
+    expect(command).toContain('helper_status=0');
+    expect(command).toContain(
+      '[ "$unmount_status" -eq 0 ] && [ "$helper_status" -eq 0 ]',
+    );
+    expect(command).not.toContain(
+      "umount -l '/workspace/data' >/dev/null 2>&1 || true",
+    );
+  });
+
+  test('rejects rclone replacement cleanup when its tracked NFS helper is not terminated', async () => {
+    let command = '';
+
+    await expect(
+      unmountRcloneMount({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        mountPath: '/workspace/data',
+        handle: {
+          nfsPidPath: '/tmp/openai-agents-test-logs.nfs.pid',
+        },
+        runCommand: async (receivedCommand) => {
+          command = receivedCommand;
+          return { status: 1 };
+        },
+      }),
+    ).rejects.toThrow(/failed while trying to unmount cloud bucket/u);
+
+    expect(command).toContain(
+      "openai_agents_kill_pidfile 1 '/tmp/openai-agents-test-logs.nfs.pid'",
+    );
+    expect(command).toContain('return 1');
+    expect(command).toContain('sleep 0.1');
+    expect(command).toContain('helper_status=$?');
   });
 
   test('passes S3 provider through the shared rclone helper', async () => {
@@ -264,7 +1121,7 @@ describe('remote sandbox path helpers', () => {
     expect(configText).toContain('provider = Minio');
   });
 
-  test('falls back to S3 env auth for partial credentials in the shared rclone helper', async () => {
+  test('rejects partial S3 credentials before shared rclone side effects', async () => {
     const commands: string[] = [];
     const writes = new Map<string, string>();
     const entry: S3Mount = {
@@ -280,28 +1137,26 @@ describe('remote sandbox path helpers', () => {
       },
     };
 
-    await mountRcloneCloudBucket({
-      providerName: 'TestSandboxClient',
-      providerId: 'test',
-      strategyType: 'test_cloud_bucket',
-      entry,
-      mountPath: '/workspace/logs',
-      runCommand: async (command) => {
-        commands.push(command);
-        if (command === 'id -u; id -g') {
-          return { status: 0, stdout: '1000\n1000\n' };
-        }
-        return { status: 0, stdout: '' };
-      },
-      writeFile: recordMountWrite(writes),
-    });
+    await expect(
+      mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        runCommand: async (command) => {
+          commands.push(command);
+          return { status: 0, stdout: '' };
+        },
+        writeFile: recordMountWrite(writes),
+      }),
+    ).rejects.toThrow(/both accessKeyId and secretAccessKey/u);
 
-    const configText = onlyMountWrite(writes);
-    expect(configText).toContain('env_auth = true');
-    expect(configText).not.toContain('access_key_id = access-key');
+    expect(commands).toEqual([]);
+    expect(writes.size).toBe(0);
   });
 
-  test('falls back to native GCS rclone config for partial HMAC credentials in the shared helper', async () => {
+  test('rejects partial GCS HMAC credentials before shared rclone side effects', async () => {
     const commands: string[] = [];
     const writes = new Map<string, string>();
     const entry: GCSMount = {
@@ -317,26 +1172,68 @@ describe('remote sandbox path helpers', () => {
       },
     };
 
-    await mountRcloneCloudBucket({
-      providerName: 'TestSandboxClient',
-      providerId: 'test',
-      strategyType: 'test_cloud_bucket',
-      entry,
-      mountPath: '/workspace/logs',
-      runCommand: async (command) => {
-        commands.push(command);
-        if (command === 'id -u; id -g') {
-          return { status: 0, stdout: '1000\n1000\n' };
-        }
-        return { status: 0, stdout: '' };
-      },
-      writeFile: recordMountWrite(writes),
-    });
+    await expect(
+      mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        runCommand: async (command) => {
+          commands.push(command);
+          return { status: 0, stdout: '' };
+        },
+        writeFile: recordMountWrite(writes),
+      }),
+    ).rejects.toThrow(/both accessId and secretAccessKey/u);
 
-    const configText = onlyMountWrite(writes);
-    expect(configText).toContain('type = google cloud storage');
-    expect(configText).toContain('env_auth = true');
-    expect(configText).not.toContain('access_key_id = gcs-access-id');
+    expect(commands).toEqual([]);
+    expect(writes.size).toBe(0);
+  });
+
+  test('enables ambient credential providers only after trusted opt-in', async () => {
+    const entries: Array<S3Mount | GCSMount | AzureBlobMount> = [
+      {
+        type: 's3_mount',
+        bucket: 'agent-logs',
+        mountStrategy: { type: 'test_cloud_bucket' },
+      },
+      {
+        type: 'gcs_mount',
+        bucket: 'agent-logs',
+        mountStrategy: { type: 'test_cloud_bucket' },
+      },
+      {
+        type: 'azure_blob_mount',
+        account: 'account-name',
+        container: 'agent-logs',
+        mountStrategy: { type: 'test_cloud_bucket' },
+      },
+    ];
+
+    for (const entry of entries) {
+      const writes = new Map<string, string>();
+      await mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        allowAmbientCredentials: true,
+        runCommand: async (command) =>
+          command === 'id -u; id -g'
+            ? { status: 0, stdout: '1000\n1000\n' }
+            : { status: 0, stdout: '' },
+        writeFile: recordMountWrite(writes),
+      });
+      const configText = onlyMountWrite(writes);
+      if (entry.type === 'azure_blob_mount') {
+        expect(configText).toContain('use_msi = true');
+      } else {
+        expect(configText).toContain('env_auth = true');
+      }
+      expect(configText).not.toContain('anonymous = true');
+    }
   });
 
   test('rejects shared R2 rclone mounts without accountId even with customDomain', async () => {
@@ -403,6 +1300,8 @@ describe('remote sandbox path helpers', () => {
     expect(configText).toContain('type = azureblob');
     expect(configText).toContain('account = account-name');
     expect(configText).toContain('endpoint = https://blob.alias.example.test');
+    expect(configText).toContain('use_msi = false');
+    expect(configText).toContain('env_auth = false');
   });
 
   test('validates rclone NFS pidfiles during failed mount cleanup', async () => {
@@ -420,30 +1319,43 @@ describe('remote sandbox path helpers', () => {
       },
     };
 
-    await expect(
-      mountRcloneCloudBucket({
-        providerName: 'TestSandboxClient',
-        providerId: 'test',
-        strategyType: 'test_cloud_bucket',
-        entry,
-        mountPath: '/workspace/logs',
-        pattern: {
-          type: 'rclone',
-          mode: 'nfs',
-          remote: 'logs',
-        },
-        runCommand: async (command) => {
-          commands.push(command);
-          if (command.includes('mount -v -t nfs')) {
-            return { status: 1, stderr: 'mount failed' };
-          }
+    const error = await mountRcloneCloudBucket({
+      providerName: 'TestSandboxClient',
+      providerId: 'test',
+      strategyType: 'test_cloud_bucket',
+      entry,
+      mountPath: '/workspace/logs',
+      pattern: {
+        type: 'rclone',
+        mode: 'nfs',
+        remote: 'logs',
+      },
+      runCommand: async (command) => {
+        commands.push(command);
+        if (
+          command ===
+          'command -v rclone >/dev/null 2>&1 || test -x /usr/local/bin/rclone'
+        ) {
           return { status: 0, stdout: '' };
-        },
-        writeFile: recordMountWrite(new Map<string, string>()),
-      }),
-    ).rejects.toThrow(
+        }
+        if (command === 'command -v rclone >/dev/null 2>&1') {
+          return { status: 1, stdout: '' };
+        }
+        if (command.includes('mount -v -t nfs')) {
+          return { status: 1, stderr: 'MOUNT_SECRET_SENTINEL' };
+        }
+        return { status: 0, stdout: '' };
+      },
+      writeFile: recordMountWrite(new Map<string, string>()),
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).toContain(
       'TestSandboxClient cloud bucket mount failed while trying to mount rclone nfs client.',
     );
+    expect(JSON.stringify(error)).not.toContain('MOUNT_SECRET_SENTINEL');
 
     const cleanupCommand = commands.find(
       (command) =>
@@ -452,9 +1364,90 @@ describe('remote sandbox path helpers', () => {
     );
     expect(cleanupCommand).toContain('openai_agents_kill_pidfile()');
     expect(cleanupCommand).toContain(
-      "openai_agents_kill_pidfile '/tmp/openai-agents-test-logs.nfs.pid' 'rclone' 'serve' 'nfs'",
+      "openai_agents_kill_pidfile 1 '/tmp/openai-agents-test-logs.nfs.pid' 'rclone' 'serve' 'nfs'",
     );
+    expect(cleanupCommand).toContain('[ "$helper_status" -eq 0 ] && rm -f --');
     expect(cleanupCommand).not.toContain('kill "$(cat');
+    expect(commands).toContain(
+      "'/usr/local/bin/rclone' 'serve' 'nfs' '--help' >/dev/null 2>&1",
+    );
+    expect(
+      commands.some((command) =>
+        command.includes("('/usr/local/bin/rclone' 'serve' 'nfs'"),
+      ),
+    ).toBe(true);
+  });
+
+  test('surfaces failed rclone NFS helper termination without leaking output', async () => {
+    const commands: string[] = [];
+    const entry: S3Mount = {
+      type: 's3_mount',
+      bucket: 'agent-logs',
+      accessKeyId: 'access-key',
+      secretAccessKey: 'secret-key',
+      mountStrategy: {
+        type: 'test_cloud_bucket',
+        pattern: {
+          type: 'rclone',
+          mode: 'nfs',
+          remote: 'logs',
+        },
+      },
+    };
+
+    const error = await mountRcloneCloudBucket({
+      providerName: 'TestSandboxClient',
+      providerId: 'test',
+      strategyType: 'test_cloud_bucket',
+      entry,
+      mountPath: '/workspace/logs',
+      pattern: {
+        type: 'rclone',
+        mode: 'nfs',
+        remote: 'logs',
+      },
+      runCommand: async (command) => {
+        commands.push(command);
+        if (
+          command ===
+          'command -v rclone >/dev/null 2>&1 || test -x /usr/local/bin/rclone'
+        ) {
+          return { status: 0, stdout: '' };
+        }
+        if (command === 'command -v rclone >/dev/null 2>&1') {
+          return { status: 1, stdout: '' };
+        }
+        if (command.includes('mount -v -t nfs')) {
+          return { status: 1, stderr: 'MOUNT_SECRET_SENTINEL' };
+        }
+        if (command.includes('openai_agents_kill_pidfile 1')) {
+          return { status: 1, stderr: 'CLEANUP_SECRET_SENTINEL' };
+        }
+        return { status: 0, stdout: '' };
+      },
+      writeFile: recordMountWrite(new Map<string, string>()),
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(SandboxMountError);
+    expect(String(error)).toContain(
+      'cloud bucket mount failed and credential cleanup could not complete',
+    );
+    expect((error as SandboxMountError).details).toMatchObject({
+      provider: 'test',
+      cleanupFailed: true,
+    });
+    expect(JSON.stringify(error)).not.toContain('MOUNT_SECRET_SENTINEL');
+    expect(JSON.stringify(error)).not.toContain('CLEANUP_SECRET_SENTINEL');
+    const cleanupCommand = commands.find((command) =>
+      command.includes('openai_agents_kill_pidfile 1'),
+    );
+    expect(cleanupCommand).toContain('[ "$helper_status" -eq 0 ] && rm -f --');
+    expect(commands).not.toContain(
+      "rm -f -- '/tmp/openai-agents-test-logs.conf'",
+    );
   });
 
   test('accept in-root absolute workspace paths', () => {
@@ -470,6 +1463,10 @@ describe('remote sandbox path helpers', () => {
     expect(resolveSandboxWorkdir('/workspace', '/workspace/src/..')).toBe(
       '/workspace',
     );
+    expect(
+      resolveSandboxRelativePath('/workspace', '/workspace/src/app.ts'),
+    ).toBe('src/app.ts');
+    expect(resolveSandboxRelativePath('/workspace', '/workspace')).toBe('');
   });
 
   test('reject workspace escapes', () => {
@@ -485,6 +1482,9 @@ describe('remote sandbox path helpers', () => {
     expect(() =>
       resolveSandboxWorkdir('/workspace', '/workspace/../tmp'),
     ).toThrow(/escapes the workspace root/);
+    expect(() => resolveSandboxRelativePath('/workspace', '/tmp')).toThrow(
+      /escapes the workspace root/,
+    );
   });
 
   test('detects host relative paths that escape a root', () => {
@@ -564,12 +1564,86 @@ describe('remote sandbox path helpers', () => {
     expect(normalizeGitRepository('openai/openai-agents-js')).toBe(
       'https://github.com/openai/openai-agents-js.git',
     );
+    expect(
+      normalizeGitRepository({
+        host: 'git.example.test',
+        repo: 'team/project',
+      }),
+    ).toBe('https://git.example.test/team/project.git');
     expect(normalizeGitRepository('https://example.test/repo.git')).toBe(
       'https://example.test/repo.git',
     );
     expect(normalizeGitRepository('git@example.test:owner/repo.git')).toBe(
       'git@example.test:owner/repo.git',
     );
+    expect(() => normalizeGitRepository({ repo: '' })).toThrow(
+      /git_repo entries require a repo/,
+    );
+  });
+
+  test('encodes, decodes, and requires native snapshot references', () => {
+    const encoded = encodeNativeSnapshotRef({
+      provider: 'modal_snapshot_filesystem',
+      snapshotId: 'snap_123',
+      workspacePersistence: 'snapshot_filesystem',
+    });
+
+    expect(decodeNativeSnapshotRef(encoded)).toEqual({
+      provider: 'modal_snapshot_filesystem',
+      snapshotId: 'snap_123',
+      workspacePersistence: 'snapshot_filesystem',
+    });
+    const encodedArrayBuffer = new ArrayBuffer(encoded.byteLength);
+    new Uint8Array(encodedArrayBuffer).set(encoded);
+    expect(decodeNativeSnapshotRef(encodedArrayBuffer)).toEqual({
+      provider: 'modal_snapshot_filesystem',
+      snapshotId: 'snap_123',
+      workspacePersistence: 'snapshot_filesystem',
+    });
+    expect(
+      new TextDecoder().decode(
+        encodeNativeSnapshotRef({
+          provider: 'e2b',
+          snapshotId: 'snap_no_workspace_persistence',
+        }),
+      ),
+    ).toBe(
+      'E2B_SANDBOX_SNAPSHOT_V1\n{"snapshot_id":"snap_no_workspace_persistence"}',
+    );
+
+    expect(
+      requireNativeSnapshotRef(encoded, 'modal_snapshot_filesystem'),
+    ).toEqual({
+      provider: 'modal_snapshot_filesystem',
+      snapshotId: 'snap_123',
+      workspacePersistence: 'snapshot_filesystem',
+    });
+  });
+
+  test('rejects invalid native snapshot references', () => {
+    expect(decodeNativeSnapshotRef('not-a-native-snapshot')).toBeUndefined();
+    expect(
+      decodeNativeSnapshotRef('E2B_SANDBOX_SNAPSHOT_V1\nnot-json'),
+    ).toBeUndefined();
+    expect(
+      decodeNativeSnapshotRef('E2B_SANDBOX_SNAPSHOT_V1\n{"snapshot_id":""}'),
+    ).toBeUndefined();
+    expect(
+      decodeNativeSnapshotRef(
+        'E2B_SANDBOX_SNAPSHOT_V1\n{"snapshot_id":"snap_123","workspace_persistence":123}',
+      ),
+    ).toEqual({
+      provider: 'e2b',
+      snapshotId: 'snap_123',
+      workspacePersistence: undefined,
+    });
+
+    expect(() =>
+      requireNativeSnapshotRef(
+        'E2B_SANDBOX_SNAPSHOT_V1\n{"snapshot_id":"snap_123"}',
+        'runloop',
+      ),
+    ).toThrow(SandboxSnapshotError);
   });
 
   test('strips ephemeral manifest data during persistence', () => {
@@ -729,6 +1803,73 @@ describe('remote sandbox path helpers', () => {
       FEATURE_FLAG: 'enabled',
       KEEP: 'manifest',
     });
+  });
+
+  test('round-trips remote environment references without resolved secrets', async () => {
+    let currentSecret = 'activity-secret';
+    class RemoteSecretReference extends EnvValueReference {
+      static readonly type = 'test.remote_secret_reference';
+
+      constructor(readonly key: string) {
+        super();
+      }
+
+      serialize(): Record<string, unknown> {
+        return { key: this.key };
+      }
+
+      async resolve(): Promise<string> {
+        return `${currentSecret}:${this.key}`;
+      }
+    }
+    const unregister = registerEnvValueReference(
+      RemoteSecretReference,
+      (payload) => {
+        if (typeof payload.key !== 'string') {
+          throw new TypeError('Remote secret reference key must be a string.');
+        }
+        return new RemoteSecretReference(payload.key);
+      },
+    );
+    try {
+      const manifest = new Manifest({
+        environment: {
+          TOKEN: new RemoteSecretReference('openai-key'),
+        },
+      });
+      const serialized = serializeRemoteSandboxSessionState({
+        manifest,
+        environment: {
+          TOKEN: 'activity-secret:openai-key',
+          PROVIDER_VALUE: 'persisted',
+        },
+      });
+      const serializedJson = JSON.stringify(serialized);
+
+      expect(serializedJson).not.toContain('activity-secret');
+      expect(serialized.manifest).toMatchObject({
+        environment: {
+          TOKEN: {
+            type: RemoteSecretReference.type,
+            key: 'openai-key',
+          },
+        },
+      });
+
+      currentSecret = 'worker-secret';
+      const restored = await rehydrateRemoteSandboxSessionStateValues(
+        JSON.parse(serializedJson),
+      );
+      expect(restored.manifest.environment.TOKEN).toBeInstanceOf(
+        RemoteSecretReference,
+      );
+      expect(restored.environment).toEqual({
+        TOKEN: 'worker-secret:openai-key',
+        PROVIDER_VALUE: 'persisted',
+      });
+    } finally {
+      unregister();
+    }
   });
 
   test('materializes and merges environment values', async () => {
@@ -1136,6 +2277,27 @@ describe('remote sandbox path helpers', () => {
     expect(files.has('renamed/new.txt')).toBe(false);
   });
 
+  test('does not treat unreadable editor fallback reads as missing files', async () => {
+    const denied = Object.assign(new Error('Permission denied'), {
+      code: 'EACCES',
+    });
+    const editor = new RemoteSandboxEditor({
+      readText: async () => {
+        throw denied;
+      },
+      writeText: vi.fn(),
+      deletePath: vi.fn(),
+    });
+
+    await expect(
+      editor.createFile({
+        type: 'create_file',
+        path: '/workspace/blocked',
+        diff: '+hello',
+      }),
+    ).rejects.toBe(denied);
+  });
+
   test('prepares runAs remote writes with privileged ownership commands', async () => {
     const commands: Array<{
       command: string;
@@ -1172,6 +2334,213 @@ describe('remote sandbox path helpers', () => {
       options: { runAs: 'sandbox-user' },
     });
     expect(commands[2]).toMatchObject({
+      command: expect.stringContaining("rm -f -- '/tmp/openai-agents-"),
+      options: { runAs: 'root' },
+    });
+  });
+
+  test('wraps sandbox user shell commands for root and sudo handoff', () => {
+    expect(sandboxUserShellCommand('echo ok')).toBe('echo ok');
+
+    const command = sandboxUserShellCommand("printf '%s' ok", 'sandbox-user');
+
+    expect(command).toContain("target_user='sandbox-user'");
+    expect(command).toContain('current_uid="$(id -u)"');
+    expect(command).toContain(
+      'if [ "$current_uid" = "$target_user" ] || [ "$current_user" = "$target_user" ]; then',
+    );
+    expect(command).toContain('elif [ "$current_uid" -eq 0 ]; then');
+    expect(command).toContain('su -s /bin/sh "$target_user" -c');
+    expect(command).toContain('sudo -n -u "$target_user" -- sh -lc');
+    expect(command).toContain("'printf '\\''%s'\\'' ok'");
+  });
+
+  test('reads runAs files and checks remote path existence', async () => {
+    const commands: Array<{
+      command: string;
+      options?: { runAs?: string };
+    }> = [];
+    const runCommand = vi.fn(async (command, options) => {
+      commands.push({ command, options });
+      if (command.startsWith('base64')) {
+        return { status: 0, stdout: 'aGVsbG8gd29ybGQ=\n' };
+      }
+      return { status: command.includes('exists') ? 0 : 1, stdout: '' };
+    });
+
+    await expect(
+      readRunAsRemoteFile({
+        providerName: 'FakeSandboxClient',
+        providerId: 'fake',
+        path: '/workspace/notes.txt',
+        runAs: 'sandbox-user',
+        runCommand,
+      }),
+    ).resolves.toEqual(new TextEncoder().encode('hello world'));
+
+    await expect(
+      runAsRemotePathExists('/workspace/exists', 'sandbox-user', runCommand),
+    ).resolves.toBe(true);
+    await expect(
+      runAsRemotePathExists('/workspace/missing', 'sandbox-user', runCommand),
+    ).resolves.toBe(false);
+    await expect(
+      runAsRemoteDirectoryExists(
+        '/workspace/exists',
+        'sandbox-user',
+        runCommand,
+      ),
+    ).resolves.toBe(true);
+
+    expect(commands).toEqual([
+      {
+        command: "base64 -- '/workspace/notes.txt'",
+        options: { runAs: 'sandbox-user' },
+      },
+      {
+        command: "test -e '/workspace/exists'",
+        options: { runAs: 'sandbox-user' },
+      },
+      {
+        command: "test -e '/workspace/missing'",
+        options: { runAs: 'sandbox-user' },
+      },
+      {
+        command: expect.stringContaining('OPENAI_AGENTS_READ_PATH_PROBE_V1'),
+        options: { runAs: 'sandbox-user' },
+      },
+      {
+        command: "test -e '/workspace/exists'",
+        options: { runAs: 'sandbox-user' },
+      },
+      {
+        command: "test -d '/workspace/exists' && test -x '/workspace/exists'",
+        options: { runAs: 'sandbox-user' },
+      },
+    ]);
+  });
+
+  test.each([
+    { status: 1, stderr: 'Permission denied' },
+    { status: 2, stderr: 'Input/output error' },
+  ])('preserves failed runAs path probes: %j', async (result) => {
+    await expect(
+      runAsRemotePathExists(
+        '/workspace/blocked',
+        'sandbox-user',
+        async () => result,
+        { providerName: 'FakeSandboxClient', providerId: 'fake' },
+      ),
+    ).rejects.toMatchObject({
+      code: 'provider_error',
+      details: {
+        provider: 'fake',
+        path: '/workspace/blocked',
+        status: result.status,
+      },
+    });
+  });
+
+  test('checks directory searchability under the requested runAs identity', async () => {
+    const runCommand = vi
+      .fn()
+      .mockResolvedValueOnce({ status: 0 })
+      .mockResolvedValueOnce({ status: 1 });
+
+    await expect(
+      runAsRemoteDirectoryExists(
+        '/workspace/blocked',
+        'sandbox-user',
+        runCommand,
+      ),
+    ).resolves.toBe(false);
+    expect(runCommand.mock.calls).toEqual([
+      ["test -e '/workspace/blocked'", { runAs: 'sandbox-user' }],
+      [
+        "test -d '/workspace/blocked' && test -x '/workspace/blocked'",
+        { runAs: 'sandbox-user' },
+      ],
+    ]);
+  });
+
+  test('reports runAs command failures with provider context', async () => {
+    await expect(
+      readRunAsRemoteFile({
+        providerName: 'FakeSandboxClient',
+        providerId: 'fake',
+        path: '/workspace/notes.txt',
+        runAs: 'sandbox-user',
+        runCommand: async () => ({
+          status: 1,
+          stdout: 'permission denied',
+          stderr: 'read failed',
+        }),
+      }),
+    ).rejects.toMatchObject({
+      message:
+        'FakeSandboxClient failed to read file /workspace/notes.txt: permission denied\nread failed',
+      details: { provider: 'fake' },
+    });
+  });
+
+  test('creates runAs remote editors with mutation hooks and resolved paths', async () => {
+    const commands: Array<{
+      command: string;
+      options?: { runAs?: string };
+    }> = [];
+    const writer = {
+      mkdir: vi.fn(),
+      writeFile: vi.fn(),
+    };
+    const beforeFilesystemMutation = vi.fn(async () => {});
+    const editor = createRunAsRemoteEditor({
+      providerName: 'FakeSandboxClient',
+      providerId: 'fake',
+      runAs: 'sandbox-user',
+      resolvePath: async (path) => `/workspace/${path}`,
+      runCommand: async (command, options) => {
+        commands.push({ command, options });
+        if (command.startsWith('test -e')) {
+          return { status: 1, stdout: '' };
+        }
+        return { status: 0, stdout: '' };
+      },
+      writer,
+      beforeFilesystemMutation,
+    });
+
+    await editor.createFile({
+      type: 'create_file',
+      path: 'src/notes.txt',
+      diff: '+hello',
+    });
+
+    expect(beforeFilesystemMutation).toHaveBeenCalledTimes(2);
+    expect(writer.writeFile).toHaveBeenCalledWith(
+      expect.stringMatching(/^\/tmp\/openai-agents-/u),
+      'hello',
+    );
+    expect(commands[0]).toEqual({
+      command: "test -e '/workspace/src/notes.txt'",
+      options: { runAs: 'sandbox-user' },
+    });
+    expect(commands[1]).toEqual({
+      command: expect.stringContaining('OPENAI_AGENTS_READ_PATH_PROBE_V1'),
+      options: { runAs: 'sandbox-user' },
+    });
+    expect(commands[2]).toEqual({
+      command: "mkdir -p -- '/workspace/src'",
+      options: { runAs: 'sandbox-user' },
+    });
+    expect(commands[3]).toMatchObject({
+      command: expect.stringContaining("chown 'sandbox-user':'sandbox-user'"),
+      options: { runAs: 'root' },
+    });
+    expect(commands[4]).toMatchObject({
+      command: expect.stringContaining("cat -- '/tmp/openai-agents-"),
+      options: { runAs: 'sandbox-user' },
+    });
+    expect(commands[5]).toMatchObject({
       command: expect.stringContaining("rm -f -- '/tmp/openai-agents-"),
       options: { runAs: 'root' },
     });
@@ -1227,7 +2596,9 @@ describe('remote sandbox path helpers', () => {
     await writeFile(join(outside, 'secret.txt'), 'secret\n');
     await symlink(outside, join(root, 'escape'));
 
+    const validationCommands: string[] = [];
     const runCommand = async (command: string) => {
+      validationCommands.push(command);
       try {
         const { stdout, stderr } = await execFileAsync('/bin/sh', [
           '-lc',
@@ -1277,7 +2648,57 @@ describe('remote sandbox path helpers', () => {
         runCommand,
       }),
     ).resolves.toBe('/src/app.ts');
+    expect(validationCommands).not.toHaveLength(0);
+    expect(validationCommands).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('PATH=/usr/bin:/bin\nHOME=/root'),
+        expect.stringContaining(
+          'unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT\nexport PATH HOME',
+        ),
+      ]),
+    );
   }, 15_000);
+
+  test('uses an absolute trusted binary for credential path resolution', async () => {
+    const runCommand = vi.fn(async () => ({
+      status: 0,
+      stdout: '/var/run/secrets/aws/token\n',
+    }));
+
+    await expect(
+      resolveRemoteSandboxEffectivePath({
+        path: '/var/run/secrets/aws/token',
+        runCommand,
+      }),
+    ).resolves.toBe('/var/run/secrets/aws/token');
+
+    expect(runCommand).toHaveBeenCalledOnce();
+    expect(runCommand).toHaveBeenCalledWith(
+      "PATH=/usr/bin:/bin HOME=/root LD_PRELOAD= LD_LIBRARY_PATH= LD_AUDIT= /usr/bin/realpath -m -- '/var/run/secrets/aws/token'",
+    );
+  });
+
+  test('rejects extra output from credential path resolution', async () => {
+    await expect(
+      resolveRemoteSandboxEffectivePath({
+        path: '/var/run/secrets/aws/token',
+        runCommand: async () => ({
+          status: 0,
+          stdout: '/var/run/secrets/aws/token\n/tmp/untrusted-override\n',
+        }),
+      }),
+    ).rejects.toThrow(/failed effective-path resolution/u);
+  });
+
+  test('rejects remote path validators that do not return absolute paths', async () => {
+    await expect(
+      validateRemoteSandboxPath({
+        root: '/workspace',
+        path: 'src/app.ts',
+        runCommand: async () => ({ status: 0, stdout: 'relative/app.ts\n' }),
+      }),
+    ).rejects.toThrow(/validator did not return an absolute resolved path/);
+  });
 
   test('validates workspace tar archives before hydrate', () => {
     expect(() =>
@@ -1350,6 +2771,205 @@ describe('remote sandbox path helpers', () => {
     ).not.toThrow();
   });
 
+  test('validates tar root members, PAX paths, and long names', () => {
+    expect(() =>
+      validateWorkspaceTarArchive(makeTarArchive([{ name: '.', type: '5' }])),
+    ).not.toThrow();
+    expect(() =>
+      validateWorkspaceTarArchive(makeTarArchive([{ name: '.', type: '2' }])),
+    ).toThrow(/archive root symlink/);
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: '.', content: 'root-file' }]),
+      ),
+    ).toThrow(/archive root member must be directory/);
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([
+          { name: 'dir', type: '5' },
+          { name: 'dir', type: '5' },
+        ]),
+      ),
+    ).not.toThrow();
+
+    const paxArchive = makeTarArchive([
+      {
+        name: 'pax-path',
+        type: 'x',
+        content: makePaxRecord('path', 'workspace/skipped/ignored.txt'),
+      },
+      { name: 'ignored', content: 'skip me' },
+      {
+        name: 'global-pax',
+        type: 'g',
+        content: makePaxRecord('comment', 'harmless metadata'),
+      },
+      {
+        name: 'long-name',
+        type: 'L',
+        content: 'workspace/keep/deep/file.txt\n',
+      },
+      { name: 'fallback', content: 'long name content' },
+    ]);
+
+    expect(() =>
+      validateWorkspaceTarArchive(paxArchive, {
+        rootName: 'workspace',
+        skipRelPaths: ['skipped'],
+      }),
+    ).not.toThrow();
+
+    const paxLinkArchive = makeTarArchive([
+      {
+        name: 'pax-link',
+        type: 'x',
+        content: `${makePaxRecord('path', 'workspace/keep/link')}${makePaxRecord(
+          'linkpath',
+          '../target.txt',
+        )}`,
+      },
+      { name: 'fallback-link', type: '2', linkName: 'fallback-target' },
+    ]);
+
+    expect(() =>
+      validateWorkspaceTarArchive(paxLinkArchive, {
+        rootName: 'workspace',
+        rejectSymlinkRelPaths: ['workspace/keep/link'],
+      }),
+    ).toThrow(/symlink member not allowed: workspace\/keep\/link/);
+  });
+
+  test.each(['path', 'linkpath'])('rejects global PAX %s overrides', (key) => {
+    const archive = makeTarArchive([
+      {
+        name: 'global-pax',
+        type: 'g',
+        content: makePaxRecord(key, 'logs/events.jsonl'),
+      },
+      { name: 'safe.txt', content: 'unsafe destination' },
+    ]);
+
+    expect(() => validateWorkspaceTarArchive(archive)).toThrow(
+      new RegExp(`global PAX ${key} override not allowed`),
+    );
+  });
+
+  test('rejects malformed PAX byte framing and encoding', () => {
+    const archive = makeTarArchive([
+      {
+        name: 'local-pax',
+        type: 'x',
+        content: '999 path=logs/events.jsonl\n',
+      },
+      { name: 'safe.txt', content: 'unsafe destination' },
+    ]);
+
+    expect(() => validateWorkspaceTarArchive(archive)).toThrow(
+      /PAX record exceeds payload/,
+    );
+
+    const invalidUtf8 = makeTarArchive([
+      {
+        name: 'local-pax',
+        type: 'x',
+        content: new Uint8Array([0x37, 0x20, 0x78, 0x3d, 0xc3, 0x28, 0x0a]),
+      },
+    ]);
+    expect(() => validateWorkspaceTarArchive(invalidUtf8)).toThrow(
+      /invalid UTF-8 in PAX record/,
+    );
+  });
+
+  test('rejects malformed tar headers and unsupported member types', () => {
+    expect(() => validateWorkspaceTarArchive(new Uint8Array(1))).toThrow(
+      /truncated header/,
+    );
+
+    const truncatedPayload = makeTarArchive([
+      { name: 'file.txt', content: 'payload' },
+    ]).subarray(0, 515);
+    expect(() => validateWorkspaceTarArchive(truncatedPayload)).toThrow(
+      /truncated member payload/,
+    );
+
+    const base256Size = makeTarArchive([{ name: 'file.txt', content: 'ok' }]);
+    base256Size[124] = 0x80;
+    expect(() => validateWorkspaceTarArchive(base256Size)).toThrow(
+      /base-256 tar sizes are not supported/,
+    );
+
+    const invalidOctalSize = makeTarArchive([
+      { name: 'file.txt', content: 'ok' },
+    ]);
+    invalidOctalSize[124] = '8'.charCodeAt(0);
+    expect(() => validateWorkspaceTarArchive(invalidOctalSize)).toThrow(
+      /invalid octal size/,
+    );
+
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'device', type: '3' }]),
+      ),
+    ).toThrow(/unsupported member type/);
+  });
+
+  test('rejects archive members that overlap protected paths', () => {
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'cache/data.json', content: 'unsafe' }]),
+        { rejectRelPaths: ['cache'] },
+      ),
+    ).toThrow(SandboxArchiveError);
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'safe/cache.txt', content: 'safe' }]),
+        { rejectRelPaths: ['cache'] },
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([
+          { name: 'workspace/cache/data.json', content: 'unsafe' },
+        ]),
+        {
+          rejectRelPaths: ['cache'],
+          rootName: 'workspace',
+        },
+      ),
+    ).toThrow(SandboxArchiveError);
+
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'cache', content: 'blocking file' }]),
+        { rejectRelPaths: ['cache/mounted'] },
+      ),
+    ).toThrow(SandboxArchiveError);
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'cache', type: '5', mode: 0o755 }]),
+        { rejectRelPaths: ['cache/mounted'] },
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'cache', type: '5', mode: 0o555 }]),
+        { rejectRelPaths: ['cache/mounted'] },
+      ),
+    ).toThrow(/archive directory blocks protected path: cache\/mounted/);
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: '.', type: '5', mode: 0o555 }]),
+        { rejectRelPaths: ['cache/mounted'] },
+      ),
+    ).toThrow(/archive directory blocks protected path: cache\/mounted/);
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'README.md', content: 'protected root' }]),
+        { rejectRelPaths: [''] },
+      ),
+    ).toThrow(SandboxArchiveError);
+  });
+
   test('rejects workspace tar archives over resource limits', () => {
     const archive = makeTarArchive([
       { name: 'one.txt', content: '1' },
@@ -1413,6 +3033,459 @@ describe('remote sandbox path helpers', () => {
       }),
     ).rejects.toBeInstanceOf(SandboxArchiveError);
     expect(writeFile).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    {
+      name: 'an exact ephemeral file',
+      manifest: new Manifest({
+        root: '/custom/workspace',
+        entries: {
+          'secret.txt': {
+            type: 'file',
+            content: 'runtime-only',
+            ephemeral: true,
+          },
+        },
+      }),
+      archive: makeTarArchive([
+        { name: 'secret.txt', content: 'persisted secret' },
+      ]),
+      protectedPath: 'secret.txt',
+    },
+    {
+      name: 'a descendant of an ephemeral directory',
+      manifest: new Manifest({
+        root: '/custom/workspace',
+        entries: {
+          logs: { type: 'dir', ephemeral: true },
+        },
+      }),
+      archive: makeTarArchive([
+        { name: 'logs/events.jsonl', content: 'persisted log' },
+      ]),
+      protectedPath: 'logs',
+    },
+    {
+      name: 'a file that blocks an ephemeral descendant',
+      manifest: new Manifest({
+        root: '/custom/workspace',
+        entries: {
+          cache: {
+            type: 'dir',
+            children: {
+              'session.json': {
+                type: 'file',
+                content: 'runtime-only',
+                ephemeral: true,
+              },
+            },
+          },
+        },
+      }),
+      archive: makeTarArchive([{ name: 'cache', content: 'blocking file' }]),
+      protectedPath: 'cache/session.json',
+    },
+    {
+      name: 'a descendant of an ephemeral mount target',
+      manifest: new Manifest({
+        root: '/custom/workspace',
+        entries: {
+          remote: mount({
+            source: 's3://bucket/data',
+            mountPath: 'mounted/cache',
+            ephemeral: true,
+            mountStrategy: { type: 'in_container' },
+          }),
+        },
+      }),
+      archive: makeTarArchive([
+        { name: 'mounted/cache/data.json', content: 'persisted mount data' },
+      ]),
+      protectedPath: 'mounted/cache',
+    },
+  ])(
+    'rejects $name before hydrating tar archives',
+    async ({ manifest, archive, protectedPath }) => {
+      const writeFile = vi.fn();
+      const runCommand = vi.fn(async (command: string) => ({
+        status: 0,
+        stdout: command.includes('resolve-workspace-path.sh')
+          ? `${manifest.root}\n`
+          : '',
+        stderr: '',
+      }));
+
+      await expect(
+        hydrateRemoteWorkspaceTar({
+          providerName: 'FakeProvider',
+          manifest,
+          data: archive,
+          io: {
+            mkdir: vi.fn(),
+            readFile: vi.fn(),
+            writeFile,
+            runCommand,
+          },
+        }),
+      ).rejects.toMatchObject({
+        details: {
+          reason: `archive member overlaps protected path: ${protectedPath}`,
+        },
+      });
+      expect(writeFile).not.toHaveBeenCalled();
+      expect(runCommand).not.toHaveBeenCalled();
+    },
+  );
+
+  test('hydrates tar archives without ephemeral manifest paths', async () => {
+    const archive = makeTarArchive([
+      { name: 'src/index.ts', content: 'export {};' },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn(async (command: string) => ({
+      status: 0,
+      stdout: command.includes('resolve-workspace-path.sh')
+        ? '/custom/workspace\n'
+        : '',
+      stderr: '',
+    }));
+
+    await hydrateRemoteWorkspaceTar({
+      providerName: 'FakeProvider',
+      manifest: new Manifest({
+        root: '/custom/workspace',
+        entries: {
+          logs: { type: 'dir', ephemeral: true },
+        },
+      }),
+      data: archive,
+      io: {
+        mkdir: vi.fn(),
+        readFile: vi.fn(),
+        writeFile,
+        runCommand,
+      },
+    });
+
+    expect(writeFile).toHaveBeenCalledWith(expect.any(String), archive);
+    expect(runCommand).toHaveBeenCalled();
+  });
+
+  test('rejects global PAX path overrides before hydration side effects', async () => {
+    const archive = makeTarArchive([
+      {
+        name: 'global-pax',
+        type: 'g',
+        content: makePaxRecord('path', 'logs/events.jsonl'),
+      },
+      { name: 'safe.txt', content: 'unsafe destination' },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn();
+
+    await expect(
+      hydrateRemoteWorkspaceTar({
+        providerName: 'FakeProvider',
+        manifest: new Manifest({
+          root: '/custom/workspace',
+          entries: {
+            logs: { type: 'dir', ephemeral: true },
+          },
+        }),
+        data: archive,
+        io: {
+          mkdir: vi.fn(),
+          readFile: vi.fn(),
+          writeFile,
+          runCommand,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'global PAX path override not allowed',
+      },
+    });
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  test('parses multibyte PAX records before protected paths', async () => {
+    const archive = makeTarArchive([
+      {
+        name: 'local-pax',
+        type: 'x',
+        content: `${makePaxRecord('comment', 'é')}${makePaxRecord(
+          'path',
+          'logs/events.jsonl',
+        )}`,
+      },
+      { name: 'safe.txt', content: 'unsafe destination' },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn();
+
+    await expect(
+      hydrateRemoteWorkspaceTar({
+        providerName: 'FakeProvider',
+        manifest: new Manifest({
+          root: '/custom/workspace',
+          entries: {
+            logs: { type: 'dir', ephemeral: true },
+          },
+        }),
+        data: archive,
+        io: {
+          mkdir: vi.fn(),
+          readFile: vi.fn(),
+          writeFile,
+          runCommand,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'archive member overlaps protected path: logs',
+      },
+    });
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  test('rejects NUL-bearing PAX paths before hydration side effects', async () => {
+    const archive = makeTarArchive([
+      {
+        name: 'local-pax',
+        type: 'x',
+        content: makePaxRecord('path', 'secret.txt\0ignored'),
+      },
+      { name: 'safe.txt', content: 'persisted secret' },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn(async (command: string) => ({
+      status: 0,
+      stdout: command.includes('resolve-workspace-path.sh')
+        ? '/custom/workspace\n'
+        : '',
+      stderr: '',
+    }));
+
+    await expect(
+      hydrateRemoteWorkspaceTar({
+        providerName: 'FakeProvider',
+        manifest: new Manifest({
+          root: '/custom/workspace',
+          entries: {
+            'secret.txt': {
+              type: 'file',
+              content: 'runtime-only',
+              ephemeral: true,
+            },
+          },
+        }),
+        data: archive,
+        io: {
+          mkdir: vi.fn(),
+          readFile: vi.fn(),
+          writeFile,
+          runCommand,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'NUL byte in PAX record',
+      },
+    });
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  test('rejects PAX size overrides before hydration side effects', async () => {
+    const embeddedHeader = makeTarArchive([
+      { name: 'logs/events.jsonl', content: '' },
+    ]).subarray(0, 512);
+    const archive = makeTarArchive([
+      {
+        name: 'local-pax',
+        type: 'x',
+        content: makePaxRecord('size', '0'),
+      },
+      { name: 'safe.txt', content: embeddedHeader },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn(async (command: string) => ({
+      status: 0,
+      stdout: command.includes('resolve-workspace-path.sh')
+        ? '/custom/workspace\n'
+        : '',
+      stderr: '',
+    }));
+
+    await expect(
+      hydrateRemoteWorkspaceTar({
+        providerName: 'FakeProvider',
+        manifest: new Manifest({
+          root: '/custom/workspace',
+          entries: {
+            logs: { type: 'dir', ephemeral: true },
+          },
+        }),
+        data: archive,
+        io: {
+          mkdir: vi.fn(),
+          readFile: vi.fn(),
+          writeFile,
+          runCommand,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'PAX size override not allowed',
+      },
+    });
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  test('rejects GNU sparse PAX destinations before hydration side effects', async () => {
+    const archive = makeTarArchive([
+      {
+        name: 'local-pax',
+        type: 'x',
+        content: makePaxRecord('GNU.sparse.name', 'logs/events.jsonl'),
+      },
+      { name: 'safe.txt', content: 'unsafe destination' },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn();
+
+    await expect(
+      hydrateRemoteWorkspaceTar({
+        providerName: 'FakeProvider',
+        manifest: new Manifest({
+          root: '/custom/workspace',
+          entries: {
+            logs: { type: 'dir', ephemeral: true },
+          },
+        }),
+        data: archive,
+        io: {
+          mkdir: vi.fn(),
+          readFile: vi.fn(),
+          writeFile,
+          runCommand,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'PAX GNU.sparse.name override not allowed',
+      },
+    });
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  test('rejects populated tar archives when the workspace root is ephemeral', async () => {
+    const archive = makeTarArchive([
+      { name: 'src/index.ts', content: 'export {};' },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn(async (command: string) => ({
+      status: 0,
+      stdout: command.includes('resolve-workspace-path.sh')
+        ? '/custom/workspace\n'
+        : '',
+      stderr: '',
+    }));
+
+    await expect(
+      hydrateRemoteWorkspaceTar({
+        providerName: 'FakeProvider',
+        manifest: new Manifest({
+          root: '/custom/workspace',
+          entries: {
+            '': { type: 'dir', ephemeral: true },
+          },
+        }),
+        data: archive,
+        io: {
+          mkdir: vi.fn(),
+          readFile: vi.fn(),
+          writeFile,
+          runCommand,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'archive member overlaps protected path: ',
+      },
+    });
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  test('round-trips an ephemeral workspace root as an empty tar archive', async () => {
+    const manifest = new Manifest({
+      root: '/custom/workspace',
+      entries: {
+        '': { type: 'dir', ephemeral: true },
+      },
+    });
+    const persistedContent = makeTarArchive([
+      { name: 'secret.txt', content: 'must not persist' },
+    ]);
+    const persistRunCommand = vi.fn(async (command: string) => ({
+      status: 0,
+      stdout: command.includes('resolve-workspace-path.sh')
+        ? '/custom/workspace\n'
+        : '',
+      stderr: '',
+    }));
+    const persistReadFile = vi.fn(async () => persistedContent);
+
+    const archive = await persistRemoteWorkspaceTar({
+      providerName: 'FakeProvider',
+      manifest,
+      io: {
+        mkdir: vi.fn(),
+        readFile: persistReadFile,
+        writeFile: vi.fn(),
+        runCommand: persistRunCommand,
+      },
+    });
+
+    expect(archive).toEqual(makeTarArchive([]));
+    expect(persistReadFile).not.toHaveBeenCalled();
+    expect(persistRunCommand).not.toHaveBeenCalled();
+
+    const hydrateWriteFile = vi.fn();
+    const hydrateRunCommand = vi.fn(async (command: string) => ({
+      status: 0,
+      stdout: command.includes('resolve-workspace-path.sh')
+        ? '/custom/workspace\n'
+        : '',
+      stderr: '',
+    }));
+
+    await hydrateRemoteWorkspaceTar({
+      providerName: 'FakeProvider',
+      manifest,
+      data: archive,
+      io: {
+        mkdir: vi.fn(),
+        readFile: vi.fn(),
+        writeFile: hydrateWriteFile,
+        runCommand: hydrateRunCommand,
+      },
+    });
+
+    expect(hydrateWriteFile).toHaveBeenCalledWith(expect.any(String), archive);
+    expect(hydrateRunCommand).toHaveBeenCalled();
   });
 
   test('clears remote workspace root before hydrating tar archives', async () => {
@@ -1502,6 +3575,11 @@ describe('remote sandbox path helpers', () => {
     const manifest = new Manifest({
       entries: {
         keep: { type: 'file', content: 'keep' },
+        'literal[1]*?': {
+          type: 'file',
+          content: 'literal',
+          ephemeral: true,
+        },
         secret: { type: 'file', content: 'secret', ephemeral: true },
         mounted: mount({
           source: 's3://bucket/data',
@@ -1513,11 +3591,9 @@ describe('remote sandbox path helpers', () => {
     });
 
     expect(workspaceTarExcludeArgs(manifest)).toEqual([
-      "--exclude='cache'",
       "--exclude='./cache'",
-      "--exclude='mounted'",
+      "--exclude='./literal\\[1\\]\\*\\?'",
       "--exclude='./mounted'",
-      "--exclude='secret'",
       "--exclude='./secret'",
     ]);
   });
@@ -1756,7 +3832,11 @@ describe('remote sandbox path helpers', () => {
             },
           },
         },
-      }),
+      }).withInContainerMountCredentialExposureAcknowledged(
+        'mounted',
+        'mounted/cache',
+        'mounted/cache/nested',
+      ),
       'test',
       resolvePath,
     );
@@ -1770,7 +3850,10 @@ describe('remote sandbox path helpers', () => {
             src: sourceFile,
           },
         },
-      }),
+      }).withInContainerMountCredentialExposureAcknowledged(
+        'mounted',
+        'mounted/cache',
+      ),
       'test',
       resolvePath,
     );
@@ -1844,7 +3927,6 @@ describe('remote sandbox path helpers', () => {
       new Manifest({
         entries: {
           child: mount({
-            source: 's3://bucket/child',
             mountPath: 'mounted/cache',
             mountStrategy: { type: 'in_container' },
           }),
@@ -1853,14 +3935,12 @@ describe('remote sandbox path helpers', () => {
             children: {
               'note.txt': file({ content: 'note' }),
               nested: mount({
-                source: 's3://bucket/nested',
                 mountPath: 'mounted/cache/nested',
                 mountStrategy: { type: 'in_container' },
               }),
             },
           },
           parent: mount({
-            source: 's3://bucket/parent',
             mountPath: 'mounted',
             mountStrategy: { type: 'in_container' },
           }),
@@ -1886,13 +3966,91 @@ describe('remote sandbox path helpers', () => {
       'mount:/workspace/mounted/cache/nested',
     ]);
     expect(resolvedPaths).toEqual([
-      'app',
-      'app/note.txt',
-      'app/nested',
       'mounted',
       'mounted/cache',
       'mounted/cache/nested',
+      'app',
+      'app/note.txt',
+      'app/nested',
     ]);
+  });
+
+  test('validates all effective mount paths before materialization', async () => {
+    const writer = {
+      mkdir: vi.fn(),
+      writeFile: vi.fn(),
+    };
+    const materializeMount = vi.fn();
+    const manifest = new Manifest({
+      entries: {
+        'note.txt': file({ content: 'not written' }),
+        first: {
+          type: 's3_mount',
+          bucket: 'first',
+          accessKeyId: 'first-key',
+          secretAccessKey: 'first-secret',
+          mountStrategy: { type: 'in_container' },
+        },
+        second: {
+          type: 's3_mount',
+          bucket: 'second',
+          accessKeyId: 'second-key',
+          secretAccessKey: 'second-secret',
+          mountStrategy: { type: 'in_container' },
+        },
+      },
+    }).withInContainerMountCredentialExposureAcknowledged('first', 'second');
+
+    await expect(
+      materializeInlineManifest(
+        writer,
+        manifest,
+        'test',
+        async (path) =>
+          path === 'second' ? '/workspace/redirected' : `/workspace/${path}`,
+        { materializeMount },
+      ),
+    ).rejects.toThrow(/model-controlled sandbox/u);
+
+    expect(materializeMount).not.toHaveBeenCalled();
+    expect(writer.mkdir).not.toHaveBeenCalled();
+    expect(writer.writeFile).not.toHaveBeenCalled();
+  });
+
+  test('revalidates effective mount paths immediately before materialization', async () => {
+    const materializeMount = vi.fn();
+    let mountPathResolutions = 0;
+    const manifest = new Manifest({
+      entries: {
+        data: {
+          type: 's3_mount',
+          bucket: 'private',
+          accessKeyId: 'trusted-key',
+          secretAccessKey: 'trusted-secret',
+          mountStrategy: { type: 'in_container' },
+        },
+      },
+    }).withInContainerMountCredentialExposureAcknowledged('data');
+
+    await expect(
+      materializeInlineManifest(
+        { mkdir: vi.fn(), writeFile: vi.fn() },
+        manifest,
+        'test',
+        async (path) => {
+          if (path !== 'data') {
+            return `/workspace/${path}`;
+          }
+          return mountPathResolutions++ === 0
+            ? '/workspace/data'
+            : '/workspace/redirected';
+        },
+        { materializeMount },
+      ),
+    ).rejects.toThrow(/model-controlled sandbox/u);
+
+    expect(mountPathResolutions).toBe(2);
+    expect(materializeMount).not.toHaveBeenCalled();
   });
 
   test('materializes local source manifest mounts after source entries', async () => {
@@ -1918,7 +4076,6 @@ describe('remote sandbox path helpers', () => {
         extraPathGrants: [{ path: dirname(sourceFile), readOnly: true }],
         entries: {
           child: mount({
-            source: 's3://bucket/child',
             mountPath: 'mounted/cache',
             mountStrategy: { type: 'in_container' },
           }),
@@ -1927,7 +4084,6 @@ describe('remote sandbox path helpers', () => {
             src: sourceFile,
           },
           parent: mount({
-            source: 's3://bucket/parent',
             mountPath: 'mounted',
             mountStrategy: { type: 'in_container' },
           }),
@@ -1951,9 +4107,9 @@ describe('remote sandbox path helpers', () => {
       'mount:/workspace/mounted/cache',
     ]);
     expect(resolvedPaths).toEqual([
-      'copied/source.txt',
       'mounted',
       'mounted/cache',
+      'copied/source.txt',
     ]);
   });
 
@@ -1981,13 +4137,11 @@ describe('remote sandbox path helpers', () => {
         type: 'dir',
         children: {
           child: mount({
-            source: 's3://bucket/child',
             mountPath: 'project/mounted/cache',
             mountStrategy: { type: 'in_container' },
           }),
           'note.txt': file({ content: 'note' }),
           parent: mount({
-            source: 's3://bucket/parent',
             mountPath: 'project/mounted',
             mountStrategy: { type: 'in_container' },
           }),
@@ -2013,12 +4167,12 @@ describe('remote sandbox path helpers', () => {
       'mount:/remote/project/mounted/cache',
     ]);
     expect(resolvedPaths).toEqual([
+      'project/mounted',
+      'project/mounted/cache',
       'project',
       'project/child',
       'project/note.txt',
       'project/parent',
-      'project/mounted',
-      'project/mounted/cache',
     ]);
     expect(state.manifest.entries.project).toMatchObject({
       type: 'dir',
@@ -2030,9 +4184,12 @@ describe('remote sandbox path helpers', () => {
     tempDirs.push(tempDir);
     const sourceFile = join(tempDir, 'source.txt');
     const sourceDir = join(tempDir, 'source-dir');
+    const nestedDir = join(sourceDir, 'nested-dir');
     await writeFile(sourceFile, 'local file');
     await mkdir(sourceDir);
     await writeFile(join(sourceDir, 'nested.txt'), 'nested');
+    await mkdir(nestedDir);
+    await writeFile(join(nestedDir, 'deep.txt'), 'deep');
 
     const directories: string[] = [];
     const files = new Map<string, string | Uint8Array>();
@@ -2068,14 +4225,23 @@ describe('remote sandbox path helpers', () => {
       'test',
       {
         localSourceGrants: [
-          { path: dirname(sourceFile), readOnly: true },
-          { path: sourceDir, readOnly: true },
+          {
+            path: '/mnt/source-file',
+            hostPath: dirname(sourceFile),
+            readOnly: true,
+          },
+          {
+            path: '/mnt/source-dir',
+            hostPath: sourceDir,
+            readOnly: true,
+          },
         ],
       },
     );
 
     expect(directories).toContain('/workspace/project');
     expect(directories).toContain('/workspace/project/data');
+    expect(directories).toContain('/workspace/project/data/nested-dir');
     expect(files.get('/workspace/project/README.md')).toBe('readme');
     expect(Buffer.from(files.get('/workspace/project/local.txt')!)).toEqual(
       Buffer.from('local file'),
@@ -2083,6 +4249,9 @@ describe('remote sandbox path helpers', () => {
     expect(
       Buffer.from(files.get('/workspace/project/data/nested.txt')!),
     ).toEqual(Buffer.from('nested'));
+    expect(
+      Buffer.from(files.get('/workspace/project/data/nested-dir/deep.txt')!),
+    ).toEqual(Buffer.from('deep'));
     await expect(
       materializeLocalSourceManifestEntry(
         writer,
@@ -2094,6 +4263,50 @@ describe('remote sandbox path helpers', () => {
         'test',
       ),
     ).rejects.toBeInstanceOf(SandboxUnsupportedFeatureError);
+  });
+
+  test('rejects local source entries with mismatched source types', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'agents-shared-test-'));
+    tempDirs.push(tempDir);
+    const sourceFile = join(tempDir, 'source.txt');
+    const sourceDir = join(tempDir, 'source-dir');
+    await writeFile(sourceFile, 'local file');
+    await mkdir(sourceDir);
+
+    const writer = {
+      mkdir: async (_path: string) => {},
+      writeFile: async (_path: string, _content: string | Uint8Array) => {},
+    };
+
+    await expect(
+      materializeLocalSourceManifestEntry(
+        writer,
+        '/workspace/source-dir',
+        {
+          type: 'local_dir',
+          src: sourceFile,
+        },
+        'test',
+        {
+          localSourceGrants: [{ path: tempDir, readOnly: true }],
+        },
+      ),
+    ).rejects.toThrow(/local_dir source must be a directory/);
+
+    await expect(
+      materializeLocalSourceManifestEntry(
+        writer,
+        '/workspace/source.txt',
+        {
+          type: 'local_file',
+          src: sourceDir,
+        },
+        'test',
+        {
+          localSourceGrants: [{ path: tempDir, readOnly: true }],
+        },
+      ),
+    ).rejects.toThrow(/local_file entry path changed while materializing/);
   });
 
   test('rejects local source entries outside the local source base directory without a grant', async () => {
@@ -2286,7 +4499,7 @@ describe('remote sandbox path helpers', () => {
 
   test('formats command output and truncates token output', () => {
     expect(truncateOutput('0123456789abcdef', 1)).toEqual({
-      text: 'Total output lines: 1\n\n01...3 tokens truncated...ef',
+      text: '...4',
       originalTokenCount: 4,
     });
     expect(truncateOutput('one two', 3)).toEqual({ text: 'one two' });
@@ -2328,23 +4541,257 @@ describe('remote sandbox path helpers', () => {
     expect(output).toContain('Process exited with code 1');
   });
 
-  test('detects image media types', () => {
-    expect(sniffImageMediaType(Uint8Array.from([0x89, 0x50, 0x4e, 0x47]))).toBe(
-      'image/png',
+  test('opens browser-style PTY WebSockets and handles connection failures', async () => {
+    type FakeListener = (event: unknown) => void;
+    class FakeWebSocket {
+      static instances: FakeWebSocket[] = [];
+      readyState = 0;
+      binaryType = '';
+      readonly listeners = new Map<string, Set<FakeListener>>();
+      readonly url: string;
+
+      constructor(url: string) {
+        this.url = url;
+        FakeWebSocket.instances.push(this);
+      }
+
+      send() {}
+
+      close() {}
+
+      addEventListener(type: string, listener: FakeListener) {
+        const listeners = this.listeners.get(type) ?? new Set<FakeListener>();
+        listeners.add(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      removeEventListener(type: string, listener: FakeListener) {
+        this.listeners.get(type)?.delete(listener);
+      }
+
+      emit(type: string, event: unknown = {}) {
+        for (const listener of this.listeners.get(type) ?? []) {
+          listener(event);
+        }
+      }
+    }
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const opened = openPtyWebSocket({
+      url: 'wss://pty.example.test/session',
+      providerName: 'FakeSandboxClient',
+      timeoutMs: 1_000,
+    });
+    await vi.waitFor(() => {
+      expect(FakeWebSocket.instances).toHaveLength(1);
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    expect(socket.binaryType).toBe('arraybuffer');
+    socket.readyState = 1;
+    socket.emit('open');
+    await expect(opened).resolves.toBe(socket);
+
+    const failed = openPtyWebSocket({
+      url: 'wss://pty.example.test/fail',
+      providerName: 'FakeSandboxClient',
+      timeoutMs: 1_000,
+    });
+    await vi.waitFor(() => {
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      expect(FakeWebSocket.instances[1]!.listeners.has('error')).toBe(true);
+    });
+    FakeWebSocket.instances[1]!.emit('error', { message: 'denied' });
+    await expect(failed).rejects.toThrow(
+      'FakeSandboxClient PTY WebSocket failed to connect: denied',
     );
-    expect(sniffImageMediaType(Uint8Array.from([0xff, 0xd8, 0xff]))).toBe(
-      'image/jpeg',
+
+    const failedWithError = openPtyWebSocket({
+      url: 'wss://pty.example.test/error',
+      providerName: 'FakeSandboxClient',
+      timeoutMs: 1_000,
+    });
+    await vi.waitFor(() => {
+      expect(FakeWebSocket.instances).toHaveLength(3);
+      expect(FakeWebSocket.instances[2]!.listeners.has('error')).toBe(true);
+    });
+    FakeWebSocket.instances[2]!.emit('error', new Error('socket denied'));
+    await expect(failedWithError).rejects.toThrow(
+      'FakeSandboxClient PTY WebSocket failed to connect: socket denied',
     );
-    expect(sniffImageMediaType(Uint8Array.from([0x47, 0x49, 0x46, 0x38]))).toBe(
-      'image/gif',
+
+    const failedUnknown = openPtyWebSocket({
+      url: 'wss://pty.example.test/unknown-error',
+      providerName: 'FakeSandboxClient',
+      timeoutMs: 1_000,
+    });
+    await vi.waitFor(() => {
+      expect(FakeWebSocket.instances).toHaveLength(4);
+      expect(FakeWebSocket.instances[3]!.listeners.has('error')).toBe(true);
+    });
+    FakeWebSocket.instances[3]!.emit('error', {});
+    await expect(failedUnknown).rejects.toThrow(
+      'FakeSandboxClient PTY WebSocket failed to connect: unknown error',
+    );
+
+    const closed = openPtyWebSocket({
+      url: 'wss://pty.example.test/closed',
+      providerName: 'FakeSandboxClient',
+      timeoutMs: 1_000,
+    });
+    await vi.waitFor(() => {
+      expect(FakeWebSocket.instances).toHaveLength(5);
+      expect(FakeWebSocket.instances[4]!.listeners.has('close')).toBe(true);
+    });
+    FakeWebSocket.instances[4]!.emit('close');
+    await expect(closed).rejects.toThrow(
+      'FakeSandboxClient PTY WebSocket closed before opening.',
+    );
+  });
+
+  test('adapts Node-style PTY WebSocket listeners and cleanup fallbacks', () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const socket = {
+      send: vi.fn(),
+      close: vi.fn(),
+      on: vi.fn((type: string, listener: (...args: unknown[]) => void) => {
+        listeners.set(type, listener);
+      }),
+      removeListener: vi.fn(),
+    };
+    const messageListener = vi.fn();
+
+    const remove = addPtyWebSocketListener(socket, 'message', messageListener);
+    listeners.get('message')?.('payload');
+    remove();
+
+    expect(messageListener).toHaveBeenCalledWith({ data: 'payload' });
+    expect(socket.removeListener).toHaveBeenCalledWith(
+      'message',
+      expect.any(Function),
+    );
+  });
+
+  test('formats PTY shell commands with default and explicit shells', () => {
+    expect(shellCommandForPty({ cmd: 'echo hi' })).toBe("/bin/sh -c 'echo hi'");
+    expect(shellCommandForPty({ cmd: 'echo hi', shell: '/bin/zsh' })).toBe(
+      "/bin/zsh -lc 'echo hi'",
     );
     expect(
-      sniffImageMediaType(
-        Uint8Array.from([
-          0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50,
-        ]),
-      ),
-    ).toBe('image/webp');
+      shellCommandForPty({ cmd: 'echo hi', shell: '/bin/zsh', login: false }),
+    ).toBe("/bin/zsh -c 'echo hi'");
+  });
+
+  test('collects PTY output from string and binary chunks', async () => {
+    const entry = createPtyProcessEntry({});
+    const pendingOutput = collectPtyOutput({
+      entry,
+      yieldTimeMs: 1_000,
+    });
+
+    appendPtyOutput(entry, 'hello ');
+    appendPtyOutput(entry, new TextEncoder().encode('from bytes'));
+    markPtyDone(entry, 0);
+
+    await expect(pendingOutput).resolves.toEqual({
+      text: 'hello from bytes',
+    });
+  });
+
+  test('writes PTY stdin, finalizes completed sessions, and reports missing sessions', async () => {
+    const sendInput = vi.fn(async (chars: string) => {
+      expect(chars).toBe('continue\n');
+    });
+    const registry = new PtyProcessRegistry();
+    const entry = createPtyProcessEntry({ sendInput });
+    const { sessionId } = registry.register(entry);
+
+    appendPtyOutput(entry, 'ready\n');
+    markPtyDone(entry, 0);
+
+    const output = await writePtyStdin({
+      providerName: 'FakeSandboxClient',
+      registry,
+      sessionId,
+      chars: 'continue\n',
+      yieldTimeMs: 1,
+    });
+
+    expect(sendInput).toHaveBeenCalledWith('continue\n');
+    expect(output).toContain('Process exited with code 0');
+    expect(output).toContain('ready');
+
+    await expect(
+      writePtyStdin({
+        providerName: 'FakeSandboxClient',
+        registry,
+        sessionId: 999_999,
+      }),
+    ).resolves.toContain('write_stdin failed: session not found: 999999');
+  });
+
+  test('rejects PTY stdin for non-interactive process entries', async () => {
+    const registry = new PtyProcessRegistry();
+    const entry = createPtyProcessEntry({ tty: false });
+    const { sessionId } = registry.register(entry);
+
+    await expect(
+      writePtyStdin({
+        providerName: 'FakeSandboxClient',
+        registry,
+        sessionId,
+        chars: 'input',
+      }),
+    ).rejects.toThrow(
+      'FakeSandboxClient stdin is not available for this process.',
+    );
+  });
+
+  test('watches PTY process completion and terminates registry entries best effort', async () => {
+    const registry = new PtyProcessRegistry();
+    const terminate = vi.fn(async () => {
+      throw new Error('already gone');
+    });
+    const successEntry = createPtyProcessEntry({ terminate });
+    const failureEntry = createPtyProcessEntry({});
+    const success = registry.register(successEntry);
+    const failure = registry.register(failureEntry);
+
+    watchPtyProcess(
+      successEntry,
+      async () => ({ exitCode: 2.9 }),
+      (result) => (result as { exitCode: number }).exitCode,
+    );
+    watchPtyProcess(
+      failureEntry,
+      async () => {
+        throw new Error('boom');
+      },
+      (_result, error) => (error ? undefined : 0),
+    );
+
+    await vi.waitFor(() => {
+      expect(successEntry.done).toBe(true);
+      expect(failureEntry.done).toBe(true);
+    });
+
+    expect(successEntry.exitCode).toBe(2);
+    expect(failureEntry.exitCode).toBe(1);
+
+    await registry.terminateAll();
+
+    expect(terminate).toHaveBeenCalledOnce();
+    expect(registry.get(success.sessionId)).toBeUndefined();
+    expect(registry.get(failure.sessionId)).toBeUndefined();
+  });
+
+  test('detects image media types', () => {
+    expect(sniffImageMediaType(ONE_BY_ONE_PNG)).toBe('image/png');
+    expect(sniffImageMediaType(ONE_BY_ONE_JPEG)).toBe('image/jpeg');
+    expect(sniffImageMediaType(ONE_BY_ONE_GIF)).toBe('image/gif');
+    expect(sniffImageMediaType(ONE_BY_ONE_WEBP)).toBe('image/webp');
+    expect(
+      sniffImageMediaType(Uint8Array.from([0x89, 0x50, 0x4e, 0x47])),
+    ).toBeNull();
     expect(sniffImageMediaType(Uint8Array.from([0]))).toBeNull();
   });
 

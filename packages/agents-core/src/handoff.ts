@@ -97,13 +97,65 @@ type HandoffEnabledPredicate<TContext = UnknownContext> = (args: {
 }) => boolean | Promise<boolean>;
 
 type HandoffEnabledOption<TContext> =
-  | boolean
-  | HandoffEnabledPredicate<TContext>;
+  boolean | HandoffEnabledPredicate<TContext>;
 
 export type HandoffEnabledFunction<TContext = UnknownContext> = (args: {
   runContext: RunContext<TContext>;
   agent: Agent<any, any>;
 }) => Promise<boolean>;
+
+export type HandoffCloneOptions<
+  TContext = UnknownContext,
+  TOutput extends AgentOutputType = TextOutput,
+> = {
+  /**
+   * The agent that the cloned handoff should target.
+   */
+  agent?: Agent<TContext, TOutput>;
+
+  /**
+   * The callback that should run when the cloned handoff is invoked.
+   */
+  onInvokeHandoff?: (
+    context: RunContext<TContext>,
+    args: string,
+  ) => Promise<Agent<TContext, TOutput>> | Agent<TContext, TOutput>;
+
+  /**
+   * The model-facing name of the target agent.
+   */
+  agentName?: string;
+
+  /**
+   * The name of the tool that represents the cloned handoff.
+   */
+  toolName?: string;
+
+  /**
+   * The description of the tool that represents the cloned handoff.
+   */
+  toolDescription?: string;
+
+  /**
+   * The JSON schema for the cloned handoff input.
+   */
+  inputJsonSchema?: JsonObjectSchema<any>;
+
+  /**
+   * Whether the cloned handoff input schema is strict.
+   */
+  strictJsonSchema?: boolean;
+
+  /**
+   * A function that filters the inputs that are passed to the cloned handoff's agent.
+   */
+  inputFilter?: HandoffInputFilter;
+
+  /**
+   * Determines whether the cloned handoff should be available for the current run.
+   */
+  isEnabled?: HandoffEnabledFunction<TContext>;
+};
 
 export class Handoff<
   TContext = UnknownContext,
@@ -157,7 +209,7 @@ export class Handoff<
    * sees the entire conversation history. In some cases, you may want to filter inputs e.g. to
    * remove older inputs, or remove tools from existing inputs.
    *
-   * The function will receive the entire conversation hisstory so far, including the input item
+   * The function will receive the entire conversation history so far, including the input item
    * that triggered the handoff and a tool call output item representing the handoff tool's output.
    *
    * You are free to modify the input history or new items as you see fit. The next agent that runs
@@ -181,6 +233,40 @@ export class Handoff<
       parameters: this.inputJsonSchema,
       strict: this.strictJsonSchema,
     };
+  }
+
+  /**
+   * Makes a copy of this handoff, with the given fields changed.
+   *
+   * Tool name and description default to the original handoff's values so adapters can replace
+   * the runtime target without changing the model-facing tool contract.
+   */
+  clone(
+    overrides: HandoffCloneOptions<TContext, TOutput> = {},
+  ): Handoff<TContext, TOutput> {
+    const agent = overrides.agent ?? this.agent;
+    const onInvokeHandoff =
+      overrides.onInvokeHandoff ??
+      (overrides.agent
+        ? async (context: RunContext<TContext>, args: string) => {
+            await this.onInvokeHandoff(context, args);
+            return agent;
+          }
+        : this.onInvokeHandoff);
+    const cloned = new Handoff(agent, onInvokeHandoff);
+
+    cloned.agentName =
+      overrides.agentName ??
+      (overrides.agent ? overrides.agent.name : this.agentName);
+    cloned.toolName = overrides.toolName ?? this.toolName;
+    cloned.toolDescription = overrides.toolDescription ?? this.toolDescription;
+    cloned.inputJsonSchema = overrides.inputJsonSchema ?? this.inputJsonSchema;
+    cloned.strictJsonSchema =
+      overrides.strictJsonSchema ?? this.strictJsonSchema;
+    cloned.inputFilter = overrides.inputFilter ?? this.inputFilter;
+    cloned.isEnabled = overrides.isEnabled ?? this.isEnabled;
+
+    return cloned;
   }
 
   public isEnabled: HandoffEnabledFunction<TContext> = async () => true;
@@ -231,8 +317,8 @@ export type HandoffConfig<
   onHandoff?: OnHandoffCallback<TInputType>;
 
   /**
-   * The type of the input to the handoff. If provided as a Zod schema, the input will be validated
-   * against this type. Only relevant if you pass a function that takes an input
+   * The type of the input to the handoff. If provided as a validation schema, the input will be
+   * validated against this type. Only relevant if you pass a function that takes an input.
    */
   inputType?: TInputType;
 
@@ -264,7 +350,7 @@ export function handoff<
   agent: Agent<TContext, TOutput>,
   config: HandoffConfig<TInputType, TContext> = {},
 ) {
-  let parser: ((input: string) => Promise<any>) | undefined = undefined;
+  let parser: ((input: string) => any | Promise<any>) | undefined = undefined;
 
   const inputType = config.inputType;
   const hasInputType = inputType != null;
@@ -291,12 +377,9 @@ export function handoff<
           'Handoff function expected non empty input',
         );
       }
+      let parsed: any;
       try {
-        // verify that it's valid input but we don't care about the result
-        const parsed = await parser(inputJsonString);
-        if (config.onHandoff) {
-          await config.onHandoff(context, parsed);
-        }
+        parsed = await parser(inputJsonString);
       } catch (error) {
         addErrorToCurrentSpan({
           message: `Invalid JSON provided`,
@@ -308,6 +391,9 @@ export function handoff<
           );
         }
         throw new ModelBehaviorError('Invalid JSON provided');
+      }
+      if (config.onHandoff) {
+        await config.onHandoff(context, parsed);
       }
     } else {
       await config.onHandoff?.(context);
@@ -347,7 +433,7 @@ export function handoff<
     handoff.toolDescription = config.toolDescriptionOverride;
   }
 
-  if (config.inputFilter) {
+  if (config.inputFilter != null) {
     handoff.inputFilter = config.inputFilter;
   }
 

@@ -9,6 +9,8 @@ import {
 } from './tool';
 import { Computer } from './computer';
 import { Handoff } from './handoff';
+import type { Span } from './tracing/spans';
+import type { Trace } from './tracing/traces';
 import {
   AgentInputItem,
   AgentOutputItem,
@@ -20,14 +22,11 @@ import {
 } from './types';
 
 export type ModelSettingsToolChoice =
-  | 'auto'
-  | 'required'
-  | 'none'
-  | (string & {});
+  'auto' | 'required' | 'none' | (string & {});
 
 /**
  * Constrains effort on reasoning for [reasoning models](https://platform.openai.com/docs/guides/reasoning).
- * Currently supported values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`.
+ * Currently supported values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
  * Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning in a response.
  */
 export type ModelSettingsReasoningEffort =
@@ -37,6 +36,7 @@ export type ModelSettingsReasoningEffort =
   | 'medium'
   | 'high'
   | 'xhigh'
+  | 'max'
   | null;
 
 /**
@@ -44,11 +44,21 @@ export type ModelSettingsReasoningEffort =
  */
 export type ModelSettingsReasoning = {
   /**
+   * Controls which reasoning items are rendered back to the model on later turns.
+   */
+  context?: 'auto' | 'current_turn' | 'all_turns' | null;
+
+  /**
    * Constrains effort on reasoning for [reasoning models](https://platform.openai.com/docs/guides/reasoning).
-   * Currently supported values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`.
+   * Currently supported values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
    * Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning in a response.
    */
   effort?: ModelSettingsReasoningEffort | null;
+
+  /**
+   * Controls the reasoning execution mode for the request.
+   */
+  mode?: 'standard' | 'pro' | (string & {});
 
   /**
    * A summary of the reasoning performed by the model.
@@ -56,6 +66,21 @@ export type ModelSettingsReasoning = {
    * One of `auto`, `concise`, or `detailed`.
    */
   summary?: 'auto' | 'concise' | 'detailed' | null;
+};
+
+/**
+ * Prompt-cache configuration for supported model providers.
+ */
+export type ModelSettingsPromptCacheOptions = {
+  /**
+   * Controls whether the provider creates an implicit cache breakpoint.
+   */
+  mode?: 'implicit' | 'explicit';
+
+  /**
+   * The minimum lifetime applied to cache breakpoints written by the request.
+   */
+  ttl?: '30m';
 };
 
 export interface ModelSettingsText {
@@ -103,6 +128,14 @@ export type RetryDecision =
        * Optional explanation for logging or debugging.
        */
       reason?: string;
+
+      /**
+       * Explicit application approval to repeat provider-side work that may
+       * already have happened. This is required when replay safety is unknown
+       * or unsafe, including timed-out requests. Streamed requests remain
+       * non-retryable after any output event is emitted.
+       */
+      approveUnsafeReplay?: boolean;
     };
 
 export type ModelRetryNormalizedError = {
@@ -156,6 +189,11 @@ export type ModelRetryAdvice = {
   replaySafety?: 'unsafe' | 'safe';
 
   /**
+   * Whether the provider had begun emitting the response when the failure occurred.
+   */
+  responseStarted?: boolean;
+
+  /**
    * Provider-supplied normalized facts that should override generic extraction when present.
    */
   normalized?: Partial<ModelRetryNormalizedError>;
@@ -191,6 +229,38 @@ export type RetryPolicyContext = {
    * Generic normalized facts extracted from the error and provider advice.
    */
   normalized: ModelRetryNormalizedError;
+
+  /**
+   * The previous response identifier carried by the failed request, when present.
+   */
+  readonly previousResponseId?: string;
+
+  /**
+   * The conversation identifier carried by the failed request, when present.
+   */
+  readonly conversationId?: string;
+
+  /**
+   * Stable provider replay classification captured before the policy runs.
+   * The runner always supplies this field; it is optional for compatibility
+   * with code that constructs policy contexts directly.
+   */
+  readonly replaySafety?: 'safe' | 'unsafe' | 'unknown';
+
+  /**
+   * Stable response-start evidence captured before the policy runs.
+   * The runner preserves `undefined` when the provider supplies no evidence.
+   * The field is optional for compatibility with code that constructs policy
+   * contexts directly.
+   */
+  readonly responseStarted?: boolean;
+
+  /**
+   * Whether the failed request carried a previous response or conversation identifier.
+   * The runner always supplies this field; it is optional for compatibility
+   * with code that constructs policy contexts directly.
+   */
+  readonly statefulRequest?: boolean;
 };
 
 export type RetryPolicy = (
@@ -248,6 +318,14 @@ export type ModelRetrySettings = {
  */
 export type ModelSettings = {
   /**
+   * Cooperative timeout in milliseconds for each model call.
+   * The timeout aborts only the current model call; a run-level abort signal
+   * still cancels the entire run. Must be greater than 0 and less than or
+   * equal to 2147483647 when provided.
+   */
+  timeoutMs?: number;
+
+  /**
    * The temperature to use when calling the model.
    */
   temperature?: number;
@@ -301,6 +379,11 @@ export type ModelSettings = {
   promptCacheRetention?: 'in-memory' | '24h' | null;
 
   /**
+   * Controls implicit and explicit prompt caching for supported model providers.
+   */
+  promptCacheOptions?: ModelSettingsPromptCacheOptions;
+
+  /**
    * Context-management strategies to apply when calling the model.
    * This setting is available on OpenAI Responses requests, including server-side compaction.
    * See https://developers.openai.com/api/docs/guides/compaction.
@@ -327,6 +410,12 @@ export type ModelSettings = {
    * Runtime-only retry configuration for the model request.
    */
   retry?: ModelRetrySettings;
+
+  /**
+   * Whether to preserve a JSON-compatible snapshot of provider usage before
+   * the Agents SDK normalizes it. Defaults to false if not provided.
+   */
+  preserveRawUsage?: boolean;
 };
 
 export type ModelTracing = boolean | 'enabled_without_data';
@@ -364,6 +453,21 @@ export type SerializedFunctionTool = {
   deferLoading?: FunctionTool['deferLoading'];
 
   /**
+   * Additional provider-specific metadata forwarded with the function tool definition.
+   */
+  providerData?: FunctionTool['providerData'];
+
+  /**
+   * Responses API only. Execution contexts allowed to invoke the function.
+   */
+  allowedCallers?: FunctionTool['allowedCallers'];
+
+  /**
+   * Responses API only. Schema for the JSON value encoded in string outputs.
+   */
+  outputSchema?: FunctionTool['outputSchema'];
+
+  /**
    * Responses API only. Explicit namespace used to group related function tools.
    */
   namespace?: string;
@@ -385,11 +489,13 @@ export type SerializedShellTool = {
   type: ShellTool['type'];
   name: ShellTool['name'];
   environment?: ShellTool['environment'];
+  allowedCallers?: ShellTool['allowedCallers'];
 };
 
 export type SerializedApplyPatchTool = {
   type: ApplyPatchTool['type'];
   name: ApplyPatchTool['name'];
+  allowedCallers?: ApplyPatchTool['allowedCallers'];
 };
 
 export type SerializedHostedTool = {
@@ -514,6 +620,9 @@ export type ModelRequest = {
    */
   _internal?: {
     runnerManagedRetry?: boolean;
+    reasoningEffortImplicit?: boolean;
+    tracingParent?: Span<any> | Trace;
+    toolNameCollisionPolicy?: 'warn' | 'error';
   };
 };
 
@@ -565,6 +674,12 @@ export type ModelResponse = {
    * Raw response data from the underlying model provider.
    */
   providerData?: Record<string, any>;
+
+  /**
+   * A detached JSON-compatible snapshot of provider usage captured before
+   * the Agents SDK normalizes missing values. Only populated when requested.
+   */
+  rawUsage?: Record<string, unknown>;
 };
 
 /**

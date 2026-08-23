@@ -1,4 +1,5 @@
 import type { AgentInputItem } from '../../types';
+import { UserError } from '../../errors';
 import { Capability } from './base';
 import { supportsResponsesCompactionTransport } from './transport';
 
@@ -28,6 +29,15 @@ export class DynamicCompactionPolicy extends CompactionPolicy {
     fallbackThreshold: number = 240000,
   ) {
     super();
+    if (
+      !Number.isFinite(thresholdRatio) ||
+      thresholdRatio < 0 ||
+      thresholdRatio > 1
+    ) {
+      throw new UserError(
+        'DynamicCompactionPolicy.thresholdRatio must be a finite number between 0 and 1.',
+      );
+    }
     this.thresholdRatio = thresholdRatio;
     this.fallbackThreshold = fallbackThreshold;
   }
@@ -148,6 +158,10 @@ function getSandboxCompactionModelCandidates(model: string): string[] {
 }
 
 const SANDBOX_CONTEXT_WINDOWS_1M = new Set([
+  'gpt-5.6',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
   'gpt-5.4',
   'gpt-5.4-2026-03-05',
   'gpt-5.4-pro',

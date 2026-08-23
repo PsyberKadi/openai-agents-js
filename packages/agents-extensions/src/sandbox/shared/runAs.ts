@@ -2,6 +2,10 @@ import { SandboxProviderError, type Entry } from '@openai/agents-core/sandbox';
 import { RemoteSandboxEditor } from './editor';
 import type { ManifestMaterializationOptions } from './manifest';
 import { sandboxEntryPermissionsMode } from './metadata';
+import {
+  probeRemoteSandboxDirectoryExists,
+  probeRemoteSandboxPathExists,
+} from './pathProbe';
 import { shellQuote } from './paths';
 import type {
   RemoteManifestWriter,
@@ -74,7 +78,10 @@ export function createRunAsRemoteEditor(args: {
         }),
       ),
     pathExists: async (path) =>
-      await runAsRemotePathExists(path, args.runAs, args.runCommand),
+      await runAsRemotePathExists(path, args.runAs, args.runCommand, {
+        providerName: args.providerName,
+        providerId: args.providerId,
+      }),
     writeText: async (path, content) => {
       await args.beforeFilesystemMutation?.();
       await writeRunAsRemoteText({
@@ -123,9 +130,38 @@ export async function runAsRemotePathExists(
   path: string,
   runAs: string | undefined,
   runCommand: RemoteRunAsCommandRunner,
+  provider: {
+    providerName: string;
+    providerId: string;
+  } = {
+    providerName: 'RemoteSandboxClient',
+    providerId: 'remote',
+  },
 ): Promise<boolean> {
-  const result = await runCommand(`test -e ${shellQuote(path)}`, { runAs });
-  return result.status === 0;
+  return await probeRemoteSandboxPathExists({
+    ...provider,
+    path,
+    runCommand: async (command) => await runCommand(command, { runAs }),
+  });
+}
+
+export async function runAsRemoteDirectoryExists(
+  path: string,
+  runAs: string | undefined,
+  runCommand: RemoteRunAsCommandRunner,
+  provider: {
+    providerName: string;
+    providerId: string;
+  } = {
+    providerName: 'RemoteSandboxClient',
+    providerId: 'remote',
+  },
+): Promise<boolean> {
+  return await probeRemoteSandboxDirectoryExists({
+    ...provider,
+    path,
+    runCommand: async (command) => await runCommand(command, { runAs }),
+  });
 }
 
 export async function writeRunAsRemoteText(args: {

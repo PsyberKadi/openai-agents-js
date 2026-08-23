@@ -27,6 +27,7 @@ import type {
   AgentInputItem,
   ResolvedAgentOutput,
   JsonSchemaDefinition,
+  JsonObjectSchema,
   HandoffsOutput,
   Expand,
 } from './types';
@@ -51,18 +52,35 @@ import {
   type StructuredToolInputBuilder,
 } from './agentToolInput';
 import {
+  getToolCallParentSpanFromDetails,
   getAgentToolParentRunConfigFromDetails,
   getInheritedAgentToolRunConfig,
   mergeAgentToolRunConfig,
 } from './agentToolRunConfig';
-import type { ZodObjectLike } from './utils/zodCompat';
+import type { StandardSchemaWithJSON } from './utils/standardSchema';
+import {
+  assertStandardSchemaObjectRoot,
+  hasStandardSchemaMarker,
+  isStandardSchemaWithJSON,
+  standardSchemaToJsonSchema,
+  validateStandardSchema,
+  unsupportedStandardSchemaError,
+} from './utils/standardSchema';
+import { prepareOpenAIStrictToolSchema } from './utils/strictToolSchema';
 import { saveAgentToolRunResult } from './agentToolRunResults';
 import { registerAgentToolSourceAgent } from './agentToolSourceRegistry';
 import type { AgentToolInvocation } from './agentToolInvocation';
+import {
+  getToolUsageRecorder,
+  setRunnerParentUsageRecorder,
+} from './runner/usageTracking';
+import { setRunnerInvocationSpanParent } from './runner/invocationContext';
+import type { Span } from './tracing';
+import { hasDefinitelyDifferentOutputTypes } from './agentOutputTypeWarning';
+import type { ZodObjectLike } from './utils/zodCompat';
 
 type CompletedRunResult<TContext, TAgent extends Agent<TContext, any>> = (
-  | RunResult<TContext, TAgent>
-  | StreamedRunResult<TContext, TAgent>
+  RunResult<TContext, TAgent> | StreamedRunResult<TContext, TAgent>
 ) & {
   finalOutput: ResolvedAgentOutput<TAgent['outputType']>;
 };
@@ -100,7 +118,7 @@ type AgentToolEventHandler<TAgent extends Agent<any, any>> = (
 ) => void | Promise<void>;
 type AgentToolInputBuilder<TParameters extends AgentToolInputParameters> =
   StructuredToolInputBuilder<ToolExecuteArgument<TParameters>>;
-type AgentToolOptions<
+export type AgentToolOptions<
   TContext,
   TAgent extends Agent<TContext, any>,
   TParameters extends AgentToolInputParameters,
@@ -164,21 +182,21 @@ type AgentToolOptions<
    */
   onStream?: (event: AgentToolStreamEvent<TAgent>) => void | Promise<void>;
 };
-type AgentToolOptionsWithDefault<
+export type AgentToolOptionsWithDefault<
   TContext,
   TAgent extends Agent<TContext, any>,
 > = Omit<
   AgentToolOptions<TContext, TAgent, typeof AgentAsToolInputSchema>,
   'parameters'
 > & { parameters?: undefined };
-type AgentToolOptionsWithParameters<
+export type AgentToolOptionsWithParameters<
   TContext,
   TAgent extends Agent<TContext, any>,
   TParameters extends AgentToolInputParameters,
 > = AgentToolOptions<TContext, TAgent, TParameters> & {
   parameters: TParameters;
 };
-type AgentTool<
+export type AgentTool<
   TContext,
   TAgent extends Agent<TContext, any>,
   TParameters extends AgentToolInputParameters,
@@ -237,6 +255,7 @@ export type ToolsToFinalOutputResult =
 export type AgentOutputType<HandoffOutputType = UnknownContext> =
   | TextOutput
   | ZodObjectLike
+  | StandardSchemaWithJSON<any, any>
   | JsonSchemaDefinition
   | HandoffsOutput<HandoffOutputType>;
 
@@ -325,7 +344,7 @@ export interface AgentConfiguration<
    * The model implementation to use when invoking the LLM.
    *
    * By default, if not set, the agent will use the default model returned by
-   * getDefaultModel (currently "gpt-5.4-mini").
+   * getDefaultModel (currently "gpt-5.6-luna").
    */
   model: string | Model;
 
@@ -451,8 +470,7 @@ type ExtractHandoffOutput<T> = T extends Handoff<any, infer O> ? O : never;
 export type HandoffsOutputUnion<
   Handoffs extends readonly (Agent<any, any> | Handoff<any, any>)[],
 > =
-  | ExtractAgentOutput<Handoffs[number]>
-  | ExtractHandoffOutput<Handoffs[number]>;
+  ExtractAgentOutput<Handoffs[number]> | ExtractHandoffOutput<Handoffs[number]>;
 
 /**
  * Helper type for config with handoffs
@@ -557,6 +575,24 @@ export class Agent<
     this.inputGuardrails = config.inputGuardrails ?? [];
     this.outputGuardrails = config.outputGuardrails ?? [];
     if (config.outputType) {
+      if (
+        !isZodObject(config.outputType) &&
+        hasStandardSchemaMarker(config.outputType) &&
+        !isStandardSchemaWithJSON(config.outputType)
+      ) {
+        throw unsupportedStandardSchemaError();
+      }
+      if (
+        !isZodObject(config.outputType) &&
+        isStandardSchemaWithJSON(config.outputType)
+      ) {
+        const inputSchema = standardSchemaToJsonSchema(
+          config.outputType,
+          'input',
+        );
+        assertStandardSchemaObjectRoot(inputSchema, 'Agent output');
+        prepareOpenAIStrictToolSchema(inputSchema as JsonObjectSchema<any>);
+      }
       this.outputType = config.outputType;
     }
     this.toolUseBehavior = config.toolUseBehavior ?? 'run_llm_again';
@@ -586,18 +622,30 @@ export class Agent<
       config.handoffOutputTypeWarningEnabled
     ) {
       if (this.handoffs && this.outputType) {
-        const outputTypes = new Set<string>([JSON.stringify(this.outputType)]);
+        const outputTypes: unknown[] = [this.outputType];
         for (const h of this.handoffs) {
           if ('outputType' in h && h.outputType) {
-            outputTypes.add(JSON.stringify(h.outputType));
+            outputTypes.push(h.outputType);
           } else if ('agent' in h && h.agent.outputType) {
-            outputTypes.add(JSON.stringify(h.agent.outputType));
+            outputTypes.push(h.agent.outputType);
           }
         }
-        if (outputTypes.size > 1) {
-          logger.warn(
-            `[Agent] Warning: Handoff agents have different output types: ${Array.from(outputTypes).join(', ')}. You can make it type-safe by using Agent.create({ ... }) method instead.`,
+
+        if (logger.dontLogModelData) {
+          if (hasDefinitelyDifferentOutputTypes(outputTypes)) {
+            logger.warn(
+              '[Agent] Warning: Handoff agents have different output types. Output type details are redacted. You can make it type-safe by using Agent.create({ ... }) method instead.',
+            );
+          }
+        } else {
+          const serializedOutputTypes = outputTypes.map((type) =>
+            JSON.stringify(type),
           );
+          if (new Set<string>(serializedOutputTypes).size > 1) {
+            logger.warn(
+              `[Agent] Warning: Handoff agents have different output types: ${serializedOutputTypes.join(', ')}. You can make it type-safe by using Agent.create({ ... }) method instead.`,
+            );
+          }
         }
       }
     }
@@ -616,8 +664,10 @@ export class Agent<
       return 'text';
     } else if (isZodObject(this.outputType)) {
       return 'ZodOutput';
+    } else if (isStandardSchemaWithJSON(this.outputType)) {
+      return 'StandardSchemaOutput';
     } else if (typeof this.outputType === 'object') {
-      return this.outputType.name;
+      return (this.outputType as JsonSchemaDefinition).name;
     }
 
     throw new Error(`Unknown output type: ${this.outputType}`);
@@ -629,6 +679,30 @@ export class Agent<
    * ```
    * const newAgent = agent.clone({ instructions: 'New instructions' })
    * ```
+   *
+   * This method never copies a list property such as `tools`, `handoffs`, `mcpServers`,
+   * `inputGuardrails`, or `outputGuardrails`. It merges `config` over this agent's current
+   * property values and constructs a new agent from the result, so each list is whatever that
+   * merged configuration holds. Two consequences follow:
+   *
+   * - A property `config` leaves out arrives as the original agent's own array, which both agents
+   *   then share, entries included.
+   * - A property `config` includes is taken exactly as given, so it shares an array or an entry
+   *   with the original agent only where you reused one. Including the property with the value
+   *   `undefined` still counts as including it, and the new agent starts that list empty instead
+   *   of inheriting it.
+   *
+   * Because two agents can hold one array, mutating it through either one also changes the other.
+   * After `const clonedAgent = agent.clone({ name: 'Clone' })`, calling
+   * `clonedAgent.tools.push(extraTool)` adds that tool to `agent` as well. To give the clone a
+   * list that no other agent holds, pass a new array:
+   *
+   * ```
+   * const newAgent = agent.clone({ tools: [...agent.tools, extraTool] })
+   * ```
+   *
+   * The entries copied into that new array, such as tool and handoff objects, remain the same
+   * objects the original agent holds.
    *
    * @param config - A partial configuration to change.
    * @returns A new agent with the given changes.
@@ -739,8 +813,7 @@ export class Agent<
       parameters: toolParameters,
       strict: true,
       needsApproval: needsApproval as
-        | boolean
-        | ToolApprovalFunction<ToolInputParametersStrict>,
+        boolean | ToolApprovalFunction<ToolInputParametersStrict>,
       isEnabled,
       execute: async (
         params: ToolExecuteArgument<ToolInputParametersStrict>,
@@ -794,6 +867,11 @@ export class Agent<
           runConfig,
         );
         const runner = new Runner(nestedRunConfig);
+        setRunnerParentUsageRecorder(runner, getToolUsageRecorder(details));
+        setRunnerInvocationSpanParent(
+          runner,
+          getToolCallParentSpanFromDetails(details),
+        );
         const resumeContextStrategy = resumeState?.contextStrategy ?? 'merge';
         const resumeContext =
           resumeContextStrategy === 'preferSerialized' ? undefined : runContext;
@@ -811,7 +889,7 @@ export class Agent<
               context &&
               resumeContext !== context
             ) {
-              resumeContext._mergeApprovals(context.toJSON().approvals);
+              resumeContext._mergeApprovalState(context);
             }
             runInput = await RunState.fromStringWithContext<TContext, TAgent>(
               this,
@@ -870,6 +948,17 @@ export class Agent<
               });
             }
             await streamResult.completed;
+            if (streamResult.cancelled) {
+              const currentStep = streamResult.state._currentStep;
+              const hasCommittedOutcome =
+                (currentStep?.type === 'next_step_final_output' &&
+                  streamResult.state._currentTurnInProgress === false) ||
+                (streamResult.interruptions?.length ?? 0) > 0;
+              if (!hasCommittedOutcome) {
+                combinedSignal?.throwIfAborted();
+                throw new Error('Nested agent run was cancelled.');
+              }
+            }
           }
 
           const completedResult = result as CompletedRunResult<
@@ -903,6 +992,8 @@ export class Agent<
             outputText = await customOutputExtractor(
               completedResultWithAgentToolInvocation,
             );
+          } else if ((completedResult.interruptions?.length ?? 0) > 0) {
+            outputText = '';
           } else {
             const finalOutputText =
               typeof completedResult.finalOutput !== 'undefined'
@@ -991,6 +1082,7 @@ export class Agent<
    */
   async getMcpTools(
     runContext: RunContext<TContext>,
+    tracingParent?: Span<any>,
   ): Promise<Tool<TContext>[]> {
     if (this.mcpServers.length > 0) {
       const includeServerInToolNames =
@@ -1005,6 +1097,7 @@ export class Agent<
         reservedToolNames: includeServerInToolNames
           ? await this.getMcpToolReservedNames(runContext)
           : undefined,
+        tracingParent,
       });
     }
 
@@ -1037,8 +1130,9 @@ export class Agent<
    */
   async getAllTools(
     runContext: RunContext<TContext>,
+    tracingParent?: Span<any>,
   ): Promise<Tool<TContext>[]> {
-    const mcpTools = await this.getMcpTools(runContext);
+    const mcpTools = await this.getMcpTools(runContext, tracingParent);
     const enabledTools: Tool<TContext>[] = [];
 
     for (const candidate of this.tools) {
@@ -1096,11 +1190,33 @@ export class Agent<
       return output as ResolvedAgentOutput<TOutput>;
     }
 
-    if (typeof this.outputType === 'object') {
+    if (
+      typeof this.outputType === 'object' ||
+      typeof this.outputType === 'function'
+    ) {
       const parsed = JSON.parse(output);
 
       if (isZodObject(this.outputType)) {
         return this.outputType.parse(parsed) as ResolvedAgentOutput<TOutput>;
+      }
+
+      if (isStandardSchemaWithJSON(this.outputType)) {
+        const inputSchema = standardSchemaToJsonSchema(
+          this.outputType,
+          'input',
+        );
+        assertStandardSchemaObjectRoot(inputSchema, 'Agent output');
+        const normalized = prepareOpenAIStrictToolSchema(
+          inputSchema as JsonObjectSchema<any>,
+        ).normalizeInput(parsed);
+        return validateStandardSchema(
+          this.outputType,
+          normalized,
+        ) as ResolvedAgentOutput<TOutput>;
+      }
+
+      if (hasStandardSchemaMarker(this.outputType)) {
+        throw unsupportedStandardSchemaError();
       }
 
       return parsed as ResolvedAgentOutput<TOutput>;

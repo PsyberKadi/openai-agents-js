@@ -21,6 +21,20 @@ import logger from '../src/logger';
  * shapes expected by OpenAI's Chat Completions API.
  */
 describe('itemsToMessages', () => {
+  test('rejects Responses compaction history before conversion', () => {
+    const compaction: protocol.CompactionItem = {
+      type: 'compaction',
+      id: 'cmp_1',
+      encrypted_content: 'ciphertext',
+    };
+
+    expect(() => itemsToMessages([compaction])).toThrowError(
+      new UserError(
+        'Compaction items are not supported for chat completions. Please use the Responses API when working with compaction.',
+      ),
+    );
+  });
+
   test('converts built-in file_search_call without throwing', () => {
     const items: protocol.ModelItem[] = [
       {
@@ -101,6 +115,74 @@ describe('content extraction helpers', () => {
       {
         type: 'input_audio',
         input_audio: { data: 'abc', format: 'mp3', foo: 'bar' },
+      },
+    ]);
+  });
+
+  test('extractAllUserContent honors top-level input_image detail', () => {
+    const userContent: protocol.UserMessageItem['content'] = [
+      {
+        type: 'input_image',
+        image: 'http://img',
+        detail: 'low',
+      },
+    ];
+    const converted = extractAllUserContent(userContent);
+    expect(converted).toEqual([
+      { type: 'image_url', image_url: { url: 'http://img', detail: 'low' } },
+    ]);
+  });
+
+  test('extractAllUserContent preserves prompt-cache breakpoints', () => {
+    const promptCacheBreakpoint = { mode: 'explicit' } as const;
+    const userContent: protocol.UserMessageItem['content'] = [
+      {
+        type: 'input_text',
+        text: 'one',
+        promptCacheBreakpoint,
+      },
+      {
+        type: 'input_image',
+        image: 'http://img',
+        promptCacheBreakpoint,
+      },
+      {
+        type: 'input_file',
+        file: 'data:text/plain;base64,SGVsbG8=',
+        filename: 'hello.txt',
+        promptCacheBreakpoint,
+      },
+      {
+        type: 'audio',
+        audio: 'AAA=',
+        format: 'wav',
+        promptCacheBreakpoint,
+      },
+    ];
+
+    expect(extractAllUserContent(userContent)).toEqual([
+      {
+        type: 'text',
+        text: 'one',
+        prompt_cache_breakpoint: promptCacheBreakpoint,
+      },
+      {
+        type: 'image_url',
+        image_url: { url: 'http://img' },
+        prompt_cache_breakpoint: promptCacheBreakpoint,
+      },
+      {
+        type: 'file',
+        file: {
+          file_data: 'data:text/plain;base64,SGVsbG8=',
+          filename: 'hello.txt',
+        },
+        prompt_cache_breakpoint: promptCacheBreakpoint,
+      },
+      {
+        type: 'input_audio',
+        input_audio: { data: 'AAA=', format: 'wav' },
+        prompt_cache_breakpoint: promptCacheBreakpoint,
       },
     ]);
   });
@@ -421,6 +503,119 @@ describe('itemsToMessages', () => {
         ],
       },
       { role: 'assistant', content: [{ type: 'text', text: 'there' }] },
+    ]);
+  });
+
+  test.each(['commentary', 'final_answer'] as const)(
+    'warns before dropping unsupported assistant phase "%s"',
+    (phase) => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+      const items: protocol.ModelItem[] = [
+        {
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          phase,
+          content: [{ type: 'output_text', text: 'assistant reply' }],
+        },
+      ];
+
+      try {
+        expect(itemsToMessages(items)).toEqual([
+          {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'assistant reply' }],
+          },
+        ]);
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining('Assistant message phase is not supported'),
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    },
+  );
+
+  test('rejects unsupported assistant phases in strict validation mode', () => {
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        phase: 'commentary',
+        content: [{ type: 'output_text', text: 'assistant reply' }],
+      },
+    ];
+
+    expect(() =>
+      itemsToMessages(items, { strictFeatureValidation: true }),
+    ).toThrow(UserError);
+    expect(() =>
+      itemsToMessages(items, { strictFeatureValidation: true }),
+    ).toThrow('Use the Responses API to preserve assistant message phases.');
+  });
+
+  test('detects and removes assistant phases stored in legacy providerData', () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: 'assistant reply' }],
+        providerData: { phase: 'commentary', custom: 'keep' },
+      },
+    ];
+
+    try {
+      expect(itemsToMessages(items)).toEqual([
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'assistant reply' }],
+          custom: 'keep',
+        },
+      ]);
+      expect(warnSpy).toHaveBeenCalledOnce();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test('rejects invalid assistant phases in Chat Completions conversion', () => {
+    const items = [
+      {
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        phase: 'invalid',
+        content: [{ type: 'output_text', text: 'assistant reply' }],
+      },
+    ] as any;
+
+    expect(() => itemsToMessages(items)).toThrow(
+      'Invalid assistant message phase: "invalid". Expected "commentary" or "final_answer".',
+    );
+  });
+
+  test('does not forward assistant-only phase metadata on other message roles', () => {
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'message',
+        role: 'system',
+        content: 'instructions',
+        providerData: { phase: 'commentary', custom: 'keep-system' },
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: 'input',
+        providerData: { phase: 'final_answer', custom: 'keep-user' },
+      },
+    ];
+
+    expect(itemsToMessages(items)).toEqual([
+      { role: 'system', content: 'instructions', custom: 'keep-system' },
+      { role: 'user', content: 'input', custom: 'keep-user' },
     ]);
   });
 
@@ -762,6 +957,233 @@ describe('itemsToMessages', () => {
     ]);
   });
 
+  test('keeps reasoning on the assistant message it belongs to', () => {
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'reasoning',
+        content: [],
+        rawContent: [{ type: 'reasoning_text', text: 'why' }],
+      } as protocol.ReasoningItem,
+      {
+        id: 'msg_1',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: 'hello' }],
+      } as protocol.AssistantMessageItem,
+    ];
+    const msgs = itemsToMessages(items);
+    expect(msgs).toEqual([
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'hello' }],
+        reasoning: 'why',
+      },
+    ]);
+  });
+
+  test('drops an empty reasoning item instead of emitting an empty assistant turn', () => {
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'reasoning',
+        content: [],
+        rawContent: [],
+      } as protocol.ReasoningItem,
+      {
+        id: 'msg_1',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: 'hello' }],
+      } as protocol.AssistantMessageItem,
+    ];
+    const msgs = itemsToMessages(items);
+    expect(msgs).toEqual([
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'hello' }],
+      },
+    ]);
+  });
+
+  test('keeps reasoning with the tool call message when a tool call follows', () => {
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'reasoning',
+        content: [],
+        rawContent: [{ type: 'reasoning_text', text: 'why' }],
+      } as protocol.ReasoningItem,
+      {
+        type: 'function_call',
+        id: '1',
+        callId: 'call1',
+        name: 'f',
+        arguments: '{}',
+        status: 'completed',
+      } as protocol.FunctionCallItem,
+    ];
+    const msgs = itemsToMessages(items);
+    expect(msgs).toEqual([
+      {
+        role: 'assistant',
+        content: null,
+        reasoning: 'why',
+        tool_calls: [
+          {
+            id: 'call1',
+            type: 'function',
+            function: { name: 'f', arguments: '{}' },
+          },
+        ],
+      },
+    ]);
+  });
+
+  test('does not attach reasoning to a following user message', () => {
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'reasoning',
+        content: [],
+        rawContent: [{ type: 'reasoning_text', text: 'why' }],
+      } as protocol.ReasoningItem,
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'hi' }],
+      } as protocol.UserMessageItem,
+    ];
+    const msgs = itemsToMessages(items);
+    expect(msgs).toEqual([
+      { role: 'assistant', content: null, reasoning: 'why' },
+      { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+    ]);
+  });
+
+  test('does not steal reasoning from a previous assistant message', () => {
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'reasoning',
+        content: [],
+        rawContent: [{ type: 'reasoning_text', text: 'first' }],
+      } as protocol.ReasoningItem,
+      {
+        id: 'msg_1',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: 'one' }],
+      } as protocol.AssistantMessageItem,
+      {
+        id: 'msg_2',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: 'two' }],
+      } as protocol.AssistantMessageItem,
+    ];
+    const msgs = itemsToMessages(items);
+    expect(msgs).toEqual([
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'one' }],
+        reasoning: 'first',
+      },
+      { role: 'assistant', content: [{ type: 'text', text: 'two' }] },
+    ]);
+  });
+
+  test('does not carry reasoning across an unknown provider item', () => {
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'reasoning',
+        content: [],
+        rawContent: [{ type: 'reasoning_text', text: 'why' }],
+      } as protocol.ReasoningItem,
+      {
+        type: 'unknown',
+        providerData: { role: 'assistant', content: 'provider specific' },
+      } as unknown as protocol.ModelItem,
+      {
+        id: 'msg_1',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: 'hello' }],
+      } as protocol.AssistantMessageItem,
+    ];
+    const msgs = itemsToMessages(items);
+    expect(msgs).toEqual([
+      { role: 'assistant', content: null, reasoning: 'why' },
+      { role: 'assistant', content: 'provider specific' },
+      { role: 'assistant', content: [{ type: 'text', text: 'hello' }] },
+    ]);
+  });
+
+  test('keeps an unknown provider item in history order', () => {
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'function_call',
+        id: '1',
+        callId: 'call1',
+        name: 'f',
+        arguments: '{}',
+        status: 'completed',
+      } as protocol.FunctionCallItem,
+      {
+        type: 'unknown',
+        providerData: { role: 'assistant', content: 'provider specific' },
+      } as unknown as protocol.ModelItem,
+    ];
+    const msgs = itemsToMessages(items);
+    expect(msgs.map((m) => (m as any).content)).toEqual([
+      null,
+      'provider specific',
+    ]);
+  });
+
+  test('does not accumulate contentless assistant messages across turns', () => {
+    // Replayed history from a provider that returns reasoning on the assistant
+    // message grows by one reasoning item per turn. Each one used to add its own
+    // assistant message with no content and no tool calls.
+    const items: protocol.ModelItem[] = [];
+    for (const turn of [1, 2, 3, 4, 5]) {
+      items.push({
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: `question ${turn}` }],
+      } as protocol.UserMessageItem);
+      items.push({
+        type: 'reasoning',
+        content: [],
+        rawContent: [{ type: 'reasoning_text', text: `reasoning ${turn}` }],
+      } as protocol.ReasoningItem);
+      items.push({
+        id: `msg_${turn}`,
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: `answer ${turn}` }],
+      } as protocol.AssistantMessageItem);
+    }
+
+    const msgs = itemsToMessages(items);
+    const assistantMessages = msgs.filter((m) => m.role === 'assistant');
+
+    expect(assistantMessages).toHaveLength(5);
+    expect(
+      assistantMessages.filter(
+        (m) => m.content === null && !(m as any).tool_calls,
+      ),
+    ).toHaveLength(0);
+    expect(assistantMessages.map((m) => (m as any).reasoning)).toEqual([
+      'reasoning 1',
+      'reasoning 2',
+      'reasoning 3',
+      'reasoning 4',
+      'reasoning 5',
+    ]);
+  });
+
   test('propagates providerData from function_call to assistant message', () => {
     const items: protocol.ModelItem[] = [
       {
@@ -933,6 +1355,20 @@ describe('itemsToMessages', () => {
 });
 
 describe('tool helpers', () => {
+  test('itemsToMessages rejects Programmatic Tool Calling history', () => {
+    expect(() =>
+      itemsToMessages([
+        {
+          type: 'program',
+          id: 'prog_1',
+          callId: 'call_prog_1',
+          code: 'text("ok")',
+          fingerprint: 'fp_1',
+        },
+      ]),
+    ).toThrow(/Programmatic Tool Calling history is not supported/);
+  });
+
   test('toolToOpenAI rejects non-function tools', () => {
     const tool: SerializedTool = { type: 'builtin' } as any;
     expect(() => toolToOpenAI(tool)).toThrow();

@@ -7,8 +7,13 @@ import {
   isGpt5Default,
 } from '../src/defaultModel';
 import { loadEnv } from '../src/config';
+import { Agent } from '../src/agent';
 vi.mock('../src/config', () => ({
   loadEnv: vi.fn(),
+  logging: {
+    dontLogModelData: false,
+    dontLogToolData: false,
+  },
 }));
 const mockedLoadEnv = vi.mocked(loadEnv);
 beforeEach(() => {
@@ -35,9 +40,9 @@ describe('gpt5ReasoningSettingsRequired', () => {
   });
 });
 describe('getDefaultModel', () => {
-  test('falls back to gpt-5.4-mini when env var missing', () => {
+  test('falls back to gpt-5.6-luna when env var missing', () => {
     mockedLoadEnv.mockReturnValue({});
-    expect(getDefaultModel()).toBe('gpt-5.4-mini');
+    expect(getDefaultModel()).toBe('gpt-5.6-luna');
   });
   test('lowercases provided env value', () => {
     mockedLoadEnv.mockReturnValue({
@@ -45,6 +50,21 @@ describe('getDefaultModel', () => {
     });
     expect(getDefaultModel()).toBe('gpt-5-mini');
   });
+
+  test.each(['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])(
+    'lowercases the %s model family from the environment',
+    (model) => {
+      mockedLoadEnv.mockReturnValue({
+        [OPENAI_DEFAULT_MODEL_ENV_VARIABLE_NAME]: model.toUpperCase(),
+      });
+
+      expect(getDefaultModel()).toBe(model);
+      expect(new Agent({ name: 'TestAgent' }).modelSettings).toEqual({
+        reasoning: { effort: 'none' },
+        text: { verbosity: 'low' },
+      });
+    },
+  );
 });
 describe('isGpt5Default', () => {
   test('returns true for the built-in GPT-5 default model', () => {
@@ -64,7 +84,7 @@ describe('isGpt5Default', () => {
   });
 });
 describe('getDefaultModelSettings', () => {
-  test('returns GPT-5.4 mini defaults when no model is specified', () => {
+  test('returns GPT-5.6 Luna defaults when no model is specified', () => {
     mockedLoadEnv.mockReturnValue({});
     expect(getDefaultModelSettings()).toEqual({
       reasoning: { effort: 'none' },
@@ -178,6 +198,16 @@ describe('getDefaultModelSettings', () => {
       text: { verbosity: 'low' },
     });
   });
+
+  test.each(['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])(
+    'returns none reasoning defaults for %s',
+    (model) => {
+      expect(getDefaultModelSettings(model)).toEqual({
+        reasoning: { effort: 'none' },
+        text: { verbosity: 'low' },
+      });
+    },
+  );
 
   test('omits reasoning defaults for GPT-5 variants without confirmed support', () => {
     expect(getDefaultModelSettings('gpt-5-mini')).toEqual({

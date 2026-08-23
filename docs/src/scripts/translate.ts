@@ -16,12 +16,13 @@ import fs from 'fs/promises';
 import path from 'path';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import { Agent, Runner, setDefaultOpenAIKey } from '@openai/agents';
 import {
-  Agent,
-  getDefaultModelSettings,
-  Runner,
-  setDefaultOpenAIKey,
-} from '@openai/agents';
+  preserveCanonicalHeadingIds,
+  refreshLocalizedHeadingIds,
+  validateTranslationHeadingInputs,
+  writeCanonicalHeadingCopy,
+} from './headingAnchors';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -140,7 +141,7 @@ const languages: Record<string, string> = {
   zh: 'Chinese',
   // Add more languages here
 };
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.4';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.6-sol';
 setDefaultOpenAIKey(process.env.OPENAI_API_KEY || '');
 const ENABLE_CODE_SNIPPET_EXCLUSION = true;
 
@@ -296,6 +297,17 @@ const engToNonEngInstructions: Record<string, string[]> = {
 
 async function ensureDir(dir: string) {
   await fs.mkdir(dir, { recursive: true });
+}
+
+async function readExistingFile(filePath: string): Promise<string | undefined> {
+  try {
+    return await fs.readFile(filePath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 function adjustLocalizedMdxImports(content: string): string {
@@ -612,12 +624,14 @@ async function callAgent(
   instructions: string,
   model: string = OPENAI_MODEL,
 ): Promise<string> {
-  const modelSettings = getDefaultModelSettings(model);
   const agent = new Agent({
     name: 'translator',
     instructions,
     model,
-    modelSettings,
+    modelSettings: {
+      reasoning: { effort: 'high' },
+      text: { verbosity: 'medium' },
+    },
   });
   const result = await runner.run(agent, content);
   const output = result.finalOutput;
@@ -677,15 +691,21 @@ function chunkMarkdown(content: string): {
   return { chunks, codeBlocks };
 }
 
-async function translateFile(
+export async function translateFile(
   filePath: string,
   targetPath: string,
   langCode: string,
 ): Promise<void> {
-  // Load sidebar translations for this language
+  const content = await fs.readFile(filePath, 'utf8');
+  const previousLocalizedMarkdown = await readExistingFile(targetPath);
+  await validateTranslationHeadingInputs(
+    content,
+    previousLocalizedMarkdown,
+    path.relative(REPO_ROOT, targetPath),
+  );
+  // Load sidebar translations only after validating the known inputs.
   const sidebarMap = await extractSidebarTranslations(langCode);
   console.log(`Translating ${filePath} into a different language: ${langCode}`);
-  const content = await fs.readFile(filePath, 'utf8');
 
   // Streamlined frontmatter extraction
   const lines = content.split('\n');
@@ -718,7 +738,7 @@ async function translateFile(
         langCode,
       );
       translatedTitle = sanitizeTitle(
-        await callAgent(titleValue, instructions, 'gpt-4.1'),
+        await callAgent(titleValue, instructions, 'gpt-5.4-mini'),
       );
     }
     // Remove markdown heading if present as the first non-empty line after frontmatter
@@ -744,8 +764,12 @@ async function translateFile(
     mainContent = adjustLocalizedMdxImports(mainContent);
   } else {
     // If not matching, keep original English content
-    await ensureDir(path.dirname(targetPath));
-    await fs.writeFile(targetPath, content, 'utf8');
+    await writeCanonicalHeadingCopy(
+      content,
+      targetPath,
+      path.relative(REPO_ROOT, targetPath),
+      previousLocalizedMarkdown,
+    );
     return;
   }
 
@@ -773,6 +797,12 @@ async function translateFile(
   translatedText = frontmatter + '\n' + translatedText.trimStart();
   translatedText = localizeSiteLinks(translatedText, langCode);
   translatedText = normalizeTypography(translatedText);
+  translatedText = await preserveCanonicalHeadingIds(
+    content,
+    translatedText,
+    path.relative(REPO_ROOT, targetPath),
+    previousLocalizedMarkdown,
+  );
   await ensureDir(path.dirname(targetPath));
   await fs.writeFile(targetPath, translatedText, 'utf8');
 }
@@ -877,6 +907,16 @@ async function translateSingleSourceFile(
     !shouldTranslateBasedOnTranslation(filePath)
   ) {
     console.log(`Skipping ${filePath}: The translated one is up-to-date.`);
+    const rel = path.relative(sourceDir, filePath);
+    const localizedPaths = Object.keys(languages).map((langCode) =>
+      path.join(sourceDir, langCode, rel),
+    );
+    for (const changedPath of await refreshLocalizedHeadingIds(
+      filePath,
+      localizedPaths,
+    )) {
+      console.log(`Refreshing heading IDs in ${changedPath}`);
+    }
     return;
   }
   // Always compute rel as the path relative to docs/src/content/docs
@@ -1016,7 +1056,9 @@ async function main() {
   console.log('Translation completed.');
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}

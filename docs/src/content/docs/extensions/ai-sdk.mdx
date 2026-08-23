@@ -70,6 +70,24 @@ would become
 
 when using the AI SDK integration.
 
+## Prompt cache retention
+
+For AI SDK models whose provider is `openai.responses`, the adapter forwards `modelSettings.promptCacheRetention` on streamed and non-streamed requests when the model uses AI SDK specification version v3 or v4. It maps the Agents SDK value `'in-memory'` to the AI SDK provider value `'in_memory'`; `'24h'` and `null` are forwarded unchanged.
+
+AI SDK v2 models do not support this option, so the adapter raises a `UserError` before making a model request when it is set. An explicit `modelSettings.providerData.providerOptions.openai.promptCacheRetention` value takes precedence over `modelSettings.promptCacheRetention`, and the adapter does not forward the setting to other AI SDK providers.
+
+This setting controls the legacy maximum-retention policy and is only supported by certain models. See [Prompt cache retention](https://developers.openai.com/api/docs/guides/prompt-caching#prompt-cache-retention) for current model compatibility and the newer cache-lifetime controls.
+
+## PDF file inputs
+
+The AI SDK adapter converts Agents SDK `input_file` content into the file-part shape expected by AI SDK v2, v3, and v4 models. You can provide a PDF as:
+
+- A base64 data URL such as `data:application/pdf;base64,...`.
+- Non-empty raw base64 with either a `.pdf` filename or `providerData.mediaType`.
+- A public HTTP(S) URL with either a `.pdf` path or `providerData.mediaType`.
+
+When the filename or URL path ends in `.pdf`, the adapter infers `application/pdf`. Otherwise, set `providerData: { mediaType: 'application/pdf' }` explicitly. The adapter forwards public URLs directly to the AI SDK model without downloading them, so the selected provider and model must support URL-based PDF file parts; use a base64 representation when they do not. OpenAI file IDs are not supported through the AI SDK adapter; pass file data or a public URL, or use an OpenAI Responses model directly.
+
 ## Normalizing finalized output text
 
 Some providers return structured output as plain text with extra wrapping, such as JSON code fences. If you need provider-specific cleanup before the Agents runtime validates the final output, pass `transformOutputText` when creating the adapter:
@@ -105,9 +123,16 @@ There are two related integrations in `@openai/agents-extensions`:
 
 - The `@openai/agents-extensions/ai-sdk` adapter is still in beta, so it is worth testing carefully with your chosen provider, especially smaller ones.
 - If you are using OpenAI models, prefer the default OpenAI model provider instead of this adapter.
-- Supported AI SDK providers must expose `specificationVersion` `v2` or `v3`. If you need the older v1 provider style, copy the module from [examples/ai-sdk-v1](https://github.com/openai/openai-agents-js/tree/main/examples/ai-sdk-v1) into your project.
+- Supported AI SDK providers must expose `specificationVersion` `v2`, `v3`, or `v4`. If you need the older v1 provider style, copy the module from [examples/ai-sdk-v1](https://github.com/openai/openai-agents-js/tree/main/examples/ai-sdk-v1) into your project.
 - Computer tools require display metadata when used through this adapter. Make sure the tool includes both `environment` and `dimensions` metadata.
 - Deferred Responses tool-loading flows are not supported here. That includes `toolNamespace()`, function tools with `deferLoading: true`, and `toolSearchTool()`. If you need tool search, use an OpenAI Responses model directly. See the [Tools guide](/openai-agents-js/guides/tools#deferred-tool-loading-with-tool-search) and [Models guide](/openai-agents-js/guides/models#responses-only-deferred-tool-loading).
+- Programmatic Tool Calling is not supported by the AI SDK model adapter. It rejects `programmaticToolCallingTool()`, tools whose `allowedCallers` includes `'programmatic'`, Programmatic Tool Calling history items, and Responses `outputSchema`. Use an OpenAI Responses model directly for these features.
+
+### Image tool outputs
+
+The adapter preserves `ToolOutputImage` values returned by function tools, including remote URLs, base64 data, and OpenAI file IDs. AI SDK v2 models receive `media` parts. AI SDK v3 models receive `image-url`, `image-data`, or `image-file-id` parts. AI SDK v4 models receive `file` parts whose data is represented as a URL, inline data, or a provider reference for file IDs. This lets each supported model version consume the original image representation.
+
+See [`examples/ai-sdk/image-tool-output.ts`](https://github.com/openai/openai-agents-js/tree/main/examples/ai-sdk/image-tool-output.ts) for a complete example.
 
 ## AI SDK UI stream helpers
 
@@ -120,6 +145,8 @@ There are two related integrations in `@openai/agents-extensions`:
 These helpers accept a `StreamedRunResult`, stream-like source, or compatible wrapper object. The response helpers return a `Response` with streaming-friendly headers.
 
 Use `createAiSdkUiMessageStreamResponse(...)` when your route should return the AI SDK response directly. Use `createAiSdkUiMessageStream(...)` when you want to own the response or rendering layer while still using the maintained Agents SDK to AI SDK `UIMessageChunk` translation. Use `createAiSdkTextStreamResponse(...)` when you only want plain text.
+
+The UI stream helpers can wrap a streamed OpenAI Responses run that uses Programmatic Tool Calling even though the AI SDK model adapter cannot originate that flow. Program items are emitted as `programmatic_tool_calling` tool inputs, and matching program results are emitted as `program_output` tool outputs.
 
 The response helpers also accept optional response settings through `options`:
 

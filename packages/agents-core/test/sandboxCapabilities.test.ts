@@ -9,6 +9,7 @@ import {
   shell,
   StaticCompactionPolicy,
 } from '../src/sandbox';
+import { scriptedSandboxSession } from '../src/testing';
 
 describe('Compaction', () => {
   it('uses a static threshold when configured', () => {
@@ -50,6 +51,23 @@ describe('Compaction', () => {
       ],
     });
   });
+
+  it.each(['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])(
+    'uses the 1M context window for %s compaction',
+    (model) => {
+      const capability = compaction();
+
+      expect(CompactionModelInfo.forModel(model)?.contextWindow).toBe(1047576);
+      expect(capability.samplingParams({ model })).toEqual({
+        context_management: [
+          {
+            type: 'compaction',
+            compact_threshold: 942818,
+          },
+        ],
+      });
+    },
+  );
 
   it('tracks Python sandbox model context windows for compaction', () => {
     expect(CompactionModelInfo.forModel('o1-pro')?.contextWindow).toBe(200000);
@@ -396,12 +414,14 @@ describe('Memory', () => {
   });
 
   it('renders memory read prompts from the sandbox summary file', async () => {
-    const capability = memory({ generate: false }).bind({
-      state: { manifest: new Manifest() },
-      pathExists: async (path: string) => path === 'memories/memory_summary.md',
-      readFile: async () =>
-        new TextEncoder().encode('Use pnpm for package commands.'),
-    });
+    const session = scriptedSandboxSession([
+      { method: 'pathExists', result: true },
+      {
+        method: 'readFile',
+        result: new TextEncoder().encode('Use pnpm for package commands.'),
+      },
+    ]);
+    const capability = memory({ generate: false }).bind(session);
 
     const instructions = await capability.instructions(new Manifest());
 
@@ -410,28 +430,24 @@ describe('Memory', () => {
     expect(instructions).toContain(
       'Memory is writable. You are authorized to edit memories/MEMORY.md',
     );
+    session.assertComplete();
   });
 
   it('omits memory read prompts when no summary exists', async () => {
-    const capability = memory({ generate: false }).bind({
-      state: { manifest: new Manifest() },
-      pathExists: async () => false,
-      readFile: async () => {
-        throw new Error('must not be called');
-      },
-    });
+    const session = scriptedSandboxSession([
+      { method: 'pathExists', result: false },
+    ]);
+    const capability = memory({ generate: false }).bind(session);
 
     await expect(capability.instructions(new Manifest())).resolves.toBeNull();
+    session.assertComplete();
   });
 
   it('can read memory summaries through shell-only sessions', async () => {
-    const capability = memory({
-      read: { liveUpdate: false },
-      generate: false,
-    }).bind({
-      state: { manifest: new Manifest() },
-      execCommand: async () =>
-        [
+    const session = scriptedSandboxSession([
+      {
+        method: 'execCommand',
+        result: [
           'Chunk ID: abc123',
           'Wall time: 0.0001 seconds',
           'Process exited with code 0',
@@ -440,7 +456,12 @@ describe('Memory', () => {
           'Remember to run node --test.',
           '__OPENAI_AGENTS_MEMORY_SUMMARY_END__',
         ].join('\n'),
-    });
+      },
+    ]);
+    const capability = memory({
+      read: { liveUpdate: false },
+      generate: false,
+    }).bind(session);
 
     const instructions = await capability.instructions(new Manifest());
 
@@ -448,5 +469,6 @@ describe('Memory', () => {
     expect(instructions).toContain(
       'Never update memories. You can only read them.',
     );
+    session.assertComplete();
   });
 });

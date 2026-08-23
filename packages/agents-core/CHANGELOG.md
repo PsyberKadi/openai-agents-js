@@ -1,5 +1,238 @@
 # @openai/agents-core
 
+## 0.17.0
+
+### Minor Changes
+
+- 33fe55c: fix: redact blocked tool outputs and aliases from replay state
+
+## 0.16.1
+
+### Patch Changes
+
+- 2896600: feat: add run-scoped sandbox working directories
+- acedac3: feat: allow Docker sandboxes to disable networking
+- b93163b: feat: add Modal sandbox CPU and memory options
+- 8ece061: docs: document Agent.clone list property sharing
+- 937fb98: fix(sandbox): trace effective run-scoped sandbox paths
+- 861ba39: fix: honor exact call approval decisions before sticky defaults
+- f4bd821: fix: validate dynamic sandbox compaction threshold ratios before use
+- 51fb859: feat: add provider-neutral model call timeouts (#894)
+- e3aaeea: fix: require raster signatures for view_image output
+
+## 0.16.0
+
+### Minor Changes
+
+- b727790: feat: add scripted model, sandbox session, and Realtime testing utilities
+
+### Patch Changes
+
+- bedb045: fix: isolate interruption result arrays from pending approvals
+- 442cedb: fix: finalize max-turn handler items after guardrails and persistence
+- ede1fb9: fix: detach RunState interruption snapshots
+- f639953: fix: detach Manifest arguments in scripted sandbox call snapshots
+- e2cbca8: fix: reject partially matched stacked apply-diff anchors
+- c5eda7e: feat: allow model-input filters to preserve item identity
+- d4ef614: fix: detach automatically generated scripted model stream events
+- 77343dd: fix: redact invalid structured tool output diagnostics
+- 200c20e: fix: snapshot sandbox HTTP event sink headers
+- 85a5ddb: fix: apply stacked diff anchors sequentially
+- d385c10: fix: avoid redundant Standard Schema validation without dynamic approval
+- aa6dd2d: feat: support Standard Schema tool inputs and structured agent outputs
+- d7fd0cf: fix: keep cached MCP tool arrays private from callers
+- 26bc638: fix: describe and test granted view_image paths
+
+## 0.15.0
+
+### Minor Changes
+
+- 442cfe3: feat: require OpenAI Node SDK v7.2 or later
+- 41f5011: feat: switch the default OpenAI model to gpt-5.6-luna when no model is explicitly configured
+- 5b5a7cb: feat: support MCP 2026-07-28 negotiation with legacy fallback
+
+### Patch Changes
+
+- 00def07: feat: allow applications to explicitly approve unsafe model request replays
+- d1c585d: feat: support React Native package conditions for portable core and Realtime shims
+- ba85cda: fix: redact structured final-output errors
+- daefc63: fix: preserve complete AI SDK response text and item ordering (#1593)
+- 2ce5c25: test: cover trusted external rclone config paths
+- 398a592: fix: normalize strict tool arguments without widening unsupported JSON schemas
+- 75af3ee: feat: add durable pending input to resumable run state
+- 1f617f9: fix: bind tool approvals and completed replays to canonical invocations
+- d308e1d: fix: make `StreamedRunResult.currentTurn` report only model turns that reach the request boundary, including across resumed runs
+- 09d5065: fix: preserve free-form MCP object schemas
+- 81e0066: feat: pass run context to opted-in custom sessions
+- c122399: fix: invalidate MCP tool caches and metadata across lifecycle changes and concurrent listings
+- 9b97dd2: fix: publish completed guardrail results when a sibling fails
+- 8249c45: fix: serialize MCP manager lifecycle operations
+- e006790: test: add immutable historical RunState compatibility coverage
+- 512f340: test: enforce silent unit test output
+- 066a03c: fix: restrict sandbox mount credentials and preserve final local process output
+- b7cb351: fix: reject overly deep strict JSON schemas safely
+- d48b2b0: fix: scope persistent hosted MCP approvals by server and tool identity
+- 96201ba: fix: preserve structured tool outputs in RunState
+- c7a91e6: feat: preserve raw provider usage payloads on request
+
+## 0.14.3
+
+### Patch Changes
+
+- 31bc820: feat: add idempotent session history transactions
+- 90781d8: fix: preserve committed tool effects when output guardrails block final output
+- 08169df: fix: cancel and drain sibling tool work after a concurrent failure
+- 1154aa0: fix: include every paginated MCP tool in agent tool discovery
+- 15ac711: fix: resolve ambiguous tool and handoff names consistently with a warning by default and an opt-in error policy, including owner-scoped approvals for nested agents
+- 59fa3fc: fix: preserve completed tool guardrail results on run errors
+- 2d5d040: fix: deduplicate provider-identified model inputs without breaking causal item order
+- 427331f: fix: preserve repeated session history provenance
+- 4bb80e4: fix: name Runner task spans after their configured or restored workflow
+- 78f8581: fix: preserve inline compaction items across turns
+- b4a90f9: test: capture expected MCP and session recovery logs without stderr noise
+- 9416c96: test: split RunState coverage into parallel suites and silence collision warnings
+- f431475: fix: redact invalid tool argument errors by default
+- 9cbba54: fix: preserve approved tool results when output guardrails trip
+- 0f9b12e: fix: normalize closed typeless object schemas in strict tools
+- 92a0809: fix: enforce sandbox output budgets across core and extension providers
+- 1eaa425: fix: ignore invalid environment paths for default sandbox snapshots
+
+## 0.14.2
+
+### Patch Changes
+
+- e8de524: fix: clean MCP servers before reconnecting
+- b4b8b21: fix: redact MCP URL credentials from external metadata
+- 7255289: fix: redact endpoint credentials from MCP transport errors
+- 25e1cf0: feat: preserve sandbox environment secret references
+
+## 0.14.1
+
+### Patch Changes
+
+- e4158f1: fix: allow Docker command workdirs within sandbox path grants (#1539)
+- 73abbdc: fix: support native Windows host paths in sandbox path grants (#1537)
+- 48094d0: fix: preserve Docker path-grant sessions with verified live reuse and safe snapshot fallback
+- 58e3a43: fix: export lifecycle hook and agent tool helper types (#1534)
+
+## 0.14.0
+
+### Minor Changes
+
+- f7771c1: feat: add default task and turn tracing with a per-run opt-out
+- 67e9733: feat: disable sensitive model and tool data logging by default with a programmatic opt-in
+
+### Patch Changes
+
+- 457166e: fix: redact sensitive tool and model data from error logs
+- b907917: fix: propagate run cancellation to MCP tool requests (#1530)
+- 02ef342: feat: add Programmatic Tool Calling with caller-aware replay, runtime-validated Zod outputs, configuration preflight, examples, and explicit unsupported-adapter errors
+- b45fd21: fix: preserve assistant message phases across Responses history and replay
+- efdd60e: fix: fail closed when dynamic tool approval receives invalid arguments
+- e4f3293: fix(core): reconcile non-streaming function tool cancellation safely (#1521)
+- fa7c36f: fix: honor sensitive logging flags across runtime error and payload paths
+- a3092ca: fix: distinguish missing sandbox paths from inaccessible files and provider failures
+- 68cc86b: fix: parse SELinux security-context markers in permission strings
+- 4461a35: fix(core): wait for cancelled stream cleanup before resolving completion (#1521)
+- 84aed6e: fix(core): propagate streamed cancellation to function tools without replaying settled work (#1521)
+
+## 0.13.5
+
+### Patch Changes
+
+- 2437c35: feat: add AI SDK provider-executed tool search support (#1479)
+- 72ca4bc: fix: correlate streamed text deltas with completed output items (#1484)
+- f1ae0b4: fix: decode persisted binary sandbox manifest content without host base64 globals
+
+## 0.13.4
+
+### Patch Changes
+
+- a1670ce: fix: fail zodJsonSchemaCompat union/tuple conversion instead of silently dropping unconvertible members
+
+  When the fallback zod-to-JSON-schema converter met a union (or tuple) member it could not convert — for example a discriminated-union variant containing `z.preprocess` — it silently filtered the member out and emitted the remaining schema. The result looked valid but forbade outputs the Zod schema accepts: an agent whose `outputType` union lost a variant could never emit that action under structured outputs. Conversion now fails the whole union/tuple so the caller raises the existing descriptive `UserError` instead of degrading the model's output space.
+
+## 0.13.3
+
+### Patch Changes
+
+- a1ea36f: test: improve retry, MCP approval, and Realtime sequencing coverage
+- 4292ecc: fix: avoid installing tracing process-lifecycle listeners in workerd and browsers
+
+## 0.13.2
+
+### Patch Changes
+
+- 4c14038: fix: remove the MCP shim initialization cycle
+- e5b75e1: feat: support GPT-5.6 reasoning and prompt-cache request controls
+- 240b6eb: fix: restore run usage when deserializing RunState
+
+## 0.13.1
+
+### Patch Changes
+
+- 532ab2b: fix: support openai-node v6.46.0 usage types
+- ec48462: feat: add GPT-5.6 model defaults, reasoning, and sandbox compaction support
+
+## 0.13.0
+
+## 0.12.1
+
+### Patch Changes
+
+- f064c56: fix: prevent acknowledged tool results from replaying on resume (#1435)
+- b65face: chore: correct explicit model flag spelling
+- 59a67c4: fix: reject invalid handoff input filters before invoking handoffs
+- 81d654f: feat: add invalid final output recovery handler
+- 5f57fe1: test: improve agents-core and agents-extensions coverage
+- dc7864a: refactor: consolidate internal runtime helpers and adapter normalization
+
+## 0.12.0
+
+### Patch Changes
+
+- e044d14: fix: tailor remote mount edit guidance to writable editor paths
+- a8f81cd: fix: avoid reevaluating resolved tool approvals
+- c450c2b: fix: parse special filesystem permission bits by position
+- 5350aad: fix: await sibling guardrails after execution failures
+- 395699e: chore: upgrade openai package to the latest version
+- f990172: fix: preserve empty array tool outputs as text
+
+## 0.11.8
+
+### Patch Changes
+
+- dd64ba6: feat: add opt-in pre-approval tool input guardrails
+- b740fb3: feat: add SDK-only custom data for tool outputs
+
+## 0.11.7
+
+### Patch Changes
+
+- edd0a07: fix: expose sandbox error retryability metadata
+- dfbc3b0: feat(mcp): expose serializable full tool results
+
+## 0.11.6
+
+### Patch Changes
+
+- 13f7662: feat: add tracing span lifecycle dispatch helpers
+
+## 0.11.5
+
+### Patch Changes
+
+- 8dc0069: feat: add configurable tracing ID generation
+- d2a4687: feat: add Handoff clone overrides
+- 1ce5404: feat: add opt-in recovery for missing function tools
+- 60bba25: fix: make Runner modelProvider optional
+- 4f28a02: feat: add RunState trace clearing for resumed runs
+- 647810d: feat: add scoped trace context helpers
+- 26624a5: fix: guard session persistence debug env access
+- b84c1c4: feat: add completed tracing lifecycle dispatch helpers
+- cb0b532: fix: restore browser tracing context and add context storage injection
+- 1151713: fix: add public Usage JSON restoration helpers
+
 ## 0.11.4
 
 ### Patch Changes

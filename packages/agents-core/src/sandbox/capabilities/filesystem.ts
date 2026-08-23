@@ -15,6 +15,7 @@ import type {
 import { ApplyPatchOperation } from '../../types/protocol';
 import { encodeUint8ArrayToBase64 } from '../../utils/base64';
 import type { ViewImageArgs } from '../session';
+import type { ToolCallDetails } from '../../tool';
 import { withSandboxSpan } from '../runtime/spans';
 import { isRecord } from '../shared/typeGuards';
 import {
@@ -26,6 +27,7 @@ import {
   supportsApplyPatchTransport,
   supportsStructuredToolOutputTransport,
 } from './transport';
+import type { SandboxWorkspaceScope } from '../workspacePaths';
 
 export type FilesystemArgs = {
   configureTools?: ConfigureCapabilityTools;
@@ -526,32 +528,40 @@ class FilesystemCapability extends Capability {
 
   override tools(): Tool<any>[] {
     const session = requireBoundSession(this.type, this._session);
-    const editor = session.createEditor?.(this._runAs);
-    if (!editor) {
+    const sessionEditor = session.createEditor?.(this._runAs);
+    if (!sessionEditor) {
       throw new UserError(
         'Filesystem sandbox sessions must provide createEditor().',
       );
     }
+    const editor = this._workspaceScope?.cwd
+      ? scopedEditor(sessionEditor, this._workspaceScope)
+      : sessionEditor;
 
     const tools: Tool<any>[] = [];
-    const viewImage = async (path: string): Promise<ViewImageToolResult> => {
+    const viewImage = async (
+      path: string,
+      details?: ToolCallDetails,
+    ): Promise<ViewImageToolResult> => {
       if (!session.viewImage) {
         throw new UserError(
           'Filesystem sandbox sessions must provide viewImage().',
         );
       }
+      const effectivePath = this._workspaceScope?.anchor(path) ?? path;
       try {
         return await withSandboxSpan(
           'sandbox.view_image',
           {
-            path,
+            path: effectivePath,
             run_as: this._runAs,
           },
           async () =>
             await session.viewImage!({
-              path,
+              path: effectivePath,
               runAs: this._runAs,
             } satisfies ViewImageArgs),
+          this.tracingParent(details),
         );
       } catch (error) {
         return renderViewImageError(path, error);
@@ -563,15 +573,19 @@ class FilesystemCapability extends Capability {
         tool({
           name: 'view_image',
           description:
-            'Returns an image output from a local path in the sandbox workspace.',
+            'Returns an image output from a path in the sandbox workspace or an explicitly granted sandbox path.',
           parameters: z.object({
-            path: z.string().describe('Local filesystem path to an image file'),
+            path: z
+              .string()
+              .describe(
+                'Path to an image file in the sandbox workspace or an explicitly granted sandbox path',
+              ),
           }),
-          execute: async ({
-            path,
-          }: {
-            path: string;
-          }): Promise<ViewImageToolResult> => await viewImage(path),
+          execute: async (
+            { path }: { path: string },
+            _context,
+            details?: ToolCallDetails,
+          ): Promise<ViewImageToolResult> => await viewImage(path, details),
         }),
       );
     } else {
@@ -579,12 +593,20 @@ class FilesystemCapability extends Capability {
         tool({
           name: 'view_image',
           description:
-            'Returns an image from a local path in the sandbox workspace as a data URL or reference string.',
+            'Returns an image from a path in the sandbox workspace or an explicitly granted sandbox path as a data URL or reference string.',
           parameters: z.object({
-            path: z.string().describe('Local filesystem path to an image file'),
+            path: z
+              .string()
+              .describe(
+                'Path to an image file in the sandbox workspace or an explicitly granted sandbox path',
+              ),
           }),
-          execute: async ({ path }: { path: string }): Promise<string> =>
-            renderImageForTextTransport(await viewImage(path)),
+          execute: async (
+            { path }: { path: string },
+            _context,
+            details?: ToolCallDetails,
+          ): Promise<string> =>
+            renderImageForTextTransport(await viewImage(path, details)),
         }),
       );
     }
@@ -602,6 +624,32 @@ class FilesystemCapability extends Capability {
 
     return this.configureTools ? this.configureTools([...tools]) : tools;
   }
+}
+
+function scopedEditor(editor: Editor, scope: SandboxWorkspaceScope): Editor {
+  return {
+    createFile: async (operation, context) =>
+      await editor.createFile(
+        { ...operation, path: scope.anchor(operation.path)! },
+        context,
+      ),
+    updateFile: async (operation, context) =>
+      await editor.updateFile(
+        {
+          ...operation,
+          path: scope.anchor(operation.path)!,
+          ...(operation.moveTo
+            ? { moveTo: scope.anchor(operation.moveTo)! }
+            : {}),
+        },
+        context,
+      ),
+    deleteFile: async (operation, context) =>
+      await editor.deleteFile(
+        { ...operation, path: scope.anchor(operation.path)! },
+        context,
+      ),
+  };
 }
 
 export type Filesystem = FilesystemCapability;

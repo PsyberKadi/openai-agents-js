@@ -1,20 +1,27 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, expectTypeOf, vi, afterEach } from 'vitest';
 import { Agent } from '../src/agent';
 import { RunContext } from '../src/runContext';
 import { Handoff, handoff } from '../src/handoff';
 import { tool } from '../src/tool';
 import { z } from 'zod';
-import { JsonSchemaDefinition, setDefaultModelProvider } from '../src';
+import {
+  JsonSchemaDefinition,
+  run,
+  setDefaultModelProvider,
+  type StandardSchemaWithJSON,
+} from '../src';
 import type { AgentInputItem } from '../src/types';
 import {
-  FakeModel,
-  FakeModelProvider,
+  ScriptedModelProvider,
   TEST_MODEL_RESPONSE_BASIC,
   TEST_MODEL_RESPONSE_WITH_FUNCTION,
+  fakeModelMessage,
 } from './stubs';
 import { Runner, RunConfig } from '../src/run';
 import { RunState } from '../src/runState';
 import logger from '../src/logger';
+import { ScriptedModel, modelResponse } from '../src/testing';
+import { Usage } from '../src/usage';
 
 describe('Agent', () => {
   afterEach(() => {
@@ -40,6 +47,397 @@ describe('Agent', () => {
     expect(agent.outputType).toBe('text');
     expect(agent.toolUseBehavior).toBe('run_llm_again');
     expect(agent.resetToolChoice).toBe(true);
+  });
+
+  it('warns without inspecting handoff output schemas when model logging is disabled', () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'dontLogModelData', 'get').mockReturnValue(true);
+    const secret = 'SECRET_HANDOFF_OUTPUT_SCHEMA_123';
+    const toJSON = vi.fn(() => ({ secret }));
+    const handoffOutputType = {
+      type: 'json_schema',
+      name: 'SensitiveOutput',
+      strict: true,
+      schema: {
+        type: 'object',
+        properties: { secret: { type: 'string', description: secret } },
+        required: ['secret'],
+        additionalProperties: false,
+      },
+      toJSON,
+    } as unknown as JsonSchemaDefinition;
+    const handoffAgent = new Agent({
+      name: 'HandoffAgent',
+      outputType: handoffOutputType,
+    });
+
+    expect(
+      () =>
+        new Agent({
+          name: 'ParentAgent',
+          outputType: 'text',
+          handoffs: [handoffAgent],
+          handoffOutputTypeWarningEnabled: true,
+        }),
+    ).not.toThrow();
+    expect(toJSON).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[Agent] Warning: Handoff agents have different output types. Output type details are redacted. You can make it type-safe by using Agent.create({ ... }) method instead.',
+    );
+    expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(secret);
+  });
+
+  it('includes handoff output schema details when model logging is enabled', () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'dontLogModelData', 'get').mockReturnValue(false);
+    const parentSecret = 'SECRET_PARENT_OUTPUT_SCHEMA_123';
+    const handoffSecret = 'SECRET_HANDOFF_OUTPUT_SCHEMA_456';
+    const parentOutputType = {
+      type: 'json_schema',
+      name: 'ParentOutput',
+      strict: true,
+      schema: { const: parentSecret },
+    } as unknown as JsonSchemaDefinition;
+    const handoffOutputType = {
+      type: 'json_schema',
+      name: 'HandoffOutput',
+      strict: true,
+      schema: { const: handoffSecret },
+    } as unknown as JsonSchemaDefinition;
+    const handoffAgent = new Agent({
+      name: 'HandoffAgent',
+      outputType: handoffOutputType,
+    });
+
+    new Agent({
+      name: 'ParentAgent',
+      outputType: parentOutputType,
+      handoffs: [handoffAgent],
+    });
+
+    const warningCalls = JSON.stringify(warnSpy.mock.calls);
+    expect(warningCalls).toContain(parentSecret);
+    expect(warningCalls).toContain(handoffSecret);
+  });
+
+  it('does not warn for separately constructed equivalent schemas when model logging is disabled', () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'dontLogModelData', 'get').mockReturnValue(true);
+    const parentToJSON = vi.fn(() => ({ type: 'object' }));
+    const handoffToJSON = vi.fn(() => ({ type: 'object' }));
+    const createOutputType = (toJSON: () => object) =>
+      ({
+        type: 'json_schema',
+        name: 'EquivalentOutput',
+        strict: true,
+        schema: {
+          type: 'object',
+          properties: { value: { type: 'string' } },
+          required: ['value'],
+          additionalProperties: false,
+          toJSON,
+        },
+        toJSON,
+      }) as unknown as JsonSchemaDefinition;
+    const handoffAgent = new Agent({
+      name: 'HandoffAgent',
+      outputType: createOutputType(handoffToJSON),
+    });
+
+    new Agent({
+      name: 'ParentAgent',
+      outputType: createOutputType(parentToJSON),
+      handoffs: [handoffAgent],
+    });
+
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(parentToJSON).not.toHaveBeenCalled();
+    expect(handoffToJSON).not.toHaveBeenCalled();
+  });
+
+  it('warns when schemas differ by an output property named toJSON', () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'dontLogModelData', 'get').mockReturnValue(true);
+    const createOutputType = (properties: Record<string, { type: string }>) =>
+      ({
+        type: 'json_schema',
+        name: 'ToJsonPropertyOutput',
+        strict: true,
+        schema: {
+          type: 'object',
+          properties,
+          required: [],
+          additionalProperties: false,
+        },
+      }) as JsonSchemaDefinition;
+    const handoffAgent = new Agent({
+      name: 'HandoffAgent',
+      outputType: createOutputType({}),
+    });
+
+    new Agent({
+      name: 'ParentAgent',
+      outputType: createOutputType({ toJSON: { type: 'string' } }),
+      handoffs: [handoffAgent],
+    });
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[Agent] Warning: Handoff agents have different output types. Output type details are redacted. You can make it type-safe by using Agent.create({ ... }) method instead.',
+    );
+  });
+
+  it('does not warn for separately constructed equivalent Zod schemas when model logging is disabled', () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'dontLogModelData', 'get').mockReturnValue(true);
+    const createOutputType = () => z.object({ value: z.string() });
+    const handoffAgent = new Agent({
+      name: 'HandoffAgent',
+      outputType: createOutputType(),
+    });
+
+    new Agent({
+      name: 'ParentAgent',
+      outputType: createOutputType(),
+      handoffs: [handoffAgent],
+    });
+
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('warns for different JSON schemas without exposing details when model logging is disabled', () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'dontLogModelData', 'get').mockReturnValue(true);
+    const parentSecret = 'SECRET_PARENT_SCHEMA_DESCRIPTION_123';
+    const handoffSecret = 'SECRET_HANDOFF_SCHEMA_DESCRIPTION_456';
+    const createOutputType = (property: string, description: string) =>
+      ({
+        type: 'json_schema',
+        name: 'StructuredOutput',
+        strict: true,
+        schema: {
+          type: 'object',
+          properties: { [property]: { type: 'string', description } },
+          required: [property],
+          additionalProperties: false,
+        },
+      }) as JsonSchemaDefinition;
+    const handoffAgent = new Agent({
+      name: 'HandoffAgent',
+      outputType: createOutputType('child', handoffSecret),
+    });
+
+    new Agent({
+      name: 'ParentAgent',
+      outputType: createOutputType('parent', parentSecret),
+      handoffs: [handoffAgent],
+    });
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[Agent] Warning: Handoff agents have different output types. Output type details are redacted. You can make it type-safe by using Agent.create({ ... }) method instead.',
+    );
+    expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(parentSecret);
+    expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(handoffSecret);
+  });
+
+  it('warns for different Zod schemas without exposing details when model logging is disabled', () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'dontLogModelData', 'get').mockReturnValue(true);
+    const parentSecret = 'SECRET_PARENT_ZOD_DESCRIPTION_123';
+    const handoffSecret = 'SECRET_HANDOFF_ZOD_DESCRIPTION_456';
+    const handoffAgent = new Agent({
+      name: 'HandoffAgent',
+      outputType: z.object({ child: z.string().describe(handoffSecret) }),
+    });
+
+    new Agent({
+      name: 'ParentAgent',
+      outputType: z.object({ parent: z.string().describe(parentSecret) }),
+      handoffs: [handoffAgent],
+    });
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[Agent] Warning: Handoff agents have different output types. Output type details are redacted. You can make it type-safe by using Agent.create({ ... }) method instead.',
+    );
+    expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(parentSecret);
+    expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(handoffSecret);
+  });
+
+  it('does not invoke JSON schema accessors when model logging is disabled', () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'dontLogModelData', 'get').mockReturnValue(true);
+    const propertiesGetter = vi.fn(() => {
+      throw new Error('SECRET_SCHEMA_GETTER_123');
+    });
+    const schema = {
+      type: 'object',
+      required: [],
+      additionalProperties: false,
+    } as Record<string, unknown>;
+    Object.defineProperty(schema, 'properties', {
+      enumerable: true,
+      get: propertiesGetter,
+    });
+    const handoffAgent = new Agent({
+      name: 'HandoffAgent',
+      outputType: {
+        type: 'json_schema',
+        name: 'AccessorOutput',
+        strict: true,
+        schema,
+      } as JsonSchemaDefinition,
+    });
+
+    expect(
+      () =>
+        new Agent({
+          name: 'ParentAgent',
+          outputType: {
+            type: 'json_schema',
+            name: 'AccessorOutput',
+            strict: true,
+            schema: {
+              type: 'object',
+              properties: {},
+              required: [],
+              additionalProperties: false,
+            },
+          },
+          handoffs: [handoffAgent],
+        }),
+    ).not.toThrow();
+    expect(propertiesGetter).not.toHaveBeenCalled();
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not read array proxy lengths when model logging is disabled', () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'dontLogModelData', 'get').mockReturnValue(true);
+    const lengthGetter = vi.fn(() => {
+      throw new Error('SECRET_ARRAY_LENGTH_GETTER_123');
+    });
+    const lengthDescriptorGetter = vi.fn(() => {
+      throw new Error('SECRET_ARRAY_LENGTH_DESCRIPTOR_456');
+    });
+    const required = new Proxy(['value'], {
+      get(target, property, receiver) {
+        if (property === 'length') {
+          return lengthGetter();
+        }
+        return Reflect.get(target, property, receiver);
+      },
+      getOwnPropertyDescriptor(target, property) {
+        if (property === 'length') {
+          return lengthDescriptorGetter();
+        }
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      },
+    });
+    const handoffAgent = new Agent({
+      name: 'HandoffAgent',
+      outputType: {
+        type: 'json_schema',
+        name: 'ProxyArrayOutput',
+        strict: true,
+        schema: {
+          type: 'object',
+          properties: { value: { type: 'string' } },
+          required,
+          additionalProperties: false,
+        },
+      },
+    });
+
+    expect(
+      () =>
+        new Agent({
+          name: 'ParentAgent',
+          outputType: {
+            type: 'json_schema',
+            name: 'ProxyArrayOutput',
+            strict: true,
+            schema: {
+              type: 'object',
+              properties: { value: { type: 'string' } },
+              required: ['value'],
+              additionalProperties: false,
+            },
+          },
+          handoffs: [handoffAgent],
+        }),
+    ).not.toThrow();
+    expect(lengthGetter).not.toHaveBeenCalled();
+    expect(lengthDescriptorGetter).toHaveBeenCalled();
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('compares handoff schemas when the parent schema is not comparable', () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'dontLogModelData', 'get').mockReturnValue(true);
+    const propertiesGetter = vi.fn(() => {
+      throw new Error('SECRET_PARENT_SCHEMA_GETTER_123');
+    });
+    const parentSchema = {
+      type: 'object',
+      required: [],
+      additionalProperties: false,
+    } as Record<string, unknown>;
+    Object.defineProperty(parentSchema, 'properties', {
+      enumerable: true,
+      get: propertiesGetter,
+    });
+    const createHandoffAgent = (name: string, property: string) =>
+      new Agent({
+        name,
+        outputType: {
+          type: 'json_schema',
+          name: 'HandoffOutput',
+          strict: true,
+          schema: {
+            type: 'object',
+            properties: { [property]: { type: 'string' } },
+            required: [property],
+            additionalProperties: false,
+          },
+        },
+      });
+
+    new Agent({
+      name: 'ParentAgent',
+      outputType: {
+        type: 'json_schema',
+        name: 'ParentOutput',
+        strict: true,
+        schema: parentSchema,
+      } as JsonSchemaDefinition,
+      handoffs: [
+        createHandoffAgent('FirstHandoffAgent', 'first'),
+        createHandoffAgent('SecondHandoffAgent', 'second'),
+      ],
+    });
+
+    expect(propertiesGetter).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[Agent] Warning: Handoff agents have different output types. Output type details are redacted. You can make it type-safe by using Agent.create({ ... }) method instead.',
+    );
+  });
+
+  it('honors an explicit opt-out from handoff output type warnings', () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'dontLogModelData', 'get').mockReturnValue(true);
+
+    new Agent({
+      name: 'ParentAgent',
+      outputType: z.object({ parent: z.string() }),
+      handoffs: [
+        new Agent({
+          name: 'HandoffAgent',
+          outputType: z.object({ child: z.string() }),
+        }),
+      ],
+      handoffOutputTypeWarningEnabled: false,
+    });
+
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 
   it('should throw if name is missing', () => {
@@ -97,6 +495,18 @@ describe('Agent', () => {
       { reasoning: { effort: 'medium' }, text: { verbosity: 'low' } },
     ],
     ['gpt-5.5', { reasoning: { effort: 'none' }, text: { verbosity: 'low' } }],
+    [
+      'gpt-5.6-sol',
+      { reasoning: { effort: 'none' }, text: { verbosity: 'low' } },
+    ],
+    [
+      'gpt-5.6-terra',
+      { reasoning: { effort: 'none' }, text: { verbosity: 'low' } },
+    ],
+    [
+      'gpt-5.6-luna',
+      { reasoning: { effort: 'none' }, text: { verbosity: 'low' } },
+    ],
     ['gpt-5-mini', { text: { verbosity: 'low' } }],
     ['gpt-5-chat-latest', {}],
   ])(
@@ -110,6 +520,18 @@ describe('Agent', () => {
       expect(agent.modelSettings).toEqual(expected);
     },
   );
+
+  it('accepts max reasoning effort for GPT-5.6 models', () => {
+    const agent = new Agent({
+      name: 'MaxReasoningAgent',
+      model: 'gpt-5.6',
+      modelSettings: { reasoning: { effort: 'max' } },
+    });
+
+    expect(agent.modelSettings).toMatchObject({
+      reasoning: { effort: 'max' },
+    });
+  });
 
   it('uses generic defaults when an explicit model is not a GPT-5 model name', () => {
     const agent = new Agent({
@@ -184,6 +606,92 @@ describe('Agent', () => {
       reasoning: { effort: 'low' },
       text: { verbosity: 'low' },
     });
+  });
+
+  it('shares list properties between a clone and its original as documented', () => {
+    const first = tool({
+      name: 'first',
+      description: 'first',
+      parameters: z.object({}),
+      execute: async () => 'ok',
+    });
+    const target = new Agent({ name: 'Target' });
+
+    const originalAgent = new Agent({
+      name: 'OriginalAgent',
+      tools: [first],
+      handoffs: [target],
+    });
+    const clonedAgent = originalAgent.clone({ name: 'ClonedAgent' });
+
+    // A property that clone() does not override is carried over by reference.
+    expect(clonedAgent.tools).toBe(originalAgent.tools);
+    expect(clonedAgent.handoffs).toBe(originalAgent.handoffs);
+  });
+
+  it('uses the array passed to clone as given for a list property', () => {
+    const first = tool({
+      name: 'first',
+      description: 'first',
+      parameters: z.object({}),
+      execute: async () => 'ok',
+    });
+    const second = tool({
+      name: 'second',
+      description: 'second',
+      parameters: z.object({}),
+      execute: async () => 'ok',
+    });
+
+    const originalAgent = new Agent({ name: 'OriginalAgent', tools: [first] });
+    const supplied = [second];
+    const clonedAgent = originalAgent.clone({
+      name: 'ClonedAgent',
+      tools: supplied,
+    });
+
+    // The supplied array is used as given rather than copied.
+    expect(clonedAgent.tools).toBe(supplied);
+    expect(originalAgent.tools).toEqual([first]);
+    // Overriding does not by itself share entries with the original agent.
+    expect(clonedAgent.tools).not.toContain(first);
+  });
+
+  it('still shares a list when clone is given the original agent array', () => {
+    const first = tool({
+      name: 'first',
+      description: 'first',
+      parameters: z.object({}),
+      execute: async () => 'ok',
+    });
+
+    const originalAgent = new Agent({ name: 'OriginalAgent', tools: [first] });
+    const clonedAgent = originalAgent.clone({
+      name: 'ClonedAgent',
+      tools: originalAgent.tools,
+    });
+
+    // Overriding with the original array keeps both agents on one array.
+    expect(clonedAgent.tools).toBe(originalAgent.tools);
+  });
+
+  it('starts a list empty when clone is given that property as undefined', () => {
+    const first = tool({
+      name: 'first',
+      description: 'first',
+      parameters: z.object({}),
+      execute: async () => 'ok',
+    });
+
+    const originalAgent = new Agent({ name: 'OriginalAgent', tools: [first] });
+    const clonedAgent = originalAgent.clone({
+      name: 'ClonedAgent',
+      tools: undefined,
+    });
+
+    // Supplying undefined counts as supplying the property, so the list is not inherited.
+    expect(clonedAgent.tools).toEqual([]);
+    expect(originalAgent.tools).toEqual([first]);
   });
 
   it('should return static instructions as system prompt', async () => {
@@ -281,13 +789,47 @@ describe('Agent', () => {
     expect(result1).toBe(
       'An error occurred while running the tool. Please try again. Error: InvalidToolInputError: Invalid JSON input for tool',
     );
-    setDefaultModelProvider(new FakeModelProvider());
+    setDefaultModelProvider(new ScriptedModelProvider());
     const result2 = await tool.invoke(
       {} as any,
       JSON.stringify({ input: 'hey how are you?' }),
     );
     expect(result2).toBe('Hello World');
   });
+
+  it.each([
+    ['redacted', true],
+    ['diagnostic', false],
+  ] as const)(
+    'applies %s tool argument diagnostics to Agent.asTool',
+    async (_mode, dontLogToolData) => {
+      const secret = 'SECRET_AGENT_TOOL_ARGUMENT_123';
+      const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+      vi.spyOn(logger, 'dontLogToolData', 'get').mockReturnValue(
+        dontLogToolData,
+      );
+      const agent = new Agent({ name: 'Nested Agent' });
+      const agentTool = agent.asTool({
+        toolName: 'nested_agent',
+        toolDescription: 'Run the nested agent.',
+        parameters: z.object({ value: z.number() }),
+      });
+
+      const output = await agentTool.invoke(
+        new RunContext(),
+        JSON.stringify({ value: secret }),
+      );
+
+      expect(output).toBe(
+        'An error occurred while running the tool. Please try again. Error: InvalidToolInputError: Invalid JSON input for tool',
+      );
+      if (dontLogToolData) {
+        expect(JSON.stringify(debugSpy.mock.calls)).not.toContain(secret);
+      } else {
+        expect(JSON.stringify(debugSpy.mock.calls)).toContain(secret);
+      }
+    },
+  );
 
   it('warns when using asTool with stopAtToolNames behavior without custom extractor', async () => {
     const warnSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
@@ -616,7 +1158,7 @@ describe('Agent', () => {
       toolDescription: 'You act as a tool.',
       customOutputExtractor: () => 'ok',
     });
-    const inheritedProvider = new FakeModelProvider();
+    const inheritedProvider = new ScriptedModelProvider();
     const parentInputGuardrail = {
       name: 'parent-input',
       execute: vi.fn().mockResolvedValue({
@@ -641,6 +1183,7 @@ describe('Agent', () => {
       handoffInputFilter,
       traceIncludeSensitiveData: false,
       traceId: 'trace_parent_fixed',
+      toolNameCollisionPolicy: 'error',
     });
 
     await tool.invoke(
@@ -661,6 +1204,7 @@ describe('Agent', () => {
     expect(nestedRunner.config.handoffInputFilter).toBeUndefined();
     expect(nestedRunner.config.traceId).toBeUndefined();
     expect(nestedRunner.config.traceIncludeSensitiveData).toBe(true);
+    expect(nestedRunner.config.toolNameCollisionPolicy).toBe('error');
   });
 
   it('does not inherit parent tool-selection modelSettings into nested agent tools', async () => {
@@ -676,7 +1220,7 @@ describe('Agent', () => {
       customOutputExtractor: () => 'ok',
     });
     const parentRunner = new Runner({
-      modelProvider: new FakeModelProvider(),
+      modelProvider: new ScriptedModelProvider(),
       modelSettings: {
         temperature: 0.2,
         toolChoice: 'required',
@@ -713,7 +1257,7 @@ describe('Agent', () => {
     const runSpy = vi
       .spyOn(Runner.prototype, 'run')
       .mockResolvedValue({ rawResponses: [] } as any);
-    const childProvider = new FakeModelProvider();
+    const childProvider = new ScriptedModelProvider();
     const tool = agent.asTool({
       toolDescription: 'You act as a tool.',
       customOutputExtractor: () => 'ok',
@@ -721,7 +1265,7 @@ describe('Agent', () => {
         modelProvider: childProvider,
       },
     });
-    const parentProvider = new FakeModelProvider();
+    const parentProvider = new ScriptedModelProvider();
     const parentRunner = new Runner({
       modelProvider: parentProvider,
       model: 'parent-model',
@@ -761,7 +1305,7 @@ describe('Agent', () => {
       },
     });
     const parentRunner = new Runner({
-      modelProvider: new FakeModelProvider(),
+      modelProvider: new ScriptedModelProvider(),
       modelSettings: {
         reasoning: { effort: 'medium' },
         providerData: { tenant: 'acme' },
@@ -803,7 +1347,7 @@ describe('Agent', () => {
       },
     });
     const parentRunner = new Runner({
-      modelProvider: new FakeModelProvider(),
+      modelProvider: new ScriptedModelProvider(),
       modelSettings: {
         reasoning: { effort: 'medium', summary: 'auto' },
         text: { verbosity: 'medium' },
@@ -847,7 +1391,7 @@ describe('Agent', () => {
       },
     });
     const parentRunner = new Runner({
-      modelProvider: new FakeModelProvider(),
+      modelProvider: new ScriptedModelProvider(),
       modelSettings: {
         providerData: {
           extra_query: { tenant: 'acme' },
@@ -898,7 +1442,7 @@ describe('Agent', () => {
       },
     });
     const parentRunner = new Runner({
-      modelProvider: new FakeModelProvider(),
+      modelProvider: new ScriptedModelProvider(),
       modelSettings: {
         providerData: {
           extra_headers: { 'X-Parent': '1', 'X-Shared': 'parent' },
@@ -957,7 +1501,7 @@ describe('Agent', () => {
       },
     });
     const parentRunner = new Runner({
-      modelProvider: new FakeModelProvider(),
+      modelProvider: new ScriptedModelProvider(),
       modelSettings: {
         providerData: {
           extraQuery: { parentTenant: 'acme' },
@@ -1321,7 +1865,7 @@ describe('Agent', () => {
     const agent = new Agent({
       name: 'MaxTurnsTool',
       instructions: 'Short runs.',
-      model: new FakeModel([TEST_MODEL_RESPONSE_BASIC]),
+      model: new ScriptedModel([modelResponse(TEST_MODEL_RESPONSE_BASIC)]),
     });
     const tool = agent.asTool({
       toolDescription: 'desc',
@@ -1351,9 +1895,9 @@ describe('Agent', () => {
     const agent = new Agent({
       name: 'MaxTurnsToolAfterResponse',
       instructions: 'Short runs.',
-      model: new FakeModel([
-        TEST_MODEL_RESPONSE_WITH_FUNCTION,
-        TEST_MODEL_RESPONSE_BASIC,
+      model: new ScriptedModel([
+        modelResponse(TEST_MODEL_RESPONSE_WITH_FUNCTION),
+        modelResponse(TEST_MODEL_RESPONSE_BASIC),
       ]),
       tools: [testTool],
       toolUseBehavior: 'run_llm_again',
@@ -1399,7 +1943,7 @@ describe('Agent', () => {
   });
 
   it('returns the full concatenated assistant text from nested agent tools', async () => {
-    setDefaultModelProvider(new FakeModelProvider());
+    setDefaultModelProvider(new ScriptedModelProvider());
     const agent = new Agent({
       name: 'Segmented Streamer',
       instructions: 'Return segmented output.',
@@ -1435,7 +1979,7 @@ describe('Agent', () => {
   });
 
   it('returns the full concatenated structured output text from nested agent tools', async () => {
-    setDefaultModelProvider(new FakeModelProvider());
+    setDefaultModelProvider(new ScriptedModelProvider());
     const agent = new Agent({
       name: 'Structured Streamer',
       instructions: 'Return segmented structured output.',
@@ -1953,6 +2497,242 @@ describe('Agent', () => {
     });
     const result1 = agent.processFinalOutput('{"message": "Hi, how are you?"}');
     expect(result1).toEqual({ message: 'Hi, how are you?' });
+  });
+  it('keeps Zod schemas on the Zod path without Standard JSON Schema', () => {
+    const outputType = z.object({ message: z.string() });
+    const zodWithoutStandardJsonSchema = new Proxy(outputType, {
+      get(target, property, receiver) {
+        if (property === '~standard') {
+          return {
+            version: 1,
+            vendor: 'zod',
+            validate: (target as any)['~standard'].validate,
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const agent = new Agent({
+      name: 'Test Agent',
+      instructions: 'You do tests.',
+      outputType: zodWithoutStandardJsonSchema,
+    });
+
+    expect(agent.outputSchemaName).toBe('ZodOutput');
+    expect(agent.processFinalOutput('{"message":"ok"}')).toEqual({
+      message: 'ok',
+    });
+  });
+  it('should process and infer Standard Schema final output', () => {
+    type Input = { value?: string | null };
+    type Output = { value: string; length: number };
+    const outputType: StandardSchemaWithJSON<Input, Output> = {
+      '~standard': {
+        version: 1,
+        vendor: 'test',
+        types: undefined as unknown as { input: Input; output: Output },
+        jsonSchema: {
+          input: () => ({
+            type: 'object',
+            properties: { value: { type: 'string' } },
+            additionalProperties: false,
+          }),
+          output: () => ({ type: 'object' }),
+        },
+        validate: (input) => {
+          const value = (input as Input | undefined)?.value ?? 'default';
+          return { value: { value, length: value.length } };
+        },
+      },
+    };
+    const agent = new Agent({
+      name: 'Test Agent',
+      instructions: 'You do tests.',
+      outputType,
+    });
+
+    const result = agent.processFinalOutput('{"value": null}');
+    expectTypeOf(result).toEqualTypeOf<Output>();
+    expect(result).toEqual({ value: 'default', length: 7 });
+  });
+
+  it('rejects asynchronous Standard Schema final-output validation when used', () => {
+    const validate = vi.fn(async (value: unknown) => ({
+      value: value as object,
+    }));
+    const outputType: StandardSchemaWithJSON<object> = {
+      '~standard': {
+        version: 1,
+        vendor: 'test',
+        types: undefined as unknown as { input: object; output: object },
+        jsonSchema: {
+          input: () => ({
+            type: 'object',
+            properties: {},
+            additionalProperties: false,
+          }),
+          output: () => ({ type: 'object' }),
+        },
+        validate,
+      },
+    };
+    const agent = new Agent({
+      name: 'Test Agent',
+      instructions: 'You do tests.',
+      outputType,
+    });
+
+    expect(validate).not.toHaveBeenCalled();
+    expect(() => agent.processFinalOutput('{}')).toThrow(
+      /validation returned a Promise/,
+    );
+    expect(validate).toHaveBeenCalledOnce();
+  });
+  it('does not recover asynchronous Standard Schema final-output validation', async () => {
+    const outputType: StandardSchemaWithJSON<object> = {
+      '~standard': {
+        version: 1,
+        vendor: 'test',
+        types: undefined as unknown as { input: object; output: object },
+        jsonSchema: {
+          input: () => ({
+            type: 'object',
+            properties: {},
+            additionalProperties: false,
+          }),
+          output: () => ({ type: 'object' }),
+        },
+        validate: async (value) => ({ value: value as object }),
+      },
+    };
+    const agent = new Agent({
+      name: 'Async output Agent',
+      instructions: 'Return structured output.',
+      outputType,
+      model: new ScriptedModel([
+        modelResponse({
+          output: [fakeModelMessage('{}')],
+          usage: new Usage(),
+        }),
+      ]),
+    });
+    const invalidFinalOutput = vi.fn(() => ({ finalOutput: {} }));
+
+    await expect(
+      run(agent, 'test', {
+        errorHandlers: { invalidFinalOutput },
+      }),
+    ).rejects.toThrow(/validation returned a Promise/);
+    expect(invalidFinalOutput).not.toHaveBeenCalled();
+  });
+  it('processes callable Standard Schema final output', () => {
+    const standard = {
+      version: 1 as const,
+      vendor: 'test',
+      types: undefined as unknown as {
+        input: { value: string };
+        output: { value: string };
+      },
+      jsonSchema: {
+        input: () => ({
+          type: 'object',
+          properties: { value: { type: 'string' } },
+          required: ['value'],
+          additionalProperties: false,
+        }),
+        output: () => ({ type: 'object' }),
+      },
+      validate: (value: unknown) => ({
+        value: value as { value: string },
+      }),
+    };
+    const outputType = Object.assign(() => {}, { '~standard': standard });
+    const agent = new Agent({
+      name: 'Test Agent',
+      instructions: 'You do tests.',
+      outputType,
+    });
+
+    expect(agent.processFinalOutput('{"value":"ok"}')).toEqual({
+      value: 'ok',
+    });
+  });
+  it('rejects input-dependent asynchronous final-output validation', () => {
+    const validate = vi.fn((value: unknown) =>
+      typeof value === 'undefined'
+        ? { value: {} }
+        : Promise.resolve({ value: value as object }),
+    );
+    const outputType: StandardSchemaWithJSON<object> = {
+      '~standard': {
+        version: 1,
+        vendor: 'test',
+        types: undefined as unknown as { input: object; output: object },
+        jsonSchema: {
+          input: () => ({
+            type: 'object',
+            properties: {},
+            additionalProperties: false,
+          }),
+          output: () => ({ type: 'object' }),
+        },
+        validate,
+      },
+    };
+    const agent = new Agent({
+      name: 'Test Agent',
+      instructions: 'You do tests.',
+      outputType,
+    });
+
+    expect(validate).not.toHaveBeenCalled();
+    expect(() => agent.processFinalOutput('{}')).toThrow(
+      /validation returned a Promise/,
+    );
+    expect(validate).toHaveBeenCalledOnce();
+    expect(validate).toHaveBeenCalledWith({});
+  });
+  it('rejects validation-only Standard Schema agent output', () => {
+    expect(
+      () =>
+        new Agent({
+          name: 'Test Agent',
+          instructions: 'You do tests.',
+          outputType: {
+            '~standard': {
+              version: 1,
+              vendor: 'test',
+              validate: (value: unknown) => ({ value }),
+            },
+          } as never,
+        }),
+    ).toThrow(/must provide both.*validate.*jsonSchema/);
+  });
+  it('rejects unsupported Standard JSON Schema at Agent construction', () => {
+    const outputType: StandardSchemaWithJSON<object> = {
+      '~standard': {
+        version: 1,
+        vendor: 'test',
+        types: undefined as unknown as { input: object; output: object },
+        jsonSchema: {
+          input: () => ({
+            type: 'object',
+            allOf: [{ type: 'object' }],
+          }),
+          output: () => ({ type: 'object' }),
+        },
+        validate: (value) => ({ value: value as object }),
+      },
+    };
+
+    expect(
+      () =>
+        new Agent({
+          name: 'Unsupported output Agent',
+          instructions: 'Return structured output.',
+          outputType,
+        }),
+    ).toThrow(/unsupported keyword `allOf`/);
   });
   it('should process final output (json schema)', async () => {
     const agent = new Agent({

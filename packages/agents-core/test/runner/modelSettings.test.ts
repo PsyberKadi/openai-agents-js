@@ -10,11 +10,11 @@ import {
   maybeResetToolChoice,
 } from '../../src/runner/modelSettings';
 import { AgentToolUseTracker } from '../../src/runner/toolUseTracker';
-import { FakeModelProvider } from '../stubs';
+import { ScriptedModelProvider } from '../stubs';
 
 beforeAll(() => {
   setTracingDisabled(true);
-  setDefaultModelProvider(new FakeModelProvider());
+  setDefaultModelProvider(new ScriptedModelProvider());
 });
 
 describe('maybeResetToolChoice', () => {
@@ -152,6 +152,24 @@ describe('adjustModelSettingsForNonGPT5RunnerModel', () => {
 });
 
 describe('mergeModelSettings', () => {
+  it('merges GPT-5.6 reasoning and prompt-cache options', () => {
+    expect(
+      mergeModelSettings(
+        {
+          reasoning: { effort: 'max', context: 'all_turns' },
+          promptCacheOptions: { mode: 'explicit', ttl: '30m' },
+        },
+        {
+          reasoning: { mode: 'pro' },
+          promptCacheOptions: { mode: 'implicit' },
+        },
+      ),
+    ).toEqual({
+      reasoning: { effort: 'max', context: 'all_turns', mode: 'pro' },
+      promptCacheOptions: { mode: 'implicit', ttl: '30m' },
+    });
+  });
+
   it('deep merges retry settings and nested backoff overrides', () => {
     const policy = () => true;
 

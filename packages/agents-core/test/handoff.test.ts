@@ -4,6 +4,37 @@ import { handoff, getHandoff, Handoff } from '../src/handoff';
 import { ModelBehaviorError, UserError } from '../src/errors';
 import { z } from 'zod';
 import logger from '../src/logger';
+import { RunContext } from '../src/runContext';
+import type { StandardSchemaWithJSON } from '../src';
+
+function createSegmentedReferenceSchema(): Record<string, any> {
+  const definitions: Record<string, Record<string, unknown>> = {
+    terminal: { type: 'string' },
+  };
+  const properties: Record<string, Record<string, unknown>> = {};
+  const required: string[] = [];
+  let previousReference = '#/$defs/terminal';
+
+  for (let segment = 0; segment < 2; segment += 1) {
+    for (let index = 59; index >= 0; index -= 1) {
+      const name = `segment${segment}_${index}`;
+      definitions[name] = { $ref: previousReference };
+      previousReference = `#/$defs/${name}`;
+    }
+
+    const checkpoint = `checkpoint${segment}`;
+    properties[checkpoint] = { $ref: previousReference };
+    required.push(checkpoint);
+  }
+
+  return {
+    type: 'object',
+    properties,
+    required,
+    additionalProperties: false,
+    $defs: definitions,
+  };
+}
 
 const agent = new Agent({ name: 'A' });
 
@@ -12,6 +43,27 @@ describe('handoff()', () => {
     expect(() => handoff(agent, { inputType: z.object({}) })).toThrow(
       UserError,
     );
+  });
+
+  it('rejects required-only over-depth schemas before constructing a handoff', () => {
+    const inputType = createSegmentedReferenceSchema();
+    const original = structuredClone(inputType);
+    const onHandoff = vi.fn();
+    let thrown: unknown;
+
+    try {
+      handoff(agent, { inputType: inputType as any, onHandoff });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(UserError);
+    expect(thrown).not.toBeInstanceOf(RangeError);
+    expect((thrown as Error).message).toContain(
+      'JSON schema is too deeply nested to process safely.',
+    );
+    expect(inputType).toEqual(original);
+    expect(onHandoff).not.toHaveBeenCalled();
   });
 
   it('allows onHandoff without inputType', async () => {
@@ -48,6 +100,45 @@ describe('handoff()', () => {
     errorSpy.mockRestore();
   });
 
+  it('validates Standard Schema handoff input before invoking the callback', async () => {
+    type Input = { reason?: string };
+    type Output = { reason: string; normalized: true };
+    const inputType: StandardSchemaWithJSON<Input, Output> = {
+      '~standard': {
+        version: 1,
+        vendor: 'test',
+        types: undefined as unknown as { input: Input; output: Output },
+        jsonSchema: {
+          input: () => ({
+            type: 'object',
+            properties: { reason: { type: 'string' } },
+            additionalProperties: false,
+          }),
+          output: () => ({ type: 'object' }),
+        },
+        validate: (value) => ({
+          value: {
+            reason:
+              (value as Input | undefined)?.reason?.trim() ?? 'unspecified',
+            normalized: true,
+          },
+        }),
+      },
+    };
+    const onHandoff = vi.fn(
+      (_context: RunContext, _input: Output | undefined) => {},
+    );
+    const h = handoff(agent, { inputType, onHandoff });
+    const runContext = new RunContext();
+
+    await h.onInvokeHandoff(runContext, '{"reason":"  billing  "}');
+
+    expect(onHandoff).toHaveBeenCalledWith(runContext, {
+      reason: 'billing',
+      normalized: true,
+    });
+  });
+
   it('applies overrides and inputFilter', () => {
     const filter = vi.fn((d) => d);
     const h = handoff(agent, {
@@ -60,6 +151,164 @@ describe('handoff()', () => {
     expect(h.toolName).toBe('t');
     expect(h.toolDescription).toBe('d');
     expect(h.inputFilter).toBe(filter);
+  });
+});
+
+describe('Handoff#clone', () => {
+  it('returns a distinct Handoff instance and leaves the original unchanged', async () => {
+    const targetAgent = new Agent({ name: 'Target Agent' });
+    const filter = vi.fn((data) => data);
+    const h = handoff(targetAgent, {
+      inputFilter: filter,
+      isEnabled: false,
+      toolNameOverride: 'stable_transfer',
+      toolDescriptionOverride: 'Stable transfer',
+    });
+
+    const clone = h.clone();
+    clone.toolName = 'mutated_clone_transfer';
+
+    expect(clone).toBeInstanceOf(Handoff);
+    expect(clone).not.toBe(h);
+    expect(h.toolName).toBe('stable_transfer');
+    expect(h.toolDescription).toBe('Stable transfer');
+    expect(h.inputFilter).toBe(filter);
+    await expect(
+      h.isEnabled({ runContext: new RunContext(), agent: targetAgent }),
+    ).resolves.toBe(false);
+  });
+
+  it('preserves metadata and callback behavior without overrides', async () => {
+    const targetAgent = new Agent({ name: 'Target Agent' });
+    const onHandoff = vi.fn();
+    const filter = vi.fn((data) => data);
+    const h = handoff(targetAgent, {
+      onHandoff,
+      inputType: z.object({ reason: z.string() }),
+      inputFilter: filter,
+      isEnabled: true,
+      toolNameOverride: 'stable_transfer',
+      toolDescriptionOverride: 'Stable transfer',
+    });
+    const runContext = new RunContext();
+
+    const clone = h.clone();
+    const result = await clone.onInvokeHandoff(
+      runContext,
+      '{"reason":"refund"}',
+    );
+
+    expect(result).toBe(targetAgent);
+    expect(onHandoff).toHaveBeenCalledWith(runContext, { reason: 'refund' });
+    expect(clone.agent).toBe(h.agent);
+    expect(clone.agentName).toBe(h.agentName);
+    expect(clone.toolName).toBe(h.toolName);
+    expect(clone.toolDescription).toBe(h.toolDescription);
+    expect(clone.inputJsonSchema).toEqual(h.inputJsonSchema);
+    expect(clone.strictJsonSchema).toBe(h.strictJsonSchema);
+    expect(clone.inputFilter).toBe(filter);
+    expect(clone.isEnabled).toBe(h.isEnabled);
+    expect(clone.getHandoffAsFunctionTool()).toEqual(
+      h.getHandoffAsFunctionTool(),
+    );
+  });
+
+  it('supports target agent and callback overrides', async () => {
+    const originalAgent = new Agent({ name: 'Original Agent' });
+    const convertedAgent = new Agent({ name: 'Converted Agent' });
+    const originalCallback = vi.fn();
+    const overrideCallback = vi.fn(async () => convertedAgent);
+    const h = handoff(originalAgent, {
+      onHandoff: originalCallback,
+      toolNameOverride: 'stable_transfer',
+      toolDescriptionOverride: 'Stable transfer',
+    });
+
+    const clone = h.clone({
+      agent: convertedAgent,
+      onInvokeHandoff: overrideCallback,
+    });
+    const result = await clone.onInvokeHandoff(new RunContext(), '{}');
+
+    expect(result).toBe(convertedAgent);
+    expect(overrideCallback).toHaveBeenCalledOnce();
+    expect(originalCallback).not.toHaveBeenCalled();
+    expect(clone.agent).toBe(convertedAgent);
+    expect(clone.agentName).toBe('Converted Agent');
+    expect(clone.toolName).toBe('stable_transfer');
+    expect(clone.toolDescription).toBe('Stable transfer');
+    expect(h.agent).toBe(originalAgent);
+    expect(h.agentName).toBe('Original Agent');
+  });
+
+  it('returns the replacement agent by default while preserving handoff side effects', async () => {
+    const originalAgent = new Agent({ name: 'Original Agent' });
+    const convertedAgent = new Agent({ name: 'Converted Agent' });
+    const onHandoff = vi.fn();
+    const h = handoff(originalAgent, {
+      onHandoff,
+      inputType: z.object({ reason: z.string() }),
+      toolNameOverride: 'stable_transfer',
+      toolDescriptionOverride: 'Stable transfer',
+    });
+    const runContext = new RunContext();
+
+    const clone = h.clone({ agent: convertedAgent });
+    const result = await clone.onInvokeHandoff(
+      runContext,
+      '{"reason":"reroute"}',
+    );
+
+    expect(result).toBe(convertedAgent);
+    expect(onHandoff).toHaveBeenCalledWith(runContext, { reason: 'reroute' });
+    expect(clone.agent).toBe(convertedAgent);
+    expect(clone.agentName).toBe('Converted Agent');
+    expect(clone.toolName).toBe('stable_transfer');
+    expect(clone.toolDescription).toBe('Stable transfer');
+  });
+
+  it('uses explicit clone metadata overrides', async () => {
+    const originalAgent = new Agent({ name: 'Original Agent' });
+    const convertedAgent = new Agent({ name: 'Converted Agent' });
+    const filter = vi.fn((data) => data);
+    const isEnabled = vi.fn(async () => false);
+    const inputJsonSchema = {
+      type: 'object' as const,
+      properties: { reason: { type: 'string' } },
+      required: ['reason'],
+      additionalProperties: false,
+    };
+    const h = handoff(originalAgent);
+
+    const clone = h.clone({
+      agent: convertedAgent,
+      agentName: 'Runtime Target',
+      toolName: 'transfer_to_runtime_target',
+      toolDescription: 'Runtime target handoff',
+      inputJsonSchema,
+      strictJsonSchema: false,
+      inputFilter: filter,
+      isEnabled,
+    });
+
+    expect(clone.agent).toBe(convertedAgent);
+    expect(clone.agentName).toBe('Runtime Target');
+    expect(clone.toolName).toBe('transfer_to_runtime_target');
+    expect(clone.toolDescription).toBe('Runtime target handoff');
+    expect(clone.inputJsonSchema).toBe(inputJsonSchema);
+    expect(clone.strictJsonSchema).toBe(false);
+    expect(clone.inputFilter).toBe(filter);
+    expect(clone.isEnabled).toBe(isEnabled);
+    expect(clone.getHandoffAsFunctionTool()).toEqual({
+      type: 'function',
+      name: 'transfer_to_runtime_target',
+      description: 'Runtime target handoff',
+      parameters: inputJsonSchema,
+      strict: false,
+    });
+    await expect(
+      clone.isEnabled({ runContext: new RunContext(), agent: originalAgent }),
+    ).resolves.toBe(false);
   });
 });
 

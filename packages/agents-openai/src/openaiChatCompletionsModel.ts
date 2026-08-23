@@ -14,6 +14,7 @@ import type {
   ModelResponse,
   ResponseStreamEvent,
   SerializedOutputType,
+  UsageInput,
 } from '@openai/agents-core';
 import OpenAI from 'openai';
 import type { Stream } from 'openai/streaming';
@@ -34,11 +35,60 @@ import {
   convertHandoffTool,
   itemsToMessages,
 } from './openaiChatCompletionsConverter';
+
 import { protocol } from '@openai/agents-core';
 import { getOpenAIRetryAdvice } from './retryAdvice';
 import { normalizePromptCacheRetention } from './utils/modelSettings';
+import type { OpenAIClient } from './openaiClient';
+import {
+  CONTENT_FILTER_REFUSAL_MESSAGE,
+  shouldSynthesizeContentFilterRefusal,
+} from './openaiChatCompletionsContentFilter';
+import {
+  reportModelFailureUsage,
+  snapshotRawUsage,
+} from '@openai/agents-core/utils/internal';
+import { FAKE_ID } from './openaiItemIds';
+import {
+  createTruncatedEmptyChatCompletionError,
+  isTruncatedEmptyChatCompletion,
+  isTruncatedEmptyChatCompletionError,
+} from './openaiChatCompletionsTruncation';
 
-export const FAKE_ID = 'FAKE_ID';
+export { FAKE_ID };
+
+type ModelTracingParent = Parameters<typeof createGenerationSpan>[1];
+
+function getModelTracingParent(request: ModelRequest): ModelTracingParent {
+  return (
+    request as ModelRequest & {
+      _internal?: { tracingParent?: ModelTracingParent };
+    }
+  )._internal?.tracingParent;
+}
+
+const GPT_56_MODEL_PATTERN =
+  /^gpt-5\.6(?:-(?:sol|terra|luna)(?:-\d{4}-\d{2}-\d{2})?)?$/;
+
+type ChatCompletionStreamResult = {
+  stream: Stream<OpenAI.Chat.Completions.ChatCompletionChunk>;
+  requestId?: string;
+};
+
+type ChatCompletionStreamWithRequestId = PromiseLike<
+  Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
+> & {
+  withResponse?: () => Promise<{
+    data: Stream<OpenAI.Chat.Completions.ChatCompletionChunk>;
+    request_id: string | null;
+  }>;
+};
+
+function normalizeRequestId(requestId: unknown): string | undefined {
+  return typeof requestId === 'string' && requestId.length > 0
+    ? requestId
+    : undefined;
+}
 
 // Some Chat Completions API compatible providers return a reasoning property on the message
 // If that's the case we handle them separately
@@ -75,13 +125,14 @@ export class OpenAIChatCompletionsModel implements Model {
   #strictFeatureValidation: boolean;
   #hasWarnedUnsupportedPrompt = false;
   #hasWarnedUnsupportedConversationState = false;
+  #hasWarnedUnsupportedReasoningSettings = false;
 
   constructor(
-    client: OpenAI,
+    client: OpenAIClient,
     model: string,
     options: OpenAIChatCompletionsModelOptions = {},
   ) {
-    this.#client = client;
+    this.#client = client as OpenAI;
     this.#model = model;
     this.#strictFeatureValidation = options.strictFeatureValidation ?? false;
   }
@@ -93,25 +144,115 @@ export class OpenAIChatCompletionsModel implements Model {
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     this.#handleUnsupportedServerManagedConversationState(request);
     this.#handleUnsupportedPrompt(request);
+    this.#handleUnsupportedReasoningSettings(request);
 
-    const response = await withGenerationSpan(async (span) => {
-      span.spanData.model = this.#model;
-      span.spanData.model_config = request.modelSettings
-        ? {
-            temperature: request.modelSettings.temperature,
-            top_p: request.modelSettings.topP,
-            frequency_penalty: request.modelSettings.frequencyPenalty,
-            presence_penalty: request.modelSettings.presencePenalty,
-            reasoning_effort: request.modelSettings.reasoning?.effort,
-            verbosity: request.modelSettings.text?.verbosity,
+    const { response, rawResponse, rawUsage, preservedUsage } =
+      await withGenerationSpan(
+        async (span) => {
+          span.spanData.model = this.#model;
+          span.spanData.model_config = request.modelSettings
+            ? {
+                temperature: request.modelSettings.temperature,
+                top_p: request.modelSettings.topP,
+                frequency_penalty: request.modelSettings.frequencyPenalty,
+                presence_penalty: request.modelSettings.presencePenalty,
+                reasoning_effort: request.modelSettings.reasoning?.effort,
+                verbosity: request.modelSettings.text?.verbosity,
+              }
+            : { base_url: this.#client.baseURL };
+          const rawResponse = await this.#fetchResponse(request, span, false);
+          const rawUsage =
+            request.modelSettings.preserveRawUsage === true
+              ? snapshotRawUsage(rawResponse.usage)
+              : undefined;
+          const preservedUsage =
+            rawUsage !== undefined
+              ? new Usage(
+                  toResponseUsage(rawUsage as unknown as CompletionUsage),
+                )
+              : undefined;
+          let response = rawResponse;
+          const firstChoice = rawResponse.choices?.[0];
+          const message = firstChoice?.message;
+          // Some providers signal a filtered completion only through the finish reason.
+          // Normalize that terminal signal before tracing and protocol conversion.
+          if (
+            firstChoice &&
+            message &&
+            shouldSynthesizeContentFilterRefusal({
+              finishReason: firstChoice.finish_reason,
+              hasOutput: Boolean(
+                message.content ||
+                message.refusal ||
+                message.tool_calls?.length ||
+                message.audio,
+              ),
+            })
+          ) {
+            response = {
+              ...rawResponse,
+              choices: [
+                {
+                  ...firstChoice,
+                  message: {
+                    ...message,
+                    content: null,
+                    refusal: CONTENT_FILTER_REFUSAL_MESSAGE,
+                  },
+                },
+                ...rawResponse.choices.slice(1),
+              ],
+            };
           }
-        : { base_url: this.#client.baseURL };
-      const response = await this.#fetchResponse(request, span, false);
-      if (span && request.tracing === true) {
-        span.spanData.output = [response];
-      }
-      return response;
-    });
+          if (span && request.tracing === true) {
+            span.spanData.output = [response];
+          }
+          const normalizedMessage = response.choices?.[0]?.message;
+          const hasStrictCustomToolCall = Boolean(
+            this.#strictFeatureValidation &&
+            normalizedMessage?.tool_calls?.some(
+              (toolCall) => toolCall.type === 'custom',
+            ),
+          );
+          if (
+            normalizedMessage &&
+            !hasStrictCustomToolCall &&
+            isTruncatedEmptyChatCompletion({
+              finishReason: response.choices[0]?.finish_reason,
+              hasText:
+                typeof normalizedMessage.content === 'string' &&
+                normalizedMessage.content.length > 0,
+              hasRefusal:
+                typeof normalizedMessage.refusal === 'string' &&
+                normalizedMessage.refusal.length > 0,
+              hasAudio: normalizedMessage.audio != null,
+              hasReasoning: hasReasoningContent(normalizedMessage),
+              hasFunctionCall: Boolean(
+                normalizedMessage.tool_calls?.some(
+                  (toolCall) => toolCall.type === 'function',
+                ),
+              ),
+            })
+          ) {
+            const error = createTruncatedEmptyChatCompletionError();
+            const failureUsage = toResponseUsage(
+              response.usage ?? {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+              },
+            );
+            if (span) {
+              span.spanData.usage = failureUsage;
+            }
+            reportModelFailureUsage(request, error, new Usage(failureUsage));
+            throw error;
+          }
+          return { response, rawResponse, rawUsage, preservedUsage };
+        },
+        undefined,
+        getModelTracingParent(request),
+      );
 
     const output: protocol.OutputModelItem[] = [];
     if (response.choices && response.choices[0]) {
@@ -215,12 +356,18 @@ export class OpenAIChatCompletionsModel implements Model {
       }
     }
     const modelResponse: ModelResponse = {
-      usage: response.usage
-        ? new Usage(toResponseUsage(response.usage))
-        : new Usage(),
+      usage:
+        preservedUsage ??
+        (response.usage
+          ? new Usage(toResponseUsage(response.usage))
+          : new Usage({ requests: 1 })),
       output,
       responseId: response.id,
-      providerData: response,
+      requestId: normalizeRequestId(
+        (rawResponse as { _request_id?: unknown })._request_id,
+      ),
+      providerData: rawResponse,
+      ...(rawUsage !== undefined ? { rawUsage } : {}),
     };
 
     return modelResponse;
@@ -231,16 +378,35 @@ export class OpenAIChatCompletionsModel implements Model {
   ): AsyncIterable<ResponseStreamEvent> {
     this.#handleUnsupportedServerManagedConversationState(request);
     this.#handleUnsupportedPrompt(request);
+    this.#handleUnsupportedReasoningSettings(request);
 
-    const span = request.tracing ? createGenerationSpan() : undefined;
+    const span = request.tracing
+      ? createGenerationSpan(undefined, getModelTracingParent(request))
+      : undefined;
+    let response: OpenAI.Chat.Completions.ChatCompletion | undefined;
     try {
       if (span) {
+        span.spanData.model = this.#model;
+        span.spanData.model_config = request.modelSettings
+          ? {
+              temperature: request.modelSettings.temperature,
+              top_p: request.modelSettings.topP,
+              frequency_penalty: request.modelSettings.frequencyPenalty,
+              presence_penalty: request.modelSettings.presencePenalty,
+              reasoning_effort: request.modelSettings.reasoning?.effort,
+              verbosity: request.modelSettings.text?.verbosity,
+            }
+          : { base_url: this.#client.baseURL };
         span.start();
         setCurrentSpan(span);
       }
-      const stream = await this.#fetchResponse(request, span, true);
+      const { stream, requestId } = await this.#fetchResponse(
+        request,
+        span,
+        true,
+      );
 
-      const response: OpenAI.Chat.Completions.ChatCompletion = {
+      response = {
         id: FAKE_ID,
         created: Math.floor(Date.now() / 1000),
         model: this.#model,
@@ -255,7 +421,12 @@ export class OpenAIChatCompletionsModel implements Model {
       for await (const event of convertChatCompletionsStreamToResponses(
         response,
         stream,
-        { strictFeatureValidation: this.#strictFeatureValidation },
+        {
+          strictFeatureValidation: this.#strictFeatureValidation,
+          ...(request.modelSettings.preserveRawUsage === true
+            ? { preserveRawUsage: true }
+            : {}),
+        },
       )) {
         if (
           event.type === 'response_done' &&
@@ -277,6 +448,9 @@ export class OpenAIChatCompletionsModel implements Model {
               : event.response.usage.outputTokensDetails,
           };
         }
+        if (event.type === 'response_done' && requestId) {
+          event.response.requestId = requestId;
+        }
         yield event;
       }
 
@@ -284,7 +458,38 @@ export class OpenAIChatCompletionsModel implements Model {
         span.spanData.output = [response];
       }
     } catch (error) {
+      const truncatedResponse =
+        response !== undefined && isTruncatedEmptyChatCompletionError(error)
+          ? response
+          : undefined;
+      if (truncatedResponse) {
+        reportModelFailureUsage(
+          request,
+          error,
+          new Usage(
+            toResponseUsage(
+              truncatedResponse.usage ?? {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+              },
+            ),
+          ),
+        );
+      }
       if (span) {
+        if (truncatedResponse) {
+          if (request.tracing === true) {
+            span.spanData.output = [truncatedResponse];
+          }
+          span.spanData.usage = toResponseUsage(
+            truncatedResponse.usage ?? {
+              prompt_tokens: 0,
+              completion_tokens: 0,
+              total_tokens: 0,
+            },
+          );
+        }
         span.setError({
           message: 'Error streaming response',
           data: {
@@ -359,6 +564,39 @@ export class OpenAIChatCompletionsModel implements Model {
     }
   }
 
+  #handleUnsupportedReasoningSettings(request: ModelRequest) {
+    const reasoning = request.modelSettings.reasoning;
+    if (!reasoning) {
+      return;
+    }
+
+    const unsupported = (['mode', 'context'] as const).filter(
+      (name) => reasoning[name] !== undefined && reasoning[name] !== null,
+    );
+    if (unsupported.length === 0) {
+      return;
+    }
+
+    const unsupportedParams = unsupported
+      .map((name) => `reasoning.${name}`)
+      .join(', ');
+    const message =
+      `OpenAIChatCompletionsModel does not support ${unsupportedParams}. ` +
+      'These reasoning settings require the Responses API; Chat Completions only uses reasoning.effort.';
+
+    if (this.#strictFeatureValidation) {
+      throw new UserError(message);
+    }
+
+    if (!this.#hasWarnedUnsupportedReasoningSettings) {
+      logger.warn(
+        `${message} Ignoring unsupported reasoning settings; ` +
+          'enable strict feature validation to raise an error instead.',
+      );
+      this.#hasWarnedUnsupportedReasoningSettings = true;
+    }
+  }
+
   /**
    * @internal
    */
@@ -366,7 +604,7 @@ export class OpenAIChatCompletionsModel implements Model {
     request: ModelRequest,
     span: Span<GenerationSpanData> | undefined,
     stream: true,
-  ): Promise<Stream<OpenAI.Chat.Completions.ChatCompletionChunk>>;
+  ): Promise<ChatCompletionStreamResult>;
   async #fetchResponse(
     request: ModelRequest,
     span: Span<GenerationSpanData> | undefined,
@@ -377,12 +615,36 @@ export class OpenAIChatCompletionsModel implements Model {
     span: Span<GenerationSpanData> | undefined,
     stream: boolean,
   ): Promise<
-    | Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
-    | OpenAI.Chat.Completions.ChatCompletion
+    ChatCompletionStreamResult | OpenAI.Chat.Completions.ChatCompletion
   > {
     const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [];
     if (request.tools) {
       for (const tool of request.tools) {
+        if (
+          (tool.type === 'function' ||
+            tool.type === 'shell' ||
+            tool.type === 'apply_patch') &&
+          tool.allowedCallers?.some((caller) => caller === 'programmatic')
+        ) {
+          throw new UserError(
+            'Tools callable from Programmatic Tool Calling are only supported with the Responses API.',
+          );
+        }
+        if (tool.type === 'function' && tool.outputSchema) {
+          throw new UserError(
+            'Function tool outputSchema is only supported with the Responses API.',
+          );
+        }
+        if (
+          tool.type === 'hosted_tool' &&
+          (tool.providerData?.type === 'programmatic_tool_calling' ||
+            (Array.isArray(tool.providerData?.allowed_callers) &&
+              tool.providerData.allowed_callers.includes('programmatic')))
+        ) {
+          throw new UserError(
+            'Programmatic Tool Calling is only supported with the Responses API.',
+          );
+        }
         if (tool.type === 'function') {
           if (
             typeof tool.namespace === 'string' &&
@@ -407,15 +669,7 @@ export class OpenAIChatCompletionsModel implements Model {
       }
     }
     const responseFormat = getResponseFormat(request.outputType);
-
-    let parallelToolCalls: boolean | undefined = undefined;
-    if (typeof request.modelSettings.parallelToolCalls === 'boolean') {
-      if (request.modelSettings.parallelToolCalls && tools.length === 0) {
-        throw new Error('Parallel tool calls are not supported without tools');
-      }
-
-      parallelToolCalls = request.modelSettings.parallelToolCalls;
-    }
+    const parallelToolCalls = request.modelSettings.parallelToolCalls;
 
     const messages = itemsToMessages(request.input, {
       strictFeatureValidation: this.#strictFeatureValidation,
@@ -431,10 +685,20 @@ export class OpenAIChatCompletionsModel implements Model {
       span.spanData.input = messages;
     }
 
-    const providerData = request.modelSettings.providerData ?? {};
+    const providerData = { ...(request.modelSettings.providerData ?? {}) };
+    const requestInternal = (
+      request as ModelRequest & {
+        _internal?: { reasoningEffortImplicit?: boolean };
+      }
+    )._internal;
+    const omitImplicitReasoningEffort =
+      requestInternal?.reasoningEffortImplicit === true &&
+      (providerData.reasoning_effort !== undefined ||
+        (tools.length > 0 && GPT_56_MODEL_PATTERN.test(this.#model)));
     if (
       request.modelSettings.reasoning &&
-      request.modelSettings.reasoning.effort
+      request.modelSettings.reasoning.effort &&
+      !omitImplicitReasoningEffort
     ) {
       // merge the top-level reasoning.effort into provider data
       providerData.reasoning_effort = request.modelSettings.reasoning.effort;
@@ -463,15 +727,22 @@ export class OpenAIChatCompletionsModel implements Model {
         request.modelSettings.toolChoice,
         tools,
       ),
-      parallel_tool_calls: parallelToolCalls,
+      ...(tools.length > 0 && typeof parallelToolCalls === 'boolean'
+        ? { parallel_tool_calls: parallelToolCalls }
+        : {}),
       stream: stream ? true : false,
       stream_options: stream ? { include_usage: true } : undefined,
       store: request.modelSettings.store,
       prompt_cache_retention: normalizePromptCacheRetention(
         request.modelSettings.promptCacheRetention,
       ),
+      prompt_cache_options: request.modelSettings.promptCacheOptions,
       ...providerData,
     };
+
+    if (!requestData.tools?.length) {
+      delete requestData.parallel_tool_calls;
+    }
 
     if (responseFormat) {
       requestData.response_format = responseFormat;
@@ -503,17 +774,44 @@ export class OpenAIChatCompletionsModel implements Model {
       requestOptions.maxRetries = 0;
     }
 
-    const completion = await this.#client.chat.completions.create(
+    const completionPromise = this.#client.chat.completions.create(
       requestData,
       requestOptions,
     );
+
+    let completion:
+      | Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
+      | OpenAI.Chat.Completions.ChatCompletion;
+    let requestId: string | undefined;
+    if (stream) {
+      const withResponse = (
+        completionPromise as ChatCompletionStreamWithRequestId
+      ).withResponse;
+      if (typeof withResponse === 'function') {
+        const streamedResponse = await withResponse.call(completionPromise);
+        completion = streamedResponse.data;
+        requestId = normalizeRequestId(streamedResponse.request_id);
+      } else {
+        completion =
+          (await completionPromise) as Stream<OpenAI.Chat.Completions.ChatCompletionChunk>;
+      }
+    } else {
+      completion =
+        (await completionPromise) as OpenAI.Chat.Completions.ChatCompletion;
+    }
 
     if (logger.dontLogModelData) {
       logger.debug('Response received');
     } else {
       logger.debug(`Response received: ${JSON.stringify(completion, null, 2)}`);
     }
-    return completion;
+    return stream
+      ? {
+          stream:
+            completion as Stream<OpenAI.Chat.Completions.ChatCompletionChunk>,
+          ...(requestId ? { requestId } : {}),
+        }
+      : (completion as OpenAI.Chat.Completions.ChatCompletion);
   }
 }
 
@@ -547,7 +845,7 @@ function getResponseFormat(
 
 function toResponseUsage(
   usage: CompletionUsage,
-): OpenAI.Responses.ResponseUsage & { requests: number } {
+): UsageInput & { requests: number } {
   return {
     requests: 1,
     input_tokens: usage.prompt_tokens,

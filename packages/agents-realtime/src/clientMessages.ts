@@ -3,6 +3,7 @@ import {
   ModelSettingsToolChoice,
   Prompt,
 } from '@openai/agents-core/types';
+import type { ProviderData } from '@openai/agents-core/types';
 
 export type RealtimeClientMessage = {
   type: string;
@@ -40,15 +41,11 @@ export type RealtimeAudioFormatDefinition =
  * @deprecated Use a {type: "audio/pcm"} format instead. String shorthands are deprecated.
  */
 export type RealtimeAudioFormatLegacy =
-  | 'pcm16'
-  | 'g711_ulaw'
-  | 'g711_alaw'
-  | (string & {});
+  'pcm16' | 'g711_ulaw' | 'g711_alaw' | (string & {});
 
 // User-facing union (legacy accepted, GA preferred)
 export type RealtimeAudioFormat =
-  | RealtimeAudioFormatLegacy
-  | RealtimeAudioFormatDefinition;
+  RealtimeAudioFormatLegacy | RealtimeAudioFormatDefinition;
 
 export type RealtimeTracingConfig =
   | {
@@ -63,10 +60,18 @@ export type RealtimeInputAudioNoiseReductionConfig = {
 };
 
 export type RealtimeInputAudioTranscriptionConfig = {
+  delay?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  keywords?: string[];
   language?: string;
+  languages?: string[];
   model?:
+    | 'gpt-transcribe'
+    | 'gpt-live-transcribe'
     | 'gpt-4o-transcribe'
     | 'gpt-4o-mini-transcribe'
+    | 'gpt-4o-mini-transcribe-2025-12-15'
+    | 'gpt-4o-transcribe-diarize'
+    | 'gpt-realtime-whisper'
     | 'whisper-1'
     | (string & {});
   prompt?: string;
@@ -98,8 +103,7 @@ export type RealtimeTurnDetectionConfigCamelCase = {
 };
 
 export type RealtimeTurnDetectionConfig = (
-  | RealtimeTurnDetectionConfigAsIs
-  | RealtimeTurnDetectionConfigCamelCase
+  RealtimeTurnDetectionConfigAsIs | RealtimeTurnDetectionConfigCamelCase
 ) &
   Record<string, any>;
 
@@ -122,11 +126,7 @@ export type RealtimeAudioConfig = {
 };
 
 export type RealtimeReasoningEffort =
-  | 'minimal'
-  | 'low'
-  | 'medium'
-  | 'high'
-  | 'xhigh';
+  'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 
 export type RealtimeReasoningConfig = {
   effort?: RealtimeReasoningEffort;
@@ -178,8 +178,7 @@ export type RealtimeSessionConfigDeprecated = RealtimeSessionConfigCommon & {
 
 // Union of configs; users should not mix-and-match; runtime converter will normalize
 export type RealtimeSessionConfig =
-  | RealtimeSessionConfigDefinition
-  | RealtimeSessionConfigDeprecated;
+  RealtimeSessionConfigDefinition | RealtimeSessionConfigDeprecated;
 
 function isDefined(
   key:
@@ -187,8 +186,8 @@ function isDefined(
     | keyof RealtimeSessionConfigDeprecated,
   object: Partial<RealtimeSessionConfig>,
 ) {
-  // @ts-expect-error fudging with types here for the index types
-  return key in object && typeof object[key] !== 'undefined';
+  const config = object as Record<PropertyKey, unknown>;
+  return key in config && typeof config[key] !== 'undefined';
 }
 
 function isDeprecatedConfig(
@@ -286,8 +285,17 @@ export function normalizeAudioFormat(
   format?: RealtimeAudioFormat | undefined,
 ): RealtimeAudioFormatDefinition | undefined {
   if (!format) return undefined;
-  if (typeof format === 'object')
+  if (typeof format === 'object') {
+    if (
+      format.type === 'audio/pcm' &&
+      typeof format.rate === 'number' &&
+      !Number.isFinite(format.rate)
+    ) {
+      return { type: 'audio/pcm', rate: 24000 };
+    }
+
     return format as RealtimeAudioFormatDefinition;
+  }
   const f = String(format);
   if (f === 'pcm16') return { type: 'audio/pcm', rate: 24000 };
   if (f === 'g711_ulaw') return { type: 'audio/pcmu' };
@@ -312,12 +320,14 @@ export type HostedMCPApprovalFilter = HostedToolFilter & {
   read_only?: boolean;
 };
 
-// TODO unify this with the core types
-export type HostedMCPToolDefinition = {
-  type: 'mcp';
-  server_label: string;
+type CoreHostedMCPToolDefinition = ProviderData.HostedMCPTool<unknown>;
+type RealtimeHostedMCPSharedFields = Pick<
+  CoreHostedMCPToolDefinition,
+  'type' | 'server_label' | 'headers'
+>;
+
+export type HostedMCPToolDefinition = RealtimeHostedMCPSharedFields & {
   server_url?: string;
-  headers?: Record<string, string>;
   allowed_tools?: string[] | HostedToolFilter;
   require_approval?:
     | 'never'
@@ -329,8 +339,7 @@ export type HostedMCPToolDefinition = {
 };
 
 export type RealtimeToolDefinition =
-  | FunctionToolDefinition
-  | HostedMCPToolDefinition;
+  FunctionToolDefinition | HostedMCPToolDefinition;
 
 // Describes a tool as returned by an MCP server (via mcp_list_tools).
 // Shape mirrors the realtime event payload (with room for extensions).

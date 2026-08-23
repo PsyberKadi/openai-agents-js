@@ -1,6 +1,6 @@
 import { Agent, AgentOutputType } from '../agent';
 import { MaxTurnsExceededError } from '../errors';
-import { RunHandoffOutputItem, RunItem } from '../items';
+import { RunHandoffOutputItem, RunInputItem, RunItem } from '../items';
 import logger from '../logger';
 import { RunState } from '../runState';
 import type { AgentInputItem } from '../types';
@@ -16,18 +16,94 @@ import {
 } from './guardrails';
 import { prepareModelInputItems } from './items';
 import { ensureAgentSpan } from './tracing';
+import type { Span, Trace } from '../tracing';
 import { getToolCallOutputItem } from './toolExecution';
 import type { ProcessedResponse } from './types';
 
 type GuardrailHandlers = {
-  onParallelStart?: () => void;
+  onParallelPromise?: (promise: Promise<InputGuardrailResult[]>) => void;
   onParallelError?: (error: unknown) => void;
 };
 
 type PreparedTurn = {
   turnInput: AgentInputItem[];
-  parallelGuardrailPromise?: Promise<InputGuardrailResult[]>;
+  pendingInputItems: RunInputItem[];
+  pendingInputSourceItems: AgentInputItem[];
 };
+
+// Keep run-local input normalizations stable so identity-preserving filters can reuse them
+// across turns without changing the serialized RunState boundary.
+type PreparedInputIdentityCache = {
+  normalizedStringInput?: {
+    source: string;
+    items: AgentInputItem[];
+  };
+  pendingInputItems: WeakMap<object, RunInputItem[]>;
+};
+
+const preparedInputIdentityByRunState = new WeakMap<
+  RunState<any, any>,
+  PreparedInputIdentityCache
+>();
+
+function getPreparedInputIdentityCache<
+  TContext,
+  TAgent extends Agent<TContext, AgentOutputType>,
+>(state: RunState<TContext, TAgent>): PreparedInputIdentityCache {
+  const cached = preparedInputIdentityByRunState.get(state);
+  if (cached) {
+    return cached;
+  }
+  const created = { pendingInputItems: new WeakMap<object, RunInputItem[]>() };
+  preparedInputIdentityByRunState.set(state, created);
+  return created;
+}
+
+function getPreparedOriginalInput<
+  TContext,
+  TAgent extends Agent<TContext, AgentOutputType>,
+>(
+  state: RunState<TContext, TAgent>,
+  input: string | AgentInputItem[],
+): AgentInputItem[] {
+  if (typeof input !== 'string') {
+    return input;
+  }
+  const cache = getPreparedInputIdentityCache(state);
+  if (cache.normalizedStringInput?.source === input) {
+    return cache.normalizedStringInput.items;
+  }
+  const normalized = prepareModelInputItems(input, []);
+  cache.normalizedStringInput = { source: input, items: normalized };
+  return normalized;
+}
+
+function getPreparedPendingInputItem<
+  TContext,
+  TAgent extends Agent<TContext, AgentOutputType>,
+>(
+  state: RunState<TContext, TAgent>,
+  item: AgentInputItem,
+  occurrenceIndex: number,
+): RunInputItem {
+  if (!item || typeof item !== 'object') {
+    return new RunInputItem(structuredClone(item), state._currentAgent);
+  }
+  const cache = getPreparedInputIdentityCache(state);
+  const cached = cache.pendingInputItems.get(item as object)?.[occurrenceIndex];
+  if (cached) {
+    cached.agent = state._currentAgent;
+    return cached;
+  }
+  const prepared = new RunInputItem(structuredClone(item), state._currentAgent);
+  const preparedOccurrences = cache.pendingInputItems.get(item as object) ?? [];
+  preparedOccurrences[occurrenceIndex] = prepared;
+  cache.pendingInputItems.set(item as object, preparedOccurrences);
+  if (prepared.rawItem && typeof prepared.rawItem === 'object') {
+    cache.pendingInputItems.set(prepared.rawItem as object, [prepared]);
+  }
+  return prepared;
+}
 
 type PrepareTurnOptions<
   TContext,
@@ -47,6 +123,8 @@ type PrepareTurnOptions<
     agent: TAgent,
     turnInput: AgentInputItem[],
   ) => void;
+  onAgentSpanReady?: (turn: number, agentName: string) => void;
+  agentSpanParent?: Span<any> | Trace;
 };
 
 export async function prepareTurn<
@@ -64,6 +142,8 @@ export async function prepareTurn<
     inputGuardrailDefs,
     guardrailHandlers,
     emitAgentStart,
+    onAgentSpanReady,
+    agentSpanParent,
   } = options;
 
   const { isResumingFromInterruption } = beginTurn(state, {
@@ -93,25 +173,43 @@ export async function prepareTurn<
       handoffs: [],
       tools: [],
       currentSpan: state._currentAgentSpan,
+      parent: agentSpanParent,
     }),
   );
+  onAgentSpanReady?.(state._currentTurn, state._currentAgent.name);
 
-  const { parallelGuardrailPromise } = await runInputGuardrailsForTurn(
+  const pendingInputSourceItems = [...state._pendingInput];
+  await runInputGuardrailsForTurn(
     state,
     inputGuardrailDefs,
     isResumingFromInterruption,
     guardrailHandlers,
   );
 
+  const pendingInputOccurrences = new WeakMap<object, number>();
+  const pendingInputItems = pendingInputSourceItems.map((item) => {
+    const occurrenceIndex =
+      item && typeof item === 'object'
+        ? (pendingInputOccurrences.get(item as object) ?? 0)
+        : 0;
+    if (item && typeof item === 'object') {
+      pendingInputOccurrences.set(item as object, occurrenceIndex + 1);
+    }
+    return getPreparedPendingInputItem(state, item, occurrenceIndex);
+  });
+  const generatedItemsForTurn = generatedItems.concat(pendingInputItems);
+  const preparedOriginalInput = getPreparedOriginalInput(state, input);
+
   const turnInput = serverConversationTracker
     ? serverConversationTracker.prepareInput(
-        input,
-        generatedItems,
+        preparedOriginalInput,
+        generatedItemsForTurn,
         getManagedConversationSupplementalItems(state),
+        pendingInputItems,
       )
     : prepareModelInputItems(
-        input,
-        generatedItems,
+        preparedOriginalInput,
+        generatedItemsForTurn,
         state._reasoningItemIdPolicy,
       );
 
@@ -127,7 +225,8 @@ export async function prepareTurn<
 
   return {
     turnInput,
-    parallelGuardrailPromise,
+    pendingInputItems,
+    pendingInputSourceItems,
   };
 }
 
@@ -187,27 +286,34 @@ async function runInputGuardrailsForTurn<
   runnerGuardrails: InputGuardrailDefinition[],
   isResumingFromInterruption: boolean,
   handlers: GuardrailHandlers = {},
-): Promise<{ parallelGuardrailPromise?: Promise<InputGuardrailResult[]> }> {
-  if (state._currentTurn !== 1 || isResumingFromInterruption) {
-    return {};
+): Promise<void> {
+  const guardrailInput =
+    state._pendingInput.length > 0 ? state.pendingInput : undefined;
+  if (
+    guardrailInput === undefined &&
+    (state._currentTurn !== 1 || isResumingFromInterruption)
+  ) {
+    return;
   }
 
   const guardrailDefs = buildInputGuardrailDefinitions(state, runnerGuardrails);
   const guardrails = splitInputGuardrails(guardrailDefs);
   if (guardrails.blocking.length > 0) {
-    await runInputGuardrails(state, guardrails.blocking);
+    await runInputGuardrails(state, guardrails.blocking, {
+      input: guardrailInput,
+    });
   }
   if (guardrails.parallel.length > 0) {
-    handlers.onParallelStart?.();
-    const promise = runInputGuardrails(state, guardrails.parallel);
-    const parallelGuardrailPromise = promise.catch((err) => {
-      handlers.onParallelError?.(err);
-      return [];
-    });
-    return { parallelGuardrailPromise };
+    const parallelGuardrailPromise = runInputGuardrails(
+      state,
+      guardrails.parallel,
+      {
+        input: guardrailInput,
+        onErrorObserved: handlers.onParallelError,
+      },
+    ).catch(() => []);
+    handlers.onParallelPromise?.(parallelGuardrailPromise);
   }
-
-  return {};
 }
 
 function beginTurn<TContext, TAgent extends Agent<TContext, AgentOutputType>>(

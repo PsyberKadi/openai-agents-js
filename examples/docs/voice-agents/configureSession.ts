@@ -6,7 +6,7 @@ const agent = new RealtimeAgent({
 });
 
 const session = new RealtimeSession(agent, {
-  model: 'gpt-realtime-2',
+  model: 'gpt-realtime-2.1',
   config: {
     outputModalities: ['audio'],
     reasoning: {
@@ -17,7 +17,12 @@ const session = new RealtimeSession(agent, {
       input: {
         format: 'pcm16',
         transcription: {
-          model: 'gpt-4o-mini-transcribe',
+          model: 'gpt-live-transcribe',
+          delay: 'low',
+          prompt:
+            'A software support conversation about the OpenAI Agents SDK.',
+          keywords: ['OpenAI Agents SDK', 'RealtimeSession'],
+          languages: ['en', 'ja'],
         },
       },
       output: {

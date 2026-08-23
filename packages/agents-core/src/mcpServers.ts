@@ -1,10 +1,18 @@
-import { getLogger } from './logger';
+import { getLogger, logToolActionDebug, logToolActionError } from './logger';
 import type { MCPServer } from './mcp';
+import { getMcpServerExternalName } from './mcpLogging';
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 10_000;
 
 const logger = getLogger('openai-agents:mcp-servers');
+
+function getMcpServerLogLabel(server: MCPServer): string {
+  if (logger.dontLogToolData) {
+    return 'MCP server';
+  }
+  return `MCP server '${getMcpServerExternalName(server.name)}'`;
+}
 
 type ServerAction = 'connect' | 'close';
 
@@ -15,17 +23,23 @@ type ServerCommand = {
   reject: (error: Error) => void;
 };
 
+type TrackedCloseTask = {
+  task: Promise<void>;
+  settled: boolean;
+};
+
 class ServerWorker {
   private queue: ServerCommand[] = [];
   private draining = false;
   private done = false;
-  private closing: Promise<void> | null = null;
+  private closing: TrackedCloseTask | null = null;
   private closeResult: Promise<void> | null = null;
 
   constructor(
     private readonly server: MCPServer,
     private readonly connectTimeoutMs: number | null,
     private readonly closeTimeoutMs: number | null,
+    private readonly onCloseSettled: (error: Error | null) => void,
   ) {}
 
   get isDone(): boolean {
@@ -36,7 +50,31 @@ class ServerWorker {
     return this.submit('connect', this.connectTimeoutMs);
   }
 
-  close(): Promise<void> {
+  async close(): Promise<void> {
+    if (this.done) {
+      return;
+    }
+    if (this.closeResult) {
+      return this.closeResult;
+    }
+    if (this.closing) {
+      const existingClose = this.closing;
+      try {
+        await runWithTimeoutTask(
+          existingClose.task,
+          this.closeTimeoutMs,
+          createTimeoutError('close', this.server, this.closeTimeoutMs),
+        );
+        return;
+      } catch (error) {
+        if (!existingClose.settled) {
+          throw error;
+        }
+        if (this.closing === existingClose) {
+          this.closing = null;
+        }
+      }
+    }
     return this.submit('close', this.closeTimeoutMs);
   }
 
@@ -94,14 +132,16 @@ class ServerWorker {
           );
         } else {
           const closeTask = this.server.close();
-          this.closing = closeTask
-            .then(
-              () => undefined,
-              () => undefined,
-            )
-            .finally(() => {
-              this.closing = null;
-            });
+          const trackedClose = trackCloseTask(closeTask, (error) => {
+            if (this.closing !== trackedClose) {
+              return;
+            }
+            if (!error) {
+              this.done = true;
+            }
+            this.onCloseSettled(error);
+          });
+          this.closing = trackedClose;
           await runWithTimeoutTask(
             closeTask,
             command.timeoutMs,
@@ -153,12 +193,14 @@ export type MCPServersReconnectOptions = {
  */
 export class MCPServers {
   private readonly allServers: MCPServer[];
-  private activeServers: MCPServer[];
+  private connectedServerSet = new Set<MCPServer>();
   private failedServers: MCPServer[] = [];
   private failedServerSet = new Set<MCPServer>();
   private errorsByServer = new Map<MCPServer, Error>();
   private suppressedAbortFailures = new Set<MCPServer>();
   private workers = new Map<MCPServer, ServerWorker>();
+  private serialCloseTasks = new Map<MCPServer, TrackedCloseTask>();
+  private lifecycleTail: Promise<void> = Promise.resolve();
 
   private readonly connectTimeoutMs: number | null;
   private readonly closeTimeoutMs: number | null;
@@ -182,8 +224,7 @@ export class MCPServers {
   }
 
   private constructor(servers: MCPServer[], options?: MCPServersOptions) {
-    this.allServers = [...servers];
-    this.activeServers = [...servers];
+    this.allServers = uniqueServers(servers);
 
     this.connectTimeoutMs =
       options?.connectTimeoutMs === undefined
@@ -216,7 +257,12 @@ export class MCPServers {
   }
 
   get active(): MCPServer[] {
-    return [...this.activeServers];
+    if (!this.dropFailed) {
+      return [...this.allServers];
+    }
+    return this.allServers.filter((server) =>
+      this.connectedServerSet.has(server),
+    );
   }
 
   get failed(): MCPServer[] {
@@ -230,36 +276,78 @@ export class MCPServers {
   async reconnect(
     options: MCPServersReconnectOptions = {},
   ): Promise<MCPServer[]> {
-    const failedOnly = options.failedOnly ?? true;
-    let serversToRetry: MCPServer[];
+    return this.enqueueLifecycle(() => this.reconnectNow(options));
+  }
 
-    if (failedOnly) {
-      serversToRetry = uniqueServers(this.failedServers);
-    } else {
-      serversToRetry = [...this.allServers];
-      this.failedServers = [];
-      this.failedServerSet = new Set();
-      this.errorsByServer = new Map();
-      this.suppressedAbortFailures = new Set();
-    }
+  private async reconnectNow(
+    options: MCPServersReconnectOptions,
+  ): Promise<MCPServer[]> {
+    const failedOnly = options.failedOnly ?? true;
+    const serversToCleanup = failedOnly
+      ? uniqueServers(this.failedServers)
+      : [...this.allServers];
 
     logger.debug(
-      `Reconnecting MCP servers (failedOnly=${failedOnly}) with ${serversToRetry.length} target(s).`,
+      `Reconnecting MCP servers (failedOnly=${failedOnly}) with ${serversToCleanup.length} target(s).`,
     );
-    if (this.connectInParallel) {
-      await this.connectAllParallel(serversToRetry);
-    } else {
-      for (const server of serversToRetry) {
-        await this.attemptConnect(server);
+
+    if (!failedOnly) {
+      for (const server of serversToCleanup) {
+        if (!this.failedServerSet.has(server)) {
+          this.storeFailure(server, createClosedError(server));
+        }
       }
     }
 
-    this.refreshActiveServers();
+    try {
+      const serversToRetry = await this.closeServers(serversToCleanup);
+      if (!failedOnly) {
+        const cleanedServers = new Set(serversToRetry);
+        const cleanupFailures = serversToCleanup.flatMap((server) => {
+          if (cleanedServers.has(server)) {
+            return [];
+          }
+          const error = this.errorsByServer.get(server);
+          return error ? [{ server, error }] : [];
+        });
+
+        this.failedServers = [];
+        this.failedServerSet = new Set();
+        this.errorsByServer = new Map();
+        this.suppressedAbortFailures = new Set();
+        for (const { server, error } of cleanupFailures) {
+          this.storeFailure(server, error);
+        }
+        for (const server of serversToRetry) {
+          this.storeFailure(server, createClosedError(server));
+        }
+      }
+
+      if (this.connectInParallel) {
+        await this.connectAllParallel(serversToRetry);
+      } else {
+        for (const server of serversToRetry) {
+          await this.attemptConnect(server);
+        }
+      }
+    } finally {
+      this.refreshActiveServers();
+    }
+
     return this.active;
   }
 
   async close(): Promise<void> {
-    await this.closeAll();
+    await this.enqueueLifecycle(() => this.closeAll());
+  }
+
+  private enqueueLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.lifecycleTail.then(operation, operation);
+    this.lifecycleTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   private async connectAll(): Promise<MCPServer[]> {
@@ -294,7 +382,6 @@ export class MCPServers {
         ...this.failedServers,
       ]);
       await this.closeServers(serversToCleanup);
-      this.activeServers = [];
       throw error;
     }
 
@@ -303,17 +390,22 @@ export class MCPServers {
   }
 
   private async closeAll(): Promise<void> {
-    for (const server of [...this.allServers].reverse()) {
-      await this.closeServer(server);
+    try {
+      for (const server of [...this.allServers].reverse()) {
+        await this.closeServer(server);
+      }
+    } finally {
+      this.refreshActiveServers();
     }
   }
 
   private async attemptConnect(server: MCPServer): Promise<void> {
     const raiseOnError = this.strict;
     try {
-      logger.debug(`Connecting MCP server '${server.name}'.`);
+      logger.debug(`Connecting ${getMcpServerLogLabel(server)}.`);
       await this.runConnect(server);
-      logger.debug(`Connected MCP server '${server.name}'.`);
+      this.connectedServerSet.add(server);
+      logger.debug(`Connected ${getMcpServerLogLabel(server)}.`);
       if (this.failedServerSet.has(server)) {
         this.removeFailedServer(server);
         this.errorsByServer.delete(server);
@@ -338,21 +430,21 @@ export class MCPServers {
   }
 
   private refreshActiveServers(): void {
-    if (this.dropFailed) {
-      const failed = new Set(this.failedServerSet);
-      this.activeServers = this.allServers.filter(
-        (server) => !failed.has(server),
-      );
-    } else {
-      this.activeServers = [...this.allServers];
-    }
     logger.debug(
-      `Active MCP servers: ${this.activeServers.length}; failed: ${this.failedServers.length}.`,
+      `Active MCP servers: ${this.active.length}; failed: ${this.failedServers.length}.`,
     );
   }
 
   private recordFailure(server: MCPServer, error: Error, phase: string): void {
-    logger.error(`Failed to ${phase} MCP server '${server.name}':`, error);
+    logToolActionError(
+      logger,
+      `Failed to ${phase} ${getMcpServerLogLabel(server)}:`,
+      error,
+    );
+    this.storeFailure(server, error);
+  }
+
+  private storeFailure(server: MCPServer, error: Error): void {
     if (!this.failedServerSet.has(server)) {
       this.failedServers.push(server);
       this.failedServerSet.add(server);
@@ -366,6 +458,7 @@ export class MCPServers {
       await worker.connect();
       return;
     }
+    this.serialCloseTasks.delete(server);
     await runWithTimeout(
       () => server.connect(),
       this.connectTimeoutMs,
@@ -373,23 +466,35 @@ export class MCPServers {
     );
   }
 
-  private async closeServer(server: MCPServer): Promise<void> {
+  private async closeServer(server: MCPServer): Promise<boolean> {
     try {
-      logger.debug(`Closing MCP server '${server.name}'.`);
+      logger.debug(`Closing ${getMcpServerLogLabel(server)}.`);
       await this.runClose(server);
-      logger.debug(`Closed MCP server '${server.name}'.`);
+      logger.debug(`Closed ${getMcpServerLogLabel(server)}.`);
+      return true;
     } catch (error) {
       const err = toError(error);
       if (isAbortError(err)) {
         if (!this.suppressAbortError) {
           throw err;
         }
-        logger.debug(`Close cancelled for MCP server '${server.name}': ${err}`);
+        logToolActionDebug(
+          logger,
+          `Close cancelled for ${getMcpServerLogLabel(server)}:`,
+          err,
+        );
         this.errorsByServer.set(server, err);
-        return;
+        return false;
       }
-      logger.error(`Failed to close MCP server '${server.name}':`, err);
+      logToolActionError(
+        logger,
+        `Failed to close ${getMcpServerLogLabel(server)}:`,
+        err,
+      );
       this.errorsByServer.set(server, err);
+      return false;
+    } finally {
+      this.connectedServerSet.delete(server);
     }
   }
 
@@ -398,23 +503,55 @@ export class MCPServers {
       const worker = this.workers.get(server);
       if (worker) {
         await worker.close();
-        if (worker.isDone) {
-          this.workers.delete(server);
-        }
         return;
       }
     }
-    await runWithTimeout(
-      () => server.close(),
+    const existingClose = this.serialCloseTasks.get(server);
+    if (existingClose) {
+      try {
+        await runWithTimeoutTask(
+          existingClose.task,
+          this.closeTimeoutMs,
+          createTimeoutError('close', server, this.closeTimeoutMs),
+        );
+        return;
+      } catch (error) {
+        if (!existingClose.settled) {
+          throw error;
+        }
+        if (this.serialCloseTasks.get(server) === existingClose) {
+          this.serialCloseTasks.delete(server);
+        }
+      }
+    }
+
+    const closeTask = server.close();
+    const trackedCloseTask = trackCloseTask(closeTask, (error) => {
+      if (error && this.serialCloseTasks.get(server) === trackedCloseTask) {
+        this.errorsByServer.set(server, error);
+      }
+    });
+    this.serialCloseTasks.set(server, trackedCloseTask);
+    await runWithTimeoutTask(
+      closeTask,
       this.closeTimeoutMs,
       createTimeoutError('close', server, this.closeTimeoutMs),
     );
   }
 
-  private async closeServers(servers: MCPServer[]): Promise<void> {
+  private async closeServers(servers: MCPServer[]): Promise<MCPServer[]> {
+    const closedServers = new Set<MCPServer>();
     for (const server of [...servers].reverse()) {
-      await this.closeServer(server);
+      try {
+        if (await this.closeServer(server)) {
+          closedServers.add(server);
+        }
+      } catch (error) {
+        this.errorsByServer.set(server, toError(error));
+        throw error;
+      }
     }
+    return servers.filter((server) => closedServers.has(server));
   }
 
   private async connectAllParallel(servers: MCPServer[]): Promise<void> {
@@ -427,16 +564,20 @@ export class MCPServers {
     if (rejection) {
       throw rejection.reason;
     }
-    if (this.strict && this.failedServers.length > 0) {
-      const firstFailure = this.failedServers.find(
-        (server) => !this.suppressedAbortFailures.has(server),
+    if (this.strict) {
+      const firstFailure = servers.find(
+        (server) =>
+          this.failedServerSet.has(server) &&
+          !this.suppressedAbortFailures.has(server),
       );
       if (firstFailure) {
         const error = this.errorsByServer.get(firstFailure);
         if (error) {
           throw error;
         }
-        throw new Error(`Failed to connect MCP server '${firstFailure.name}'.`);
+        throw new Error(
+          `Failed to connect MCP server '${getMcpServerExternalName(firstFailure.name)}'.`,
+        );
       }
     }
   }
@@ -448,6 +589,11 @@ export class MCPServers {
         server,
         this.connectTimeoutMs,
         this.closeTimeoutMs,
+        (error) => {
+          if (error && this.workers.get(server) === next) {
+            this.errorsByServer.set(server, error);
+          }
+        },
       );
       this.workers.set(server, next);
       return next;
@@ -464,6 +610,27 @@ export class MCPServers {
       (failedServer) => failedServer !== server,
     );
   }
+}
+
+function trackCloseTask(
+  task: Promise<void>,
+  onSettled: (error: Error | null) => void,
+): TrackedCloseTask {
+  const tracked: TrackedCloseTask = {
+    task,
+    settled: false,
+  };
+  void task.then(
+    () => {
+      tracked.settled = true;
+      onSettled(null);
+    },
+    (error) => {
+      tracked.settled = true;
+      onSettled(toError(error));
+    },
+  );
+  return tracked;
 }
 
 /**
@@ -485,20 +652,24 @@ function createTimeoutError(
     return new Error(`MCP server ${action} timed out.`);
   }
   const error = new Error(
-    `MCP server ${action} timed out after ${timeoutMs}ms for '${server.name}'.`,
+    `MCP server ${action} timed out after ${timeoutMs}ms for '${getMcpServerExternalName(server.name)}'.`,
   );
   error.name = 'TimeoutError';
   return error;
 }
 
 function createClosedError(server: MCPServer): Error {
-  const error = new Error(`MCP server '${server.name}' is closed.`);
+  const error = new Error(
+    `MCP server '${getMcpServerExternalName(server.name)}' is closed.`,
+  );
   error.name = 'ClosedError';
   return error;
 }
 
 function createClosingError(server: MCPServer): Error {
-  const error = new Error(`MCP server '${server.name}' is closing.`);
+  const error = new Error(
+    `MCP server '${getMcpServerExternalName(server.name)}' is closing.`,
+  );
   error.name = 'ClosingError';
   return error;
 }

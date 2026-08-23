@@ -48,8 +48,12 @@ import {
   type WriteStdinArgs,
   type WorkspaceArchiveOptions,
 } from '../session';
-import { Manifest, normalizeRelativePath } from '../manifest';
-import { SandboxConfigurationError } from '../errors';
+import { cloneManifest, Manifest, normalizeRelativePath } from '../manifest';
+import {
+  SandboxConfigurationError,
+  SandboxUnsupportedFeatureError,
+} from '../errors';
+import { probeSandboxDirectoryExists } from '../shared/pathProbe';
 import {
   WorkspacePathPolicy,
   type ResolveSandboxPathOptions,
@@ -65,11 +69,23 @@ import {
   pathExists,
 } from './shared/localWorkspace';
 import {
+  assertMountCredentialsRebound,
+  assertHostPathGrantsRebound,
   mergeManifestEntryDelta,
   mergeManifestDelta,
   sanitizeEnvironmentForPersistence,
+  serializeMountCredentialRedactionMetadata,
   serializeManifest,
 } from './shared/manifestPersistence';
+import {
+  assertExistingMountTopologyPreserved,
+  assertSandboxSessionStateUsable,
+  assertSandboxStateGenerationUnchanged,
+  captureLiveMountCredentialAuthority,
+  captureSandboxStateGeneration,
+  validateMountCredentialBoundaries,
+  withExclusiveSandboxManifestMutation,
+} from '../mountSecurity';
 import {
   isHostPathWithinRoot,
   relativeHostPathEscapesRoot,
@@ -177,6 +193,7 @@ export class UnixLocalSandboxSession<
   }
 
   createEditor(runAs?: string): Editor {
+    this.assertSessionUsable();
     return new UnixLocalSandboxEditor(this, runAs);
   }
 
@@ -185,6 +202,7 @@ export class UnixLocalSandboxSession<
   }
 
   async resolveExposedPort(port: number): Promise<ExposedPortEndpoint> {
+    this.assertSessionUsable();
     const exposedPort = normalizeExposedPort(port);
     const configuredPorts = this.state.configuredExposedPorts ?? [];
     if (configuredPorts.length > 0 && !configuredPorts.includes(exposedPort)) {
@@ -209,6 +227,7 @@ export class UnixLocalSandboxSession<
   }
 
   async exec(args: ExecCommandArgs): Promise<SandboxExecResult> {
+    this.assertSessionUsable();
     const start = Date.now();
     const cwd = this.resolveCommandWorkdir(args.workdir);
     const logicalCwd = this.logicalWorkdirForPath(args.workdir);
@@ -300,6 +319,7 @@ export class UnixLocalSandboxSession<
   }
 
   async writeStdin(args: WriteStdinArgs): Promise<string> {
+    this.assertSessionUsable();
     const activeProcess = this.activeProcesses.get(args.sessionId);
     if (!activeProcess) {
       return formatExecResponse({
@@ -350,6 +370,7 @@ export class UnixLocalSandboxSession<
   }
 
   async viewImage(args: ViewImageArgs): Promise<ToolOutputImage> {
+    this.assertSessionUsable();
     await this.resolveFilesystemRunAs(args.runAs);
     const filePath = this.resolveSandboxPath(args.path);
     const info = await stat(filePath).catch(() => {
@@ -365,11 +386,27 @@ export class UnixLocalSandboxSession<
   }
 
   async pathExists(path: string, runAs?: string): Promise<boolean> {
+    this.assertSessionUsable();
     await this.resolveFilesystemRunAs(runAs);
     return await pathExists(this.resolveSandboxPath(path));
   }
 
+  async directoryExists(path: string, runAs?: string): Promise<boolean> {
+    this.assertSessionUsable();
+    const identity = await this.resolveCommandRunAs(runAs);
+    const resolvedPath = this.resolveSandboxPath(path);
+    return await probeSandboxDirectoryExists({
+      path: resolvedPath,
+      runCommand: async (command) =>
+        await runSandboxProcess('/bin/sh', ['-c', command], {
+          timeoutMs: RUN_AS_LOOKUP_TIMEOUT_MS,
+          ...(identity ? { uid: identity.uid, gid: identity.gid } : {}),
+        }),
+    });
+  }
+
   async readFile(args: ReadFileArgs): Promise<Uint8Array> {
+    this.assertSessionUsable();
     await this.resolveFilesystemRunAs(args.runAs);
     const bytes = await readFile(this.resolveSandboxPath(args.path));
     if (typeof args.maxBytes === 'number' && bytes.byteLength > args.maxBytes) {
@@ -379,6 +416,7 @@ export class UnixLocalSandboxSession<
   }
 
   async listDir(args: ListDirectoryArgs): Promise<SandboxDirectoryEntry[]> {
+    this.assertSessionUsable();
     await this.resolveFilesystemRunAs(args.runAs);
     const logicalPath = this.resolveLogicalPath(args.path);
     const entries = await readdir(this.resolveSandboxPath(args.path), {
@@ -392,8 +430,24 @@ export class UnixLocalSandboxSession<
   }
 
   async materializeEntry(args: MaterializeEntryArgs): Promise<void> {
-    const runAs = await this.resolveFilesystemRunAs(args.runAs);
+    const entry = structuredClone(args.entry);
+    return await withExclusiveSandboxManifestMutation(this.state, async () =>
+      this.materializeEntryExclusive({ ...args, entry }),
+    );
+  }
+
+  private async materializeEntryExclusive(
+    args: MaterializeEntryArgs,
+  ): Promise<void> {
     const logicalPath = this.resolveLogicalPath(args.path);
+    const nextManifest = mergeManifestEntryDelta(
+      this.state.manifest,
+      logicalPath,
+      args.entry,
+    );
+    assertExistingMountTopologyPreserved(this.state.manifest, nextManifest);
+    validateMountCredentialBoundaries(nextManifest);
+    const runAs = await this.resolveFilesystemRunAs(args.runAs);
     await materializeLocalWorkspaceManifestEntry(
       this.state.workspaceRootPath,
       logicalPath,
@@ -414,9 +468,24 @@ export class UnixLocalSandboxSession<
       logicalPath,
       args.entry,
     );
+    captureLiveMountCredentialAuthority(this.state.manifest);
   }
 
   async applyManifest(manifest: Manifest, runAs?: string): Promise<void> {
+    const manifestSnapshot = cloneManifest(manifest);
+    return await withExclusiveSandboxManifestMutation(this.state, async () =>
+      this.applyManifestExclusive(manifestSnapshot, runAs),
+    );
+  }
+
+  private async applyManifestExclusive(
+    manifest: Manifest,
+    runAs?: string,
+  ): Promise<void> {
+    const nextManifest = mergeManifestDelta(this.state.manifest, manifest);
+    assertExistingMountTopologyPreserved(this.state.manifest, nextManifest);
+    validateMountCredentialBoundaries(nextManifest);
+    assertUnixLocalHostPathGrantsUnsupported(manifest);
     assertLocalWorkspaceManifestMetadataSupported(
       'UnixLocalSandboxClient',
       manifest,
@@ -441,9 +510,11 @@ export class UnixLocalSandboxSession<
       ...environment,
     };
     this.state.manifest = mergeManifestDelta(this.state.manifest, manifest);
+    captureLiveMountCredentialAuthority(this.state.manifest);
   }
 
   async persistWorkspace(): Promise<Uint8Array> {
+    this.assertSessionUsable();
     return await createWorkspaceArchive(
       this.state.workspaceRootPath,
       this.state.manifest.ephemeralPersistencePaths(),
@@ -454,6 +525,7 @@ export class UnixLocalSandboxSession<
     data: string | ArrayBuffer | Uint8Array,
     options: WorkspaceArchiveOptions = {},
   ): Promise<void> {
+    this.assertSessionUsable();
     await restoreWorkspaceArchive(data, this.state.workspaceRootPath, {
       archiveLimits:
         options.archiveLimits === undefined
@@ -507,6 +579,7 @@ export class UnixLocalSandboxSession<
     path?: string,
     options: ResolveSandboxPathOptions = {},
   ): string {
+    this.assertSessionUsable();
     const resolved = this.resolveSandboxPathTarget(path, options);
     const workspaceRelativePath = resolved.workspaceRelativePath ?? '';
     if (!workspaceRelativePath && !resolved.grant) {
@@ -546,6 +619,10 @@ export class UnixLocalSandboxSession<
 
   protected resolveCommandWorkdir(path?: string): string {
     return this.resolveSandboxPath(path);
+  }
+
+  protected assertSessionUsable(): void {
+    assertSandboxSessionStateUsable(this.state);
   }
 
   private resolveSandboxPathTarget(
@@ -903,6 +980,8 @@ export class UnixLocalSandboxClient implements SandboxClient<
         ? { archiveLimits: createArgs.archiveLimits }
         : {}),
     };
+    validateMountCredentialBoundaries(manifest);
+    assertUnixLocalHostPathGrantsUnsupported(manifest);
     assertLocalWorkspaceManifestMetadataSupported(
       'UnixLocalSandboxClient',
       manifest,
@@ -941,6 +1020,10 @@ export class UnixLocalSandboxClient implements SandboxClient<
     state: UnixLocalSandboxSessionState,
     options: SandboxClientResumeOptions = {},
   ): Promise<UnixLocalSandboxSession> {
+    assertMountCredentialsRebound(state);
+    validateMountCredentialBoundaries(state.manifest);
+    assertHostPathGrantsRebound(state);
+    assertUnixLocalHostPathGrantsUnsupported(state.manifest);
     const archiveLimits =
       options.archiveLimits === undefined
         ? this.options.archiveLimits
@@ -956,6 +1039,9 @@ export class UnixLocalSandboxClient implements SandboxClient<
   async serializeSessionState(
     state: UnixLocalSandboxSessionState,
   ): Promise<Record<string, unknown>> {
+    assertSandboxSessionStateUsable(state);
+    const stateGeneration = captureSandboxStateGeneration(state);
+    assertUnixLocalHostPathGrantsUnsupported(state.manifest);
     const snapshotSpec = state.snapshotSpec ?? this.options.snapshot ?? null;
     const snapshot = await persistLocalSnapshot(
       'UnixLocalSandboxClient',
@@ -964,7 +1050,8 @@ export class UnixLocalSandboxClient implements SandboxClient<
     );
     state.snapshotSpec = snapshotSpec;
 
-    return {
+    const serialized = {
+      ...serializeMountCredentialRedactionMetadata(state),
       manifest: serializeManifest(state.manifest),
       workspaceRootPath: state.workspaceRootPath,
       workspaceRootOwned: state.workspaceRootOwned,
@@ -976,6 +1063,8 @@ export class UnixLocalSandboxClient implements SandboxClient<
       configuredExposedPorts: state.configuredExposedPorts ?? [],
       exposedPorts: state.exposedPorts ?? null,
     };
+    assertSandboxStateGenerationUnchanged(state, stateGeneration);
+    return serialized;
   }
 
   async deserializeSessionState(
@@ -1065,6 +1154,24 @@ function pathWithinLogicalRoot(path: string, root: string): boolean {
   return path === root || path.startsWith(`${root}/`);
 }
 
+function assertUnixLocalHostPathGrantsUnsupported(manifest: Manifest): void {
+  const grant = manifest.extraPathGrants.find(
+    ({ hostPath }) => hostPath !== undefined,
+  );
+  if (!grant) {
+    return;
+  }
+
+  throw new SandboxUnsupportedFeatureError(
+    `UnixLocalSandboxClient does not support path grant hostPath for "${grant.path}". Omit hostPath when the host and sandbox paths are the same, or use DockerSandboxClient when they differ.`,
+    {
+      provider: 'UnixLocalSandboxClient',
+      feature: 'manifest.extraPathGrants.hostPath',
+      path: grant.path,
+    },
+  );
+}
+
 function validateResolvedHostPath(args: {
   path?: string;
   resolvedPath: string;
@@ -1126,6 +1233,15 @@ class UnixLocalSandboxEditor implements Editor {
   constructor(session: UnixLocalSandboxSession, runAs?: string) {
     this.session = session;
     this.runAs = runAs;
+  }
+
+  canAccessPathForEdit(path: string): boolean {
+    try {
+      this.session.resolveSandboxPath(path, { forWrite: true });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async createFile(
@@ -1389,6 +1505,7 @@ async function waitForProcessOrTimeout(
   timeoutMs: number,
 ): Promise<void> {
   if (activeProcess.done) {
+    await activeProcess.outputClosedPromise;
     return;
   }
 

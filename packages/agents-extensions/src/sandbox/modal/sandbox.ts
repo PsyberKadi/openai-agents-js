@@ -1,5 +1,6 @@
 import { UserError, type ToolOutputImage } from '@openai/agents-core';
 import {
+  cloneManifest,
   Manifest,
   SandboxProviderError,
   SandboxUnsupportedFeatureError,
@@ -7,6 +8,8 @@ import {
   type SandboxClient,
   type SandboxClientCreateArgs,
   type SandboxClientOptions,
+  type SandboxClientResumeOptions,
+  type SandboxPreservedSessionReuseOptions,
   type SandboxArchiveLimits,
   type SandboxConcurrencyLimits,
   type ExposedPortEndpoint,
@@ -26,12 +29,16 @@ import {
   validateSandboxArchiveLimits,
 } from '@openai/agents-core/sandbox';
 import {
+  liveMountEnvironmentAuthorityMatches,
   normalizePosixPath,
   relativePosixPathWithinRoot,
+  shellQuote,
+  withExclusiveSandboxManifestMutation,
 } from '@openai/agents-core/sandbox/internal';
 import { posix as pathPosix } from 'node:path';
 import {
   assertCoreSnapshotUnsupported,
+  assertRemoteSandboxSessionStateCanResume,
   imageOutputFromBytes,
   RemoteSandboxEditor,
   assertTarWorkspacePersistence,
@@ -41,7 +48,7 @@ import {
   closeRemoteSessionOnManifestError,
   createRunAsRemoteEditor,
   decodeNativeSnapshotRef,
-  deserializeRemoteSandboxSessionStateValues,
+  rehydrateRemoteSandboxSessionStateValues,
   elapsedSeconds,
   encodeNativeSnapshotRef,
   formatExecResponse,
@@ -49,6 +56,8 @@ import {
   manifestMaterializationOptionsWithRunAs,
   materializeEnvironment,
   persistRemoteWorkspaceTar,
+  probeRemoteSandboxPathExists,
+  probeRemoteSandboxDirectoryExists,
   providerErrorMessage,
   assertConfiguredExposedPort,
   getCachedExposedPortEndpoint,
@@ -59,6 +68,7 @@ import {
   cloneManifestWithoutMountEntries,
   readRunAsRemoteFile,
   runAsRemotePathExists,
+  runAsRemoteDirectoryExists,
   sandboxUserShellCommand,
   serializeRemoteSandboxSessionState,
   truncateOutput,
@@ -91,20 +101,6 @@ const COMPLETED_ACTIVE_PROCESS_RETENTION_MS = 60_000;
 
 type ModalModule = {
   ModalClient: new (params?: Record<string, unknown>) => ModalClientLike;
-  CloudBucketMount?: new (
-    bucketName: string,
-    params?: Record<string, unknown>,
-  ) => ModalCloudBucketMountLike;
-  Secret?: {
-    fromName(
-      name: string,
-      params?: { environment?: string },
-    ): ModalSecretLike | Promise<ModalSecretLike>;
-    fromObject(
-      entries: Record<string, string>,
-      params?: Record<string, unknown>,
-    ): ModalSecretLike | Promise<ModalSecretLike>;
-  };
 };
 
 type ModalCloudBucketMountLike = {
@@ -112,6 +108,14 @@ type ModalCloudBucketMountLike = {
 };
 
 type ModalSecretLike = unknown;
+
+type ModalSandboxFilesystemLike = {
+  readBytes(path: string): Promise<Uint8Array>;
+  writeBytes(
+    data: Uint8Array | ArrayBuffer | Buffer,
+    path: string,
+  ): Promise<void>;
+};
 
 type ModalClientLike = {
   apps: {
@@ -133,6 +137,22 @@ type ModalClientLike = {
     ): Promise<ModalSandboxLike>;
     fromId(id: string): Promise<ModalSandboxLike>;
   };
+  cloudBucketMounts: {
+    create(
+      bucketName: string,
+      params?: Record<string, unknown>,
+    ): ModalCloudBucketMountLike;
+  };
+  secrets: {
+    fromName(
+      name: string,
+      params?: { environment?: string },
+    ): ModalSecretLike | Promise<ModalSecretLike>;
+    fromObject(
+      entries: Record<string, string>,
+      params?: Record<string, unknown>,
+    ): ModalSecretLike | Promise<ModalSecretLike>;
+  };
   imageBuilderVersion?(version?: string): string;
 };
 
@@ -146,14 +166,20 @@ type ModalImageLike = {
   cmd?(command: string[]): ModalImageLike;
 };
 
+type ModalSandboxSelectorLike = {
+  sandboxId: string;
+  objectId?: string;
+  [key: string]: unknown;
+};
+
 type ModalSandboxLike = {
   sandboxId: string;
   objectId?: string;
+  filesystem: ModalSandboxFilesystemLike;
   exec(
     command: string[],
     params?: Record<string, unknown>,
   ): Promise<ModalContainerProcessLike>;
-  open(path: string, mode?: string): Promise<ModalSandboxFileLike>;
   terminate(params?: { wait?: boolean }): Promise<void | number>;
   poll(): Promise<number | null>;
   tunnels?(timeoutMs?: number): Promise<Record<number, ModalTunnelLike>>;
@@ -169,13 +195,6 @@ type ModalSandboxLike = {
 type ModalTunnelLike = {
   host?: string;
   port?: number;
-};
-
-type ModalSandboxFileLike = {
-  read(): Promise<Uint8Array>;
-  write(data: Uint8Array): Promise<void>;
-  flush?(): Promise<void>;
-  close(): Promise<void>;
 };
 
 type ModalContainerProcessLike = {
@@ -207,9 +226,7 @@ type ModalCloudBucketMountsProvider = () => Promise<
 >;
 
 export type ModalWorkspacePersistence =
-  | 'tar'
-  | 'snapshot_filesystem'
-  | 'snapshot_directory';
+  'tar' | 'snapshot_filesystem' | 'snapshot_directory';
 
 export type ModalImageSelectorKind = 'image' | 'id' | 'tag';
 
@@ -242,17 +259,17 @@ export type ModalSandboxSelectorKind = 'sandbox' | 'id';
 
 export class ModalSandboxSelector {
   readonly kind: ModalSandboxSelectorKind;
-  readonly value: ModalSandboxLike | string;
+  readonly value: ModalSandboxSelectorLike | string;
 
   private constructor(
     kind: ModalSandboxSelectorKind,
-    value: ModalSandboxLike | string,
+    value: ModalSandboxSelectorLike | string,
   ) {
     this.kind = kind;
     this.value = value;
   }
 
-  static fromSandbox(sandbox: ModalSandboxLike): ModalSandboxSelector {
+  static fromSandbox(sandbox: ModalSandboxSelectorLike): ModalSandboxSelector {
     return new ModalSandboxSelector('sandbox', sandbox);
   }
 
@@ -273,6 +290,10 @@ export interface ModalSandboxClientOptions extends SandboxClientOptions {
   env?: Record<string, string>;
   timeoutMs?: number;
   idleTimeoutMs?: number;
+  cpu?: number;
+  cpuLimit?: number;
+  memoryMiB?: number;
+  memoryLimitMiB?: number;
   gpu?: string;
   exposedPorts?: number[];
   environment?: string;
@@ -298,6 +319,10 @@ export interface ModalSandboxSessionState extends SandboxSessionState {
   environment: Record<string, string>;
   timeoutMs?: number;
   idleTimeoutMs?: number;
+  cpu?: number;
+  cpuLimit?: number;
+  memoryMiB?: number;
+  memoryLimitMiB?: number;
   gpu?: string;
   configuredExposedPorts?: number[];
   modalEnvironment?: string;
@@ -515,18 +540,85 @@ export class ModalSandboxSession implements SandboxSession<ModalSandboxSessionSt
   async pathExists(path: string, runAs?: string): Promise<boolean> {
     const absolutePath = await this.resolveRemotePath(path);
     if (!runAs) {
-      const process = await this.sandbox.exec(['test', '-e', absolutePath], {
-        mode: 'text',
-        workdir: this.state.manifest.root,
-        stdout: 'ignore',
-        stderr: 'pipe',
+      return await probeRemoteSandboxPathExists({
+        providerName: 'ModalSandboxClient',
+        providerId: 'modal',
+        path: absolutePath,
+        runCommand: async (command) => {
+          const argv =
+            command === `test -e ${shellQuote(absolutePath)}`
+              ? ['test', '-e', absolutePath]
+              : ['/bin/sh', '-c', command];
+          const process = await this.sandbox.exec(argv, {
+            mode: 'text',
+            workdir: this.state.manifest.root,
+            stdout: 'ignore',
+            stderr: 'pipe',
+          });
+          let stderr = '';
+          const stderrPump = startTextStreamPump(process.stderr, (chunk) => {
+            stderr += chunk;
+          });
+          try {
+            const status = await process.wait();
+            await stderrPump.promise;
+            return { status, stderr };
+          } catch (error) {
+            await stderrPump.cancel();
+            throw error;
+          }
+        },
       });
-      return (await process.wait()) === 0;
     }
     return await runAsRemotePathExists(
       absolutePath,
       runAs,
       this.runAsCommandRunner.bind(this),
+      {
+        providerName: 'ModalSandboxClient',
+        providerId: 'modal',
+      },
+    );
+  }
+
+  async directoryExists(path: string, runAs?: string): Promise<boolean> {
+    const absolutePath = await this.resolveRemotePath(path);
+    if (!runAs) {
+      return await probeRemoteSandboxDirectoryExists({
+        providerName: 'ModalSandboxClient',
+        providerId: 'modal',
+        path: absolutePath,
+        runCommand: async (command) => {
+          const argv = ['/bin/sh', '-c', command];
+          const process = await this.sandbox.exec(argv, {
+            mode: 'text',
+            workdir: this.state.manifest.root,
+            stdout: 'ignore',
+            stderr: 'pipe',
+          });
+          let stderr = '';
+          const stderrPump = startTextStreamPump(process.stderr, (chunk) => {
+            stderr += chunk;
+          });
+          try {
+            const status = await process.wait();
+            await stderrPump.promise;
+            return { status, stderr };
+          } catch (error) {
+            await stderrPump.cancel();
+            throw error;
+          }
+        },
+      });
+    }
+    return await runAsRemoteDirectoryExists(
+      absolutePath,
+      runAs,
+      this.runAsCommandRunner.bind(this),
+      {
+        providerName: 'ModalSandboxClient',
+        providerId: 'modal',
+      },
     );
   }
 
@@ -596,45 +688,54 @@ export class ModalSandboxSession implements SandboxSession<ModalSandboxSessionSt
   }
 
   async materializeEntry(args: MaterializeEntryArgs): Promise<void> {
-    assertSandboxEntryMetadataSupported(
-      'ModalSandboxClient',
-      args.path,
-      args.entry,
-      MOUNT_MANIFEST_METADATA_SUPPORT,
-    );
-    assertModalLiveEntryMountsUnsupported(
-      args.entry,
-      args.path,
-      this.state.manifest,
-    );
-    await applyLocalSourceManifestEntryToState(
-      this.state,
-      args.path,
-      args.entry,
-      'modal',
-      this.writer(),
-      this.remotePathResolver,
-      this.manifestMaterializationOptions(args.runAs),
-    );
-    this.invalidateCloudBucketMounts();
+    const entry = structuredClone(args.entry);
+    await withExclusiveSandboxManifestMutation(this.state, async () => {
+      assertSandboxEntryMetadataSupported(
+        'ModalSandboxClient',
+        args.path,
+        entry,
+        MOUNT_MANIFEST_METADATA_SUPPORT,
+      );
+      assertModalLiveEntryMountsUnsupported(
+        entry,
+        args.path,
+        this.state.manifest,
+      );
+      await applyLocalSourceManifestEntryToState(
+        this.state,
+        args.path,
+        entry,
+        'modal',
+        this.writer(),
+        this.remotePathResolver,
+        this.manifestMaterializationOptions(args.runAs),
+      );
+      this.invalidateCloudBucketMounts();
+    });
   }
 
   async applyManifest(manifest: Manifest, runAs?: string): Promise<void> {
-    assertSandboxManifestMetadataSupported(
-      'ModalSandboxClient',
-      manifest,
-      MOUNT_MANIFEST_METADATA_SUPPORT,
-    );
-    assertModalLiveManifestMountsUnsupported(manifest, this.state.manifest);
-    await applyLocalSourceManifestToState(
-      this.state,
-      manifest,
-      'modal',
-      this.writer(),
-      this.remotePathResolver,
-      this.manifestMaterializationOptions(runAs),
-    );
-    this.invalidateCloudBucketMounts();
+    const manifestSnapshot = cloneManifest(manifest);
+    await withExclusiveSandboxManifestMutation(this.state, async () => {
+      assertSandboxManifestMetadataSupported(
+        'ModalSandboxClient',
+        manifestSnapshot,
+        MOUNT_MANIFEST_METADATA_SUPPORT,
+      );
+      assertModalLiveManifestMountsUnsupported(
+        manifestSnapshot,
+        this.state.manifest,
+      );
+      await applyLocalSourceManifestToState(
+        this.state,
+        manifestSnapshot,
+        'modal',
+        this.writer(),
+        this.remotePathResolver,
+        this.manifestMaterializationOptions(runAs),
+      );
+      this.invalidateCloudBucketMounts();
+    });
   }
 
   async persistWorkspace(): Promise<Uint8Array> {
@@ -655,6 +756,7 @@ export class ModalSandboxSession implements SandboxSession<ModalSandboxSessionSt
       );
     }
 
+    assertModalTarWorkspacePersistenceMountsSupported(this.state.manifest);
     return await persistRemoteWorkspaceTar({
       providerName: 'ModalSandboxClient',
       manifest: this.state.manifest,
@@ -690,6 +792,7 @@ export class ModalSandboxSession implements SandboxSession<ModalSandboxSessionSt
         this.state.workspacePersistence,
       );
     }
+    assertModalTarWorkspacePersistenceMountsSupported(this.state.manifest);
     await hydrateRemoteWorkspaceTar({
       providerName: 'ModalSandboxClient',
       manifest: this.state.manifest,
@@ -812,10 +915,7 @@ export class ModalSandboxSession implements SandboxSession<ModalSandboxSessionSt
       async () =>
         await withOptionalTimeoutMs(
           (async () => {
-            const image = maybeSetModalSandboxCmd(
-              await this.modalImageFromId(snapshotId),
-              this.state.useSleepCmd,
-            );
+            const image = await this.modalImageFromId(snapshotId);
             return await this.modal.sandboxes.create(
               this.app,
               image,
@@ -926,15 +1026,27 @@ export class ModalSandboxSession implements SandboxSession<ModalSandboxSessionSt
   }
 
   private async sandboxCreateParams(): Promise<Record<string, unknown>> {
+    validateModalResourceOptions(this.state);
     const cloudBucketMounts = await this.resolveCloudBucketMounts();
     return {
       workdir: this.state.manifest.root,
       env: this.state.environment,
+      ...(this.state.useSleepCmd ? { command: ['sleep', 'infinity'] } : {}),
       ...(typeof this.state.timeoutMs === 'number'
         ? { timeoutMs: this.state.timeoutMs }
         : {}),
       ...(typeof this.state.idleTimeoutMs === 'number'
         ? { idleTimeoutMs: this.state.idleTimeoutMs }
+        : {}),
+      ...(typeof this.state.cpu === 'number' ? { cpu: this.state.cpu } : {}),
+      ...(typeof this.state.cpuLimit === 'number'
+        ? { cpuLimit: this.state.cpuLimit }
+        : {}),
+      ...(typeof this.state.memoryMiB === 'number'
+        ? { memoryMiB: this.state.memoryMiB }
+        : {}),
+      ...(typeof this.state.memoryLimitMiB === 'number'
+        ? { memoryLimitMiB: this.state.memoryLimitMiB }
         : {}),
       ...(this.state.gpu ? { gpu: this.state.gpu } : {}),
       ...(this.state.configuredExposedPorts
@@ -1125,29 +1237,14 @@ export class ModalSandboxSession implements SandboxSession<ModalSandboxSessionSt
     path: string,
     content: string | Uint8Array,
   ): Promise<void> {
-    await this.ensureDirectory(pathPosix.dirname(path));
-    const handle = await this.sandbox.open(path, 'w');
-    try {
-      await handle.write(
-        typeof content === 'string'
-          ? new TextEncoder().encode(content)
-          : content,
-      );
-      if (handle.flush) {
-        await handle.flush();
-      }
-    } finally {
-      await handle.close();
-    }
+    await this.sandbox.filesystem.writeBytes(
+      typeof content === 'string' ? new TextEncoder().encode(content) : content,
+      path,
+    );
   }
 
   async readSandboxFile(path: string): Promise<Uint8Array> {
-    const handle = await this.sandbox.open(path, 'r');
-    try {
-      return Uint8Array.from(await handle.read());
-    } finally {
-      await handle.close();
-    }
+    return Uint8Array.from(await this.sandbox.filesystem.readBytes(path));
   }
 
   async removeSandboxPath(path: string): Promise<void> {
@@ -1245,6 +1342,7 @@ export class ModalSandboxClient implements SandboxClient<
   ModalSandboxSessionState
 > {
   readonly backendId = 'modal';
+  readonly preservedOwnedSessionReuseRejectionRequiresFreshCreation = true;
   private readonly options: Partial<ModalSandboxClientOptions>;
 
   constructor(options: Partial<ModalSandboxClientOptions> = {}) {
@@ -1308,8 +1406,7 @@ export class ModalSandboxClient implements SandboxClient<
         );
         const imageState = modalImageStateFromOptions(resolvedOptions);
         let cloudBucketMounts:
-          | Record<string, ModalCloudBucketMountLike>
-          | undefined;
+          Record<string, ModalCloudBucketMountLike> | undefined;
         let sandbox: ModalSandboxLike;
         if (resolvedOptions.sandbox) {
           sandbox = await withProviderError(
@@ -1329,20 +1426,32 @@ export class ModalSandboxClient implements SandboxClient<
           );
           imageState.imageId = imageId;
           imageState.imageTag = imageTag;
-          const sandboxImage = maybeSetModalSandboxCmd(image, useSleepCmd);
           cloudBucketMounts = await modalCloudBucketMountsForManifest({
-            modalModule,
+            modal,
             manifest,
             defaultSecretName: resolvedOptions.nativeCloudBucketSecretName,
           });
           const createParams = {
             workdir: manifest.root,
             env: environment,
+            ...(useSleepCmd ? { command: ['sleep', 'infinity'] } : {}),
             ...(typeof resolvedOptions.timeoutMs === 'number'
               ? { timeoutMs: resolvedOptions.timeoutMs }
               : {}),
             ...(typeof resolvedOptions.idleTimeoutMs === 'number'
               ? { idleTimeoutMs: resolvedOptions.idleTimeoutMs }
+              : {}),
+            ...(typeof resolvedOptions.cpu === 'number'
+              ? { cpu: resolvedOptions.cpu }
+              : {}),
+            ...(typeof resolvedOptions.cpuLimit === 'number'
+              ? { cpuLimit: resolvedOptions.cpuLimit }
+              : {}),
+            ...(typeof resolvedOptions.memoryMiB === 'number'
+              ? { memoryMiB: resolvedOptions.memoryMiB }
+              : {}),
+            ...(typeof resolvedOptions.memoryLimitMiB === 'number'
+              ? { memoryLimitMiB: resolvedOptions.memoryLimitMiB }
               : {}),
             ...(resolvedOptions.gpu ? { gpu: resolvedOptions.gpu } : {}),
             ...(resolvedOptions.exposedPorts
@@ -1356,7 +1465,7 @@ export class ModalSandboxClient implements SandboxClient<
               'modal',
               'create sandbox',
               async () =>
-                await modal.sandboxes.create(app, sandboxImage, createParams),
+                await modal.sandboxes.create(app, image, createParams),
               { appName: resolvedOptions.appName },
             ),
             resolvedOptions.sandboxCreateTimeoutS,
@@ -1381,6 +1490,10 @@ export class ModalSandboxClient implements SandboxClient<
           environment,
           timeoutMs: resolvedOptions.timeoutMs,
           idleTimeoutMs: resolvedOptions.idleTimeoutMs,
+          cpu: resolvedOptions.cpu,
+          cpuLimit: resolvedOptions.cpuLimit,
+          memoryMiB: resolvedOptions.memoryMiB,
+          memoryLimitMiB: resolvedOptions.memoryLimitMiB,
           gpu: resolvedOptions.gpu,
           configuredExposedPorts: resolvedOptions.exposedPorts,
           modalEnvironment: resolvedOptions.environment,
@@ -1401,7 +1514,7 @@ export class ModalSandboxClient implements SandboxClient<
           archiveLimits: createArgs.archiveLimits,
           cloudBucketMountsProvider: async () =>
             await modalCloudBucketMountsForManifest({
-              modalModule,
+              modal,
               manifest: sessionState.manifest,
               defaultSecretName: resolvedOptions.nativeCloudBucketSecretName,
             }),
@@ -1432,14 +1545,74 @@ export class ModalSandboxClient implements SandboxClient<
     return false;
   }
 
+  serializedSessionStateRequiresFreshCreationForOptions(
+    state: ModalSandboxSessionState,
+    options: SandboxClientResumeOptions<ModalSandboxClientOptions> = {},
+  ): boolean {
+    const trustedResourceOptions = modalResourceOptionsFrom(
+      resolveOptions(this.options, options.clientOptions),
+    );
+    validateModalResourceOptions(trustedResourceOptions);
+    return state.ownsSandbox !== false;
+  }
+
+  async canReusePreservedOwnedSession(
+    state: ModalSandboxSessionState,
+    options: SandboxPreservedSessionReuseOptions<ModalSandboxClientOptions> = {},
+  ): Promise<boolean> {
+    if (!options.trustedManifest) {
+      return false;
+    }
+    const resolvedOptions = resolveOptions(this.options, options.clientOptions);
+    const trustedResourceOptions = modalResourceOptionsFrom(resolvedOptions);
+    validateModalResourceOptions(trustedResourceOptions);
+    const trustedEnvironment = await materializeEnvironment(
+      options.trustedManifest,
+      resolvedOptions.env,
+    );
+    if (
+      !liveMountEnvironmentAuthorityMatches(
+        state.manifest,
+        options.trustedManifest,
+        trustedEnvironment,
+      )
+    ) {
+      return false;
+    }
+    if (state.ownsSandbox === false) {
+      return true;
+    }
+    return (
+      state.cpu === trustedResourceOptions.cpu &&
+      state.cpuLimit === trustedResourceOptions.cpuLimit &&
+      state.memoryMiB === trustedResourceOptions.memoryMiB &&
+      state.memoryLimitMiB === trustedResourceOptions.memoryLimitMiB
+    );
+  }
+
+  rebindPreservedOwnedSessionState(
+    state: ModalSandboxSessionState,
+    options: SandboxPreservedSessionReuseOptions<ModalSandboxClientOptions> = {},
+  ): void {
+    if (state.ownsSandbox !== false) {
+      return;
+    }
+    const trustedResourceOptions = modalResourceOptionsFrom(
+      resolveOptions(this.options, options.clientOptions),
+    );
+    validateModalResourceOptions(trustedResourceOptions);
+    Object.assign(state, trustedResourceOptions);
+  }
+
   async deserializeSessionState(
     state: Record<string, unknown>,
   ): Promise<ModalSandboxSessionState> {
-    const baseState = deserializeRemoteSandboxSessionStateValues(
+    const trustedResourceOptions = modalResourceOptionsFrom(this.options);
+    const baseState = await rehydrateRemoteSandboxSessionStateValues(
       state,
       this.options.env,
     );
-    return {
+    const restoredState: ModalSandboxSessionState = {
       ...state,
       ...baseState,
       ownsSandbox: state.ownsSandbox === false ? false : true,
@@ -1459,6 +1632,7 @@ export class ModalSandboxClient implements SandboxClient<
       ),
       timeoutMs: readOptionalNumber(state, 'timeoutMs'),
       idleTimeoutMs: readOptionalNumber(state, 'idleTimeoutMs'),
+      ...trustedResourceOptions,
       gpu: readOptionalString(state, 'gpu'),
       configuredExposedPorts: readOptionalNumberArray(
         state.configuredExposedPorts,
@@ -1473,9 +1647,27 @@ export class ModalSandboxClient implements SandboxClient<
       useSleepCmd:
         typeof state.useSleepCmd === 'boolean' ? state.useSleepCmd : true,
     };
+    return restoredState;
   }
 
-  async resume(state: ModalSandboxSessionState): Promise<ModalSandboxSession> {
+  async resume(
+    state: ModalSandboxSessionState,
+    options: SandboxClientResumeOptions<ModalSandboxClientOptions> = {},
+  ): Promise<ModalSandboxSession> {
+    assertRemoteSandboxSessionStateCanResume(state);
+    const trustedResourceOptions = modalResourceOptionsFrom(
+      resolveOptions(this.options, options.clientOptions),
+    );
+    validateModalResourceOptions(trustedResourceOptions);
+    if (state.ownsSandbox !== false) {
+      throw new UserError(
+        'Modal sandbox resume cannot verify the existing CPU or memory allocation. Create a fresh sandbox from current trusted configuration.',
+      );
+    }
+    const trustedState = {
+      ...state,
+      ...trustedResourceOptions,
+    };
     if (!state.sandboxId) {
       throw new UserError(
         'Modal sandbox resume requires a persisted sandboxId.',
@@ -1484,28 +1676,10 @@ export class ModalSandboxClient implements SandboxClient<
     const sandboxId = state.sandboxId;
 
     const modalModule = await loadModalModule();
-    const modal = createModalClientFromModule(modalModule, {
-      ...this.options,
-      appName: state.appName,
-      image: state.imageId
-        ? ModalImageSelector.fromId(state.imageId)
-        : undefined,
-      imageTag: state.imageTag,
-      sandboxCreateTimeoutS: state.sandboxCreateTimeoutS,
-      workspacePersistence: state.workspacePersistence,
-      snapshotFilesystemTimeoutMs: state.snapshotFilesystemTimeoutMs,
-      snapshotFilesystemRestoreTimeoutMs:
-        state.snapshotFilesystemRestoreTimeoutMs,
-      timeoutMs: state.timeoutMs,
-      idleTimeoutMs: state.idleTimeoutMs,
-      gpu: state.gpu,
-      exposedPorts: state.configuredExposedPorts,
-      environment: state.modalEnvironment ?? this.options.environment,
-      endpoint: state.endpoint ?? this.options.endpoint,
-      imageBuilderVersion:
-        state.imageBuilderVersion ?? this.options.imageBuilderVersion,
-      useSleepCmd: state.useSleepCmd,
-    });
+    const modal = createModalClientFromModule(
+      modalModule,
+      modalClientOptionsForPersistedState(this.options, state),
+    );
     const sandbox = await withProviderError(
       'ModalSandboxClient',
       'modal',
@@ -1539,14 +1713,14 @@ export class ModalSandboxClient implements SandboxClient<
     }
 
     return new ModalSandboxSession({
-      state,
+      state: trustedState,
       modal,
       app,
       sandbox,
       ownsSandbox,
       cloudBucketMountsProvider: async () =>
         await modalCloudBucketMountsForManifest({
-          modalModule,
+          modal,
           manifest: state.manifest,
           defaultSecretName:
             state.nativeCloudBucketSecretName ??
@@ -1596,88 +1770,9 @@ function shouldResolveModalApp(args: {
 }
 
 function adaptModalModule(modal: typeof import('modal')): ModalModule {
-  const secretApi: unknown = modal.Secret;
-  const usesClassSecretApi = typeof secretApi === 'function';
-  const cloudBucketMountClass =
-    typeof modal.CloudBucketMount === 'function'
-      ? (modal.CloudBucketMount as NonNullable<ModalModule['CloudBucketMount']>)
-      : undefined;
   return {
     ModalClient: modal.ModalClient,
-    CloudBucketMount:
-      usesClassSecretApi && cloudBucketMountClass
-        ? adaptClassModalCloudBucketMount(cloudBucketMountClass)
-        : (modal.CloudBucketMount as ModalModule['CloudBucketMount']),
-    Secret: {
-      fromName: async (name, params) => {
-        if (usesClassSecretApi) {
-          return await modal.Secret.fromName(name, {
-            ...(params?.environment ? { environment: params.environment } : {}),
-          });
-        }
-        if (isModalSecretModule(secretApi)) {
-          return await secretApi.fromName(name, params);
-        }
-        throw new Error('Missing Secret export from modal.');
-      },
-      fromObject: async (entries, params) => {
-        if (usesClassSecretApi) {
-          const environment = readOptionalString(params, 'environment');
-          return await modal.Secret.fromObject(entries, {
-            ...(environment ? { environment } : {}),
-          });
-        }
-        if (isModalSecretModule(secretApi)) {
-          return await secretApi.fromObject(entries, params);
-        }
-        throw new Error('Missing Secret export from modal.');
-      },
-    },
   };
-}
-
-function adaptClassModalCloudBucketMount(
-  CloudBucketMount: NonNullable<ModalModule['CloudBucketMount']>,
-): NonNullable<ModalModule['CloudBucketMount']> {
-  return class implements ModalCloudBucketMountLike {
-    private readonly mount: ModalCloudBucketMountLike;
-
-    constructor(bucketName: string, params?: Record<string, unknown>) {
-      const bucketEndpointUrl = readOptionalString(params, 'bucketEndpointUrl');
-      const keyPrefix = readOptionalString(params, 'keyPrefix');
-      this.mount = new CloudBucketMount(bucketName, {
-        ...(bucketEndpointUrl ? { bucketEndpointUrl } : {}),
-        ...(keyPrefix ? { keyPrefix } : {}),
-        ...(typeof params?.readOnly === 'boolean'
-          ? { readOnly: params.readOnly }
-          : {}),
-        ...(params?.secret ? { secret: params.secret } : {}),
-      });
-    }
-
-    toProto(mountPath: string): unknown {
-      if (!this.mount.toProto) {
-        throw new SandboxProviderError(
-          'Modal CloudBucketMount is missing toProto support.',
-          {
-            provider: 'modal',
-          },
-        );
-      }
-      return this.mount.toProto(mountPath);
-    }
-  };
-}
-
-function isModalSecretModule(
-  value: unknown,
-): value is NonNullable<ModalModule['Secret']> {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'fromName' in value &&
-    'fromObject' in value
-  );
 }
 
 function createModalClientFromModule(
@@ -1697,6 +1792,32 @@ function createModalClientFromModule(
       originalImageBuilderVersion(version ?? options.imageBuilderVersion);
   }
   return client;
+}
+
+function modalClientOptionsForPersistedState(
+  options: Partial<ModalSandboxClientOptions>,
+  state: ModalSandboxSessionState,
+): Partial<ModalSandboxClientOptions> {
+  return {
+    ...options,
+    appName: state.appName,
+    image: state.imageId ? ModalImageSelector.fromId(state.imageId) : undefined,
+    imageTag: state.imageTag,
+    sandboxCreateTimeoutS: state.sandboxCreateTimeoutS,
+    workspacePersistence: state.workspacePersistence,
+    snapshotFilesystemTimeoutMs: state.snapshotFilesystemTimeoutMs,
+    snapshotFilesystemRestoreTimeoutMs:
+      state.snapshotFilesystemRestoreTimeoutMs,
+    timeoutMs: state.timeoutMs,
+    idleTimeoutMs: state.idleTimeoutMs,
+    gpu: state.gpu,
+    exposedPorts: state.configuredExposedPorts,
+    environment: state.modalEnvironment ?? options.environment,
+    endpoint: state.endpoint ?? options.endpoint,
+    imageBuilderVersion:
+      state.imageBuilderVersion ?? options.imageBuilderVersion,
+    useSleepCmd: state.useSleepCmd,
+  };
 }
 
 async function resolveModalImage(
@@ -1801,18 +1922,8 @@ function modalImageId(image: ModalImageLike): string | undefined {
   return image.imageId ?? image.objectId;
 }
 
-function maybeSetModalSandboxCmd(
-  image: ModalImageLike,
-  useSleepCmd: boolean,
-): ModalImageLike {
-  if (!useSleepCmd || typeof image.cmd !== 'function') {
-    return image;
-  }
-  return image.cmd(['sleep', 'infinity']);
-}
-
 async function modalCloudBucketMountsForManifest(args: {
-  modalModule: ModalModule;
+  modal: ModalClientLike;
   manifest: Manifest;
   defaultSecretName?: string;
 }): Promise<Record<string, ModalCloudBucketMountLike> | undefined> {
@@ -1821,14 +1932,6 @@ async function modalCloudBucketMountsForManifest(args: {
     .filter(({ entry }) => isModalCloudBucketMountEntry(entry));
   if (mountEntries.length === 0) {
     return undefined;
-  }
-  if (!args.modalModule.CloudBucketMount) {
-    throw new SandboxProviderError(
-      'Modal cloud bucket mounts require modal.CloudBucketMount support.',
-      {
-        provider: 'modal',
-      },
-    );
   }
 
   const cloudBucketMounts: Record<string, ModalCloudBucketMountLike> = {};
@@ -1842,39 +1945,30 @@ async function modalCloudBucketMountsForManifest(args: {
         'secretEnvironmentName',
       ),
     });
-    cloudBucketMounts[mountPath] = new args.modalModule.CloudBucketMount(
+    const mountParams = {
+      ...(config.bucketEndpointUrl
+        ? { bucketEndpointUrl: config.bucketEndpointUrl }
+        : {}),
+      ...(config.keyPrefix ? { keyPrefix: config.keyPrefix } : {}),
+      ...(typeof config.readOnly === 'boolean'
+        ? { readOnly: config.readOnly }
+        : {}),
+      ...(await modalCloudBucketMountSecret(args.modal, config)),
+    };
+    cloudBucketMounts[mountPath] = args.modal.cloudBucketMounts.create(
       config.bucketName,
-      {
-        ...(config.bucketEndpointUrl
-          ? { bucketEndpointUrl: config.bucketEndpointUrl }
-          : {}),
-        ...(config.keyPrefix ? { keyPrefix: config.keyPrefix } : {}),
-        ...(typeof config.readOnly === 'boolean'
-          ? { readOnly: config.readOnly }
-          : {}),
-        ...(await modalCloudBucketMountSecret(args.modalModule, config)),
-      },
+      mountParams,
     );
   }
   return cloudBucketMounts;
 }
 
 async function modalCloudBucketMountSecret(
-  modalModule: ModalModule,
+  modal: ModalClientLike,
   config: ModalCloudBucketMountConfig,
 ): Promise<{ secret?: ModalSecretLike }> {
   if (!config.secretName && !config.credentials) {
     return {};
-  }
-  const Secret = modalModule.Secret;
-  if (!Secret) {
-    throw new SandboxProviderError(
-      'Modal cloud bucket mounts require modal.Secret support when credentials are configured.',
-      {
-        provider: 'modal',
-        bucketName: config.bucketName,
-      },
-    );
   }
   const secretName = config.secretName;
   if (secretName) {
@@ -1884,7 +1978,7 @@ async function modalCloudBucketMountSecret(
         'modal',
         'resolve cloud bucket secret',
         async () =>
-          await Secret.fromName(secretName, {
+          await modal.secrets.fromName(secretName, {
             ...(config.secretEnvironmentName
               ? { environment: config.secretEnvironmentName }
               : {}),
@@ -1901,8 +1995,9 @@ async function modalCloudBucketMountSecret(
       'ModalSandboxClient',
       'modal',
       'create cloud bucket secret',
-      async () => await Secret.fromObject(config.credentials ?? {}),
+      async () => await modal.secrets.fromObject(config.credentials ?? {}),
       { bucketName: config.bucketName },
+      { redactProviderError: true },
     ),
   };
 }
@@ -1942,6 +2037,39 @@ function assertModalMountEntrySupported(
       'secretEnvironmentName',
     ),
   });
+}
+
+function assertModalTarWorkspacePersistenceMountsSupported(
+  manifest: Manifest,
+): void {
+  const mountPaths = collectModalMountPathsWithinManifestRoot(manifest);
+  if (mountPaths.length === 0) {
+    return;
+  }
+
+  throw new SandboxUnsupportedFeatureError(
+    'ModalSandboxClient cannot use tar workspace persistence with mount entries under the workspace root.',
+    {
+      provider: 'modal',
+      feature: 'workspacePersistence.tar',
+      root: manifest.root,
+      mountPaths,
+    },
+  );
+}
+
+function collectModalMountPathsWithinManifestRoot(
+  manifest: Manifest,
+): string[] {
+  const root = normalizePosixPath(manifest.root);
+  return uniqueStrings(
+    manifest
+      .mountTargets()
+      .map(({ mountPath }) => normalizePosixPath(mountPath))
+      .filter(
+        (mountPath) => relativePosixPathWithinRoot(root, mountPath) !== null,
+      ),
+  ).sort((left, right) => left.localeCompare(right));
 }
 
 function assertModalLiveManifestMountsUnsupported(
@@ -2151,6 +2279,10 @@ function resolveOptions(
     },
     timeoutMs: overrides?.timeoutMs ?? defaults.timeoutMs,
     idleTimeoutMs: overrides?.idleTimeoutMs ?? defaults.idleTimeoutMs,
+    cpu: overrides?.cpu ?? defaults.cpu,
+    cpuLimit: overrides?.cpuLimit ?? defaults.cpuLimit,
+    memoryMiB: overrides?.memoryMiB ?? defaults.memoryMiB,
+    memoryLimitMiB: overrides?.memoryLimitMiB ?? defaults.memoryLimitMiB,
     gpu: overrides?.gpu ?? defaults.gpu,
     exposedPorts: overrides?.exposedPorts ?? defaults.exposedPorts,
     environment: overrides?.environment ?? defaults.environment,
@@ -2224,6 +2356,72 @@ function validateOptions(options: ModalSandboxClientOptions): void {
       );
     }
   }
+  validateModalResourceOptions(options);
+}
+
+function validateModalResourceOptions(
+  options: Pick<
+    ModalSandboxClientOptions,
+    'cpu' | 'cpuLimit' | 'memoryMiB' | 'memoryLimitMiB'
+  >,
+): void {
+  for (const [name, value] of [
+    ['cpu', options.cpu],
+    ['cpuLimit', options.cpuLimit],
+    ['memoryMiB', options.memoryMiB],
+    ['memoryLimitMiB', options.memoryLimitMiB],
+  ] as const) {
+    if (
+      value !== undefined &&
+      (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)
+    ) {
+      throw new UserError(
+        `ModalSandboxClient ${name} must be a positive number.`,
+      );
+    }
+  }
+  if (options.cpu === undefined && options.cpuLimit !== undefined) {
+    throw new UserError(
+      'ModalSandboxClient cpu must be specified when cpuLimit is specified.',
+    );
+  }
+  if (
+    options.cpu !== undefined &&
+    options.cpuLimit !== undefined &&
+    options.cpuLimit < options.cpu
+  ) {
+    throw new UserError(
+      'ModalSandboxClient cpuLimit must be greater than or equal to cpu.',
+    );
+  }
+  if (options.memoryMiB === undefined && options.memoryLimitMiB !== undefined) {
+    throw new UserError(
+      'ModalSandboxClient memoryMiB must be specified when memoryLimitMiB is specified.',
+    );
+  }
+  if (
+    options.memoryMiB !== undefined &&
+    options.memoryLimitMiB !== undefined &&
+    options.memoryLimitMiB < options.memoryMiB
+  ) {
+    throw new UserError(
+      'ModalSandboxClient memoryLimitMiB must be greater than or equal to memoryMiB.',
+    );
+  }
+}
+
+function modalResourceOptionsFrom(
+  options: Partial<ModalSandboxClientOptions>,
+): Pick<
+  ModalSandboxClientOptions,
+  'cpu' | 'cpuLimit' | 'memoryMiB' | 'memoryLimitMiB'
+> {
+  return {
+    cpu: options.cpu,
+    cpuLimit: options.cpuLimit,
+    memoryMiB: options.memoryMiB,
+    memoryLimitMiB: options.memoryLimitMiB,
+  };
 }
 
 function validateModalImageSelector(selector: ModalImageSelector): void {

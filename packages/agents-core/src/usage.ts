@@ -1,6 +1,6 @@
 import { RequestUsageData, UsageData } from './types/protocol';
 
-type RequestUsageInput = Partial<
+export type RequestUsageInput = Partial<
   RequestUsageData & {
     input_tokens: number;
     output_tokens: number;
@@ -11,19 +11,15 @@ type RequestUsageInput = Partial<
   }
 >;
 
-type UsageInput = Partial<
+export type UsageInput = Partial<
   UsageData & {
     input_tokens: number;
     output_tokens: number;
     total_tokens: number;
     input_tokens_details:
-      | Record<string, number>
-      | Array<Record<string, number>>
-      | object;
+      Record<string, number> | Array<Record<string, number>> | object;
     output_tokens_details:
-      | Record<string, number>
-      | Array<Record<string, number>>
-      | object;
+      Record<string, number> | Array<Record<string, number>> | object;
     request_usage_entries: RequestUsageInput[];
   }
 > & { requests?: number; requestUsageEntries?: RequestUsageInput[] };
@@ -83,6 +79,26 @@ export class RequestUsage {
       this.endpoint = input.endpoint;
     }
   }
+
+  /**
+   * Reconstructs a RequestUsage instance from a JSON-compatible wire value.
+   */
+  static fromJSON(input?: RequestUsageInput): RequestUsage {
+    return new RequestUsage(input);
+  }
+}
+
+function cloneTokenDetails(
+  details: Record<string, number>,
+): Record<string, number> {
+  return { ...details };
+}
+
+function cloneRequestUsage(input: RequestUsageInput): RequestUsage {
+  const cloned = new RequestUsage(input);
+  cloned.inputTokensDetails = cloneTokenDetails(cloned.inputTokensDetails);
+  cloned.outputTokensDetails = cloneTokenDetails(cloned.outputTokensDetails);
+  return cloned;
 }
 
 /**
@@ -179,6 +195,13 @@ export class Usage {
     }
   }
 
+  /**
+   * Reconstructs a Usage instance from a JSON-compatible wire value.
+   */
+  static fromJSON(input?: UsageInput): Usage {
+    return new Usage(input);
+  }
+
   add(newUsage: Usage) {
     this.requests += newUsage.requests ?? 0;
     this.inputTokens += newUsage.inputTokens ?? 0;
@@ -186,11 +209,15 @@ export class Usage {
     this.totalTokens += newUsage.totalTokens ?? 0;
     if (newUsage.inputTokensDetails) {
       // The type does not allow undefined, but it could happen runtime
-      this.inputTokensDetails.push(...newUsage.inputTokensDetails);
+      this.inputTokensDetails.push(
+        ...newUsage.inputTokensDetails.map(cloneTokenDetails),
+      );
     }
     if (newUsage.outputTokensDetails) {
       // The type does not allow undefined, but it could happen runtime
-      this.outputTokensDetails.push(...newUsage.outputTokensDetails);
+      this.outputTokensDetails.push(
+        ...newUsage.outputTokensDetails.map(cloneTokenDetails),
+      );
     }
 
     if (
@@ -199,14 +226,12 @@ export class Usage {
     ) {
       this.requestUsageEntries ??= [];
       this.requestUsageEntries.push(
-        ...newUsage.requestUsageEntries.map((entry) =>
-          entry instanceof RequestUsage ? entry : new RequestUsage(entry),
-        ),
+        ...newUsage.requestUsageEntries.map(cloneRequestUsage),
       );
     } else if (newUsage.requests === 1 && newUsage.totalTokens > 0) {
       this.requestUsageEntries ??= [];
       this.requestUsageEntries.push(
-        new RequestUsage({
+        cloneRequestUsage({
           inputTokens: newUsage.inputTokens,
           outputTokens: newUsage.outputTokens,
           totalTokens: newUsage.totalTokens,

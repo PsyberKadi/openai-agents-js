@@ -1,9 +1,19 @@
 import { Agent, AgentOutputType } from '../agent';
-import { MaxTurnsExceededError, ModelRefusalError } from '../errors';
+import {
+  MaxTurnsExceededError,
+  ModelBehaviorError,
+  ModelRefusalError,
+  ModelTimeoutError,
+  ToolCallError,
+  ToolInputGuardrailTripwireTriggered,
+  ToolOutputGuardrailTripwireTriggered,
+  UserError,
+} from '../errors';
 import { assistant } from '../helpers/message';
 import { RunItem, RunMessageOutputItem } from '../items';
+import logger from '../logger';
 import { ModelResponse } from '../model';
-import { RunResult, StreamedRunResult } from '../result';
+import { StreamedRunResult } from '../result';
 import { RunContext } from '../runContext';
 import { RunState } from '../runState';
 import type {
@@ -11,18 +21,14 @@ import type {
   AgentOutputItem,
   ResolvedAgentOutput,
 } from '../types';
-import type {
-  OutputGuardrailDefinition,
-  OutputGuardrailMetadata,
-} from '../guardrail';
-import { runOutputGuardrails } from './guardrails';
-import { getTurnInput } from './items';
+import { getRunOutput, getTurnInput } from './items';
 import { streamStepItemsToRunResult } from './streaming';
+import { createRedactedErrorDetailsError } from '../utils/finalOutputError';
 
 /**
  * Error kinds supported by run error handlers.
  */
-export type RunErrorKind = 'maxTurns' | 'modelRefusal';
+export type RunErrorKind = 'maxTurns' | 'modelRefusal' | 'invalidFinalOutput';
 
 /**
  * Snapshot of run data passed to error handlers.
@@ -38,7 +44,7 @@ export type RunErrorData<TContext, TAgent extends Agent<any, any>> = {
 };
 
 export type RunErrorHandlerInput<TContext, TAgent extends Agent<any, any>> = {
-  error: MaxTurnsExceededError | ModelRefusalError;
+  error: MaxTurnsExceededError | ModelRefusalError | ModelBehaviorError;
   context: RunContext<TContext>;
   runData: RunErrorData<TContext, TAgent>;
 };
@@ -75,23 +81,62 @@ type TryHandleRunErrorArgs<TContext, TAgent extends Agent<any, any>> = {
   error: unknown;
   state: RunState<TContext, TAgent>;
   errorHandlers?: RunErrorHandlers<TContext, TAgent>;
-  outputGuardrailDefs: OutputGuardrailDefinition<
-    OutputGuardrailMetadata,
-    AgentOutputType<unknown>
-  >[];
-  emitAgentEnd: (
-    context: RunContext<TContext>,
-    agent: TAgent,
-    outputText: string,
-  ) => void;
   streamResult?: StreamedRunResult<TContext, TAgent>;
+  responseAccepted: boolean;
+  attemptedErrors?: WeakSet<object>;
+};
+
+export type PreparedRunErrorFinalOutput = {
+  deferredItem?: RunMessageOutputItem;
 };
 
 type ResolveRunErrorHandlerArgs<TContext, TAgent extends Agent<any, any>> = {
   error: unknown;
+  errorKind?: RunErrorKind;
   errorHandlers?: RunErrorHandlers<TContext, TAgent>;
   context: RunContext<TContext>;
   runData: RunErrorData<TContext, TAgent>;
+  attemptedErrors?: WeakSet<object>;
+};
+
+export async function preserveInvalidFinalOutputRedaction<T>(
+  callback: (redactFromStart: boolean) => T | Promise<T>,
+  inheritedRedaction = false,
+): Promise<T> {
+  const redactFromStart = inheritedRedaction || logger.dontLogModelData;
+
+  try {
+    return await callback(redactFromStart);
+  } catch (error) {
+    if (redactFromStart || logger.dontLogModelData) {
+      throw createRedactedErrorDetailsError();
+    }
+    throw error;
+  }
+}
+
+/**
+ * Attaches the active run state to errors that need resumable caller context.
+ */
+export const attachRunStateToError = <TContext, TAgent extends Agent<any, any>>(
+  error: unknown,
+  state: RunState<TContext, TAgent>,
+): void => {
+  if (error instanceof ModelTimeoutError) {
+    error.state ??= state;
+    return;
+  }
+
+  if (!(error instanceof ToolCallError)) {
+    return;
+  }
+
+  if (
+    error.error instanceof ToolInputGuardrailTripwireTriggered ||
+    error.error instanceof ToolOutputGuardrailTripwireTriggered
+  ) {
+    error.error.state ??= state;
+  }
 };
 
 const buildRunData = <TContext, TAgent extends Agent<any, any>>(
@@ -104,7 +149,7 @@ const buildRunData = <TContext, TAgent extends Agent<any, any>>(
     state._generatedItems,
     state._reasoningItemIdPolicy,
   ),
-  output: getTurnInput([], state._generatedItems, state._reasoningItemIdPolicy),
+  output: getRunOutput(state._generatedItems, state._reasoningItemIdPolicy),
   rawResponses: state._modelResponses,
   lastAgent: state._currentAgent,
   state,
@@ -126,59 +171,117 @@ const createFinalOutputItem = <TAgent extends Agent<any, any>>(
 ): RunMessageOutputItem =>
   new RunMessageOutputItem(assistant(outputText), agent);
 
+function validateRunErrorFinalOutput<TAgent extends Agent<any, any>>(
+  agent: TAgent,
+  outputText: string,
+  redactInvalidOutputDetails = false,
+  redactFromStart = false,
+): void {
+  try {
+    agent.processFinalOutput(outputText);
+  } catch (error) {
+    if (
+      redactInvalidOutputDetails &&
+      (redactFromStart || logger.dontLogModelData)
+    ) {
+      throw createRedactedErrorDetailsError();
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new UserError(`Invalid run error handler finalOutput: ${message}`);
+  }
+}
+
 export const formatRunErrorFinalOutput = formatFinalOutput;
 export const createRunErrorFinalOutputItem = createFinalOutputItem;
+export const validateRunErrorHandlerFinalOutput = validateRunErrorFinalOutput;
+
+export function invalidateAcceptedResponseReplayEvidence(
+  state: RunState<any, any> | undefined,
+): void {
+  if (
+    state?._currentStep?.type === 'next_step_interruption' &&
+    state._currentStep.data?.responseAccepted === true
+  ) {
+    state._lastProcessedResponse = undefined;
+  }
+}
 
 export const resolveRunErrorHandler = async <
   TContext,
   TAgent extends Agent<any, any>,
 >({
   error,
+  errorKind,
   errorHandlers,
   context,
   runData,
+  attemptedErrors,
 }: ResolveRunErrorHandlerArgs<TContext, TAgent>): Promise<
   RunErrorHandlerResult<TAgent> | undefined
 > => {
-  let handler: RunErrorHandler<TContext, TAgent> | undefined;
-  if (error instanceof MaxTurnsExceededError) {
-    handler = errorHandlers?.maxTurns ?? errorHandlers?.default;
-  } else if (error instanceof ModelRefusalError) {
-    handler = errorHandlers?.modelRefusal ?? errorHandlers?.default;
-  } else {
+  const kind =
+    errorKind ??
+    (error instanceof MaxTurnsExceededError
+      ? 'maxTurns'
+      : error instanceof ModelRefusalError
+        ? 'modelRefusal'
+        : undefined);
+
+  if (!kind) {
     return undefined;
   }
 
+  const typedError =
+    kind === 'maxTurns' && error instanceof MaxTurnsExceededError
+      ? error
+      : kind === 'modelRefusal' && error instanceof ModelRefusalError
+        ? error
+        : kind === 'invalidFinalOutput' && error instanceof ModelBehaviorError
+          ? error
+          : undefined;
+
+  if (!typedError) {
+    return undefined;
+  }
+
+  const handler = errorHandlers?.[kind] ?? errorHandlers?.default;
   if (!handler) {
     return undefined;
   }
 
+  if (attemptedErrors?.has(typedError)) {
+    return undefined;
+  }
+  attemptedErrors?.add(typedError);
+
+  invalidateAcceptedResponseReplayEvidence(runData.state);
   const handlerResult = await handler({
-    error,
+    error: typedError,
     context,
     runData,
   });
   return handlerResult || undefined;
 };
 
-export const tryHandleRunError = async <
+export const prepareRunErrorFinalOutput = async <
   TContext,
   TAgent extends Agent<TContext, AgentOutputType>,
 >({
   error,
   state,
   errorHandlers,
-  outputGuardrailDefs,
-  emitAgentEnd,
   streamResult,
+  responseAccepted,
+  attemptedErrors,
 }: TryHandleRunErrorArgs<TContext, TAgent>): Promise<
-  RunResult<TContext, TAgent> | undefined
+  PreparedRunErrorFinalOutput | undefined
 > => {
   const handlerResult = await resolveRunErrorHandler({
     error,
     errorHandlers,
     context: state._context,
     runData: buildRunData(state),
+    attemptedErrors,
   });
   if (!handlerResult) {
     return undefined;
@@ -188,22 +291,30 @@ export const tryHandleRunError = async <
     state._currentAgent,
     handlerResult.finalOutput,
   );
+  validateRunErrorFinalOutput(state._currentAgent, outputText);
+  streamResult?._hideFinalOutput();
   state._lastTurnResponse = undefined;
   state._lastProcessedResponse = undefined;
   const item = createFinalOutputItem(state._currentAgent, outputText);
-  if (includeInHistory) {
+  const deferredItem =
+    error instanceof MaxTurnsExceededError && includeInHistory
+      ? item
+      : undefined;
+  if (includeInHistory && !deferredItem) {
     state._generatedItems.push(item);
   }
-  if (streamResult) {
+  if (
+    streamResult &&
+    !deferredItem &&
+    (includeInHistory || !(error instanceof MaxTurnsExceededError))
+  ) {
     streamStepItemsToRunResult(streamResult, [item]);
   }
   state._currentStep = {
     type: 'next_step_final_output',
     output: outputText,
+    ...(responseAccepted ? { responseAccepted: true } : {}),
   };
   state._finalOutputSource = 'error_handler';
-  await runOutputGuardrails(state, outputGuardrailDefs, outputText);
-  state._currentTurnInProgress = false;
-  emitAgentEnd(state._context, state._currentAgent, outputText);
-  return new RunResult<TContext, TAgent>(state);
+  return { deferredItem };
 };

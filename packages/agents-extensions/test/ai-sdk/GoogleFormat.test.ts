@@ -74,17 +74,19 @@ class CollectingProcessor implements TracingProcessor {
 
 describe('AiSdkModel issue #802', () => {
   test('handles object usage in doGenerate (Google AI SDK compatibility)', async () => {
+    const rawUsage = {
+      inputTokens: { total: 10, noCache: 10, cacheRead: 0 },
+      outputTokens: { total: 20 },
+      totalTokens: { total: 30 },
+      providerMetric: null,
+    };
     const model = new AiSdkModel(
       stubModel({
         async doGenerate() {
           return {
             content: [{ type: 'text', text: 'ok' }],
             // Simulating Google AI SDK behavior where tokens are objects
-            usage: {
-              inputTokens: { total: 10, noCache: 10, cacheRead: 0 } as any,
-              outputTokens: { total: 20 } as any,
-              totalTokens: { total: 30 } as any,
-            },
+            usage: rawUsage,
             providerMetadata: {},
             response: { id: 'id' },
             finishReason: 'stop',
@@ -92,6 +94,13 @@ describe('AiSdkModel issue #802', () => {
           } as any;
         },
       }),
+      {
+        async transformOutputText(text) {
+          await Promise.resolve();
+          rawUsage.inputTokens.cacheRead = 9;
+          return text;
+        },
+      },
     );
 
     const res = await withTrace('t', () =>
@@ -99,7 +108,7 @@ describe('AiSdkModel issue #802', () => {
         input: 'hi',
         tools: [],
         handoffs: [],
-        modelSettings: {},
+        modelSettings: { preserveRawUsage: true },
         outputType: 'text',
         tracing: false,
       } as any),
@@ -114,7 +123,66 @@ describe('AiSdkModel issue #802', () => {
       outputTokensDetails: [],
       requestUsageEntries: undefined,
     });
+    rawUsage.inputTokens.cacheRead = 11;
+    expect(res.rawUsage).toEqual({
+      inputTokens: { total: 10, noCache: 10, cacheRead: 0 },
+      outputTokens: { total: 20 },
+      totalTokens: { total: 30 },
+      providerMetric: null,
+    });
   });
+
+  test.each([
+    ['disabled', false, false],
+    ['invalid snapshot', true, true],
+  ])(
+    'keeps post-transform usage extraction when preservation is %s',
+    async (_label, preserveRawUsage, useClassInstance) => {
+      const usage = {
+        inputTokens: { total: 10 },
+        outputTokens: { total: 20 },
+      };
+      const providerUsage = useClassInstance
+        ? Object.assign(Object.create({ provider: 'google' }), usage)
+        : usage;
+      const model = new AiSdkModel(
+        stubModel({
+          async doGenerate() {
+            return {
+              content: [{ type: 'text', text: 'ok' }],
+              usage: providerUsage,
+              providerMetadata: {},
+              response: { id: 'id' },
+              finishReason: 'stop',
+              warnings: [],
+            } as any;
+          },
+        }),
+        {
+          async transformOutputText(text) {
+            await Promise.resolve();
+            providerUsage.inputTokens.total = 99;
+            return text;
+          },
+        },
+      );
+
+      const result = await withTrace('t', () =>
+        model.getResponse({
+          input: 'hi',
+          tools: [],
+          handoffs: [],
+          modelSettings: { preserveRawUsage },
+          outputType: 'text',
+          tracing: false,
+        } as any),
+      );
+
+      expect(result.rawUsage).toBeUndefined();
+      expect(result.usage.inputTokens).toBe(99);
+      expect(result.usage.totalTokens).toBe(119);
+    },
+  );
 
   test('maps cacheRead/cacheWrite usage in generation spans (#945, #955)', async () => {
     const processor = new CollectingProcessor();
@@ -134,7 +202,7 @@ describe('AiSdkModel issue #802', () => {
                   cacheRead: 2,
                   cacheWrite: 3,
                 } as any,
-                outputTokens: { total: 20 } as any,
+                outputTokens: { total: 20, text: 17, reasoning: 3 } as any,
                 totalTokens: { total: 30 } as any,
               },
               providerMetadata: {},
@@ -160,6 +228,9 @@ describe('AiSdkModel issue #802', () => {
       expect(res.usage.inputTokensDetails).toEqual([
         { cached_tokens: 2, cache_write_tokens: 3 },
       ]);
+      expect(res.usage.outputTokensDetails).toEqual([
+        { reasoning_tokens: 3, text_tokens: 17 },
+      ]);
 
       const generationSpan = processor.spans.find(
         (span) => span.spanData.type === 'generation',
@@ -169,6 +240,7 @@ describe('AiSdkModel issue #802', () => {
         input_tokens: 10,
         output_tokens: 20,
         input_tokens_details: { cached_tokens: 2, cache_write_tokens: 3 },
+        output_tokens_details: { reasoning_tokens: 3, text_tokens: 17 },
       });
     } finally {
       setTracingDisabled(true);
@@ -185,10 +257,14 @@ describe('AiSdkModel issue #802', () => {
         // Simulating Google AI SDK behavior where tokens are objects
         usage: {
           inputTokens: { total: 5, cacheRead: 1, cacheWrite: 2 } as any,
-          outputTokens: { total: 8 } as any,
+          outputTokens: { total: 8, text: 6, reasoning: 2 } as any,
         },
       },
     ];
+    const processor = new CollectingProcessor();
+    setTracingDisabled(false);
+    setTraceProcessors([processor]);
+
     const model = new AiSdkModel(
       stubModel({
         async doStream() {
@@ -200,26 +276,107 @@ describe('AiSdkModel issue #802', () => {
     );
 
     let finalUsage: any;
-    for await (const ev of model.getStreamedResponse({
-      input: 'hi',
-      tools: [],
-      handoffs: [],
-      modelSettings: {},
-      outputType: 'text',
-      tracing: false,
-    } as any)) {
-      if (ev.type === 'response_done') {
-        finalUsage = ev.response.usage;
-      }
-    }
+    let finalRawUsage: any;
+    try {
+      await withTrace('t', async () => {
+        for await (const ev of model.getStreamedResponse({
+          input: 'hi',
+          tools: [],
+          handoffs: [],
+          modelSettings: { preserveRawUsage: true },
+          outputType: 'text',
+          tracing: true,
+        } as any)) {
+          if (ev.type === 'model' && (ev.event as any).type === 'finish') {
+            (ev.event as any).usage.inputTokens.cacheRead = 99;
+            (ev.event as any).usage.outputTokens.reasoning = 77;
+          }
+          if (ev.type === 'response_done') {
+            finalUsage = ev.response.usage;
+            finalRawUsage = ev.response.rawUsage;
+          }
+        }
+      });
 
-    expect(finalUsage).toEqual({
-      inputTokens: 5,
-      outputTokens: 8,
-      totalTokens: 13,
-      inputTokensDetails: { cached_tokens: 1, cache_write_tokens: 2 },
-    });
+      expect(finalUsage).toEqual({
+        inputTokens: 5,
+        outputTokens: 8,
+        totalTokens: 13,
+        inputTokensDetails: { cached_tokens: 1, cache_write_tokens: 2 },
+        outputTokensDetails: { reasoning_tokens: 2, text_tokens: 6 },
+      });
+      expect(finalRawUsage).toEqual({
+        inputTokens: { total: 5, cacheRead: 1, cacheWrite: 2 },
+        outputTokens: { total: 8, text: 6, reasoning: 2 },
+      });
+
+      const generationSpan = processor.spans.find(
+        (span) => span.spanData.type === 'generation',
+      );
+
+      expect(generationSpan?.spanData?.usage).toEqual({
+        input_tokens: 5,
+        output_tokens: 8,
+        input_tokens_details: { cached_tokens: 1, cache_write_tokens: 2 },
+        output_tokens_details: { reasoning_tokens: 2, text_tokens: 6 },
+      });
+    } finally {
+      setTracingDisabled(true);
+      setTraceProcessors([new BatchTraceProcessor(new ConsoleSpanExporter())]);
+    }
   });
+
+  test.each([
+    ['disabled', false, false],
+    ['invalid snapshot', true, true],
+  ])(
+    'keeps post-event usage extraction when streaming preservation is %s',
+    async (_label, preserveRawUsage, useClassInstance) => {
+      const usage = {
+        inputTokens: { total: 5 },
+        outputTokens: { total: 8 },
+      };
+      const providerUsage = useClassInstance
+        ? Object.assign(Object.create({ provider: 'google' }), usage)
+        : usage;
+      const model = new AiSdkModel(
+        stubModel({
+          async doStream() {
+            return {
+              stream: partsStream([
+                {
+                  type: 'finish',
+                  finishReason: 'stop',
+                  usage: providerUsage,
+                },
+              ]),
+            } as any;
+          },
+        }),
+      );
+      let finalEvent: any;
+
+      for await (const event of model.getStreamedResponse({
+        input: 'hi',
+        tools: [],
+        handoffs: [],
+        modelSettings: { preserveRawUsage },
+        outputType: 'text',
+        tracing: false,
+      } as any)) {
+        if (event.type === 'model' && (event.event as any).type === 'finish') {
+          (event.event as any).usage.inputTokens.total = 99;
+        }
+        if (event.type === 'response_done') {
+          finalEvent = event;
+        }
+      }
+
+      expect(finalEvent.response.rawUsage).toBeUndefined();
+      expect(finalEvent.response.usage.inputTokens).toBe(99);
+      expect(finalEvent.response.usage.totalTokens).toBe(107);
+    },
+  );
 
   test('preserves toolChoice and provider options through streaming tool calls', async () => {
     const parts = [

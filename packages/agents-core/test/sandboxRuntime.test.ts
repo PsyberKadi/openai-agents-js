@@ -15,6 +15,10 @@ import {
   type SandboxSessionLike,
 } from '../src/sandbox';
 import { applyManifestToProvidedSession } from '../src/sandbox/runtime/providedSessionManifest';
+import { renderRemoteMountPolicyInstructions } from '../src/sandbox/runtime/prompts';
+import { DockerSandboxSession } from '../src/sandbox/sandboxes/docker';
+import { mergeManifestDelta } from '../src/sandbox/internal';
+import { ScriptedModel } from '../src/testing';
 
 class TestCapability extends Capability {
   public readonly type: string;
@@ -76,25 +80,9 @@ class StubEditor implements Editor {
   }
 }
 
-class OpenAIChatCompletionsModel {
-  async getResponse() {
-    throw new Error('not used');
-  }
+class OpenAIChatCompletionsModel extends ScriptedModel {}
 
-  async *getStreamedResponse() {
-    yield* [];
-  }
-}
-
-class OpenAIResponsesModel {
-  async getResponse() {
-    throw new Error('not used');
-  }
-
-  async *getStreamedResponse() {
-    yield* [];
-  }
-}
+class OpenAIResponsesModel extends ScriptedModel {}
 
 function sessionWithManifest(manifest: Manifest): SandboxSessionLike {
   return {
@@ -111,6 +99,19 @@ function sessionWithManifest(manifest: Manifest): SandboxSessionLike {
       },
     }),
   };
+}
+
+function dockerSessionWithManifest(manifest: Manifest): DockerSandboxSession {
+  return new DockerSandboxSession({
+    state: {
+      manifest,
+      workspaceRootPath: '/tmp/docker-sandbox-workspace',
+      workspaceRootOwned: false,
+      environment: {},
+      image: 'test-image',
+      containerId: 'test-container',
+    },
+  });
 }
 
 describe('prepareSandboxAgent', () => {
@@ -419,12 +420,211 @@ describe('prepareSandboxAgent', () => {
     expect(instructions).toContain(
       'copy the target to a normal workspace path',
     );
+    expect(instructions).toContain(
+      'Do not edit read-only mounted remote paths in place',
+    );
     const remotePolicyIndex =
       instructions?.indexOf('# Sandbox remote mount policy') ?? -1;
     const filesystemIndex = instructions?.indexOf('# Filesystem') ?? -1;
     expect(remotePolicyIndex).toBeGreaterThanOrEqual(0);
     expect(filesystemIndex).toBeGreaterThanOrEqual(0);
     expect(remotePolicyIndex).toBeLessThan(filesystemIndex);
+  });
+
+  it('does not suggest writing edits back to read-only remote mounts', () => {
+    const instructions = renderRemoteMountPolicyInstructions(
+      new Manifest({
+        entries: {
+          data: {
+            type: 'mount',
+            source: 's3://bucket/data',
+            mountStrategy: { type: 'in_container' },
+          },
+        },
+      }),
+    );
+
+    expect(instructions).toContain('- /workspace/data (read-only)');
+    expect(instructions).toContain(
+      'Do not edit read-only mounted remote paths in place',
+    );
+    expect(instructions).toContain('including with `apply_patch`');
+    expect(instructions).toContain('do not write edited files back');
+    expect(instructions).not.toContain('copy the result back');
+    expect(instructions).not.toContain(
+      'Use `apply_patch` directly for text edits',
+    );
+  });
+
+  it('keeps edit guidance for read-write remote mounts', () => {
+    const instructions = renderRemoteMountPolicyInstructions(
+      new Manifest({
+        entries: {
+          data: {
+            type: 'mount',
+            source: 's3://bucket/data',
+            readOnly: false,
+            mountStrategy: { type: 'in_container' },
+          },
+        },
+      }),
+      () => true,
+    );
+
+    expect(instructions).toContain('- /workspace/data (read-write)');
+    expect(instructions).toContain(
+      'Use `apply_patch` directly for text edits only under these read-write mounted remote paths: `/workspace/data`.',
+    );
+    expect(instructions).toContain(
+      'For shell-based edits under a read-write mounted remote path',
+    );
+    expect(instructions).toContain('copy the result back');
+    expect(instructions).not.toContain(
+      'Do not edit read-only mounted remote paths',
+    );
+  });
+
+  it('does not suggest apply_patch for ungranted external read-write mounts', () => {
+    const instructions = renderRemoteMountPolicyInstructions(
+      new Manifest({
+        entries: {
+          data: {
+            type: 'mount',
+            source: 's3://bucket/data',
+            readOnly: false,
+            mountStrategy: { type: 'in_container' },
+            mountPath: '/mnt/external',
+          },
+        },
+      }),
+      () => true,
+    );
+
+    expect(instructions).toContain('- /mnt/external (read-write)');
+    expect(instructions).not.toContain(
+      'Use `apply_patch` directly for text edits',
+    );
+    expect(instructions).toContain(
+      'For shell-based edits under a read-write mounted remote path',
+    );
+    expect(instructions).toContain('copy the result back');
+  });
+
+  it('limits apply_patch guidance to addressable read-write mounts', () => {
+    const instructions = renderRemoteMountPolicyInstructions(
+      new Manifest({
+        entries: {
+          internal: {
+            type: 'mount',
+            source: 's3://bucket/internal',
+            readOnly: false,
+            mountStrategy: { type: 'in_container' },
+          },
+          external: {
+            type: 'mount',
+            source: 's3://bucket/external',
+            readOnly: false,
+            mountStrategy: { type: 'in_container' },
+            mountPath: '/mnt/external',
+          },
+        },
+      }),
+      () => true,
+    );
+    const applyPatchInstruction = instructions
+      ?.split('\n')
+      .find((line) => line.includes('Use `apply_patch` directly'));
+
+    expect(applyPatchInstruction).toContain('`/workspace/internal`');
+    expect(applyPatchInstruction).not.toContain('`/mnt/external`');
+  });
+
+  it('allows apply_patch guidance for granted external read-write mounts', () => {
+    const instructions = renderRemoteMountPolicyInstructions(
+      new Manifest({
+        extraPathGrants: [{ path: '/mnt/external', readOnly: false }],
+        entries: {
+          data: {
+            type: 'mount',
+            source: 's3://bucket/data',
+            readOnly: false,
+            mountStrategy: { type: 'in_container' },
+            mountPath: '/mnt/external/data',
+          },
+        },
+      }),
+      () => true,
+    );
+
+    expect(instructions).toContain(
+      'Use `apply_patch` directly for text edits only under these read-write mounted remote paths: `/mnt/external/data`.',
+    );
+  });
+
+  it('does not suggest apply_patch for mounts unreachable by the active Docker editor', async () => {
+    const manifest = new Manifest({
+      entries: {
+        container: {
+          type: 'mount',
+          source: 's3://bucket/container',
+          readOnly: false,
+          mountStrategy: { type: 'in_container' },
+        },
+        volume: {
+          type: 'mount',
+          source: 's3://bucket/volume',
+          readOnly: false,
+          mountStrategy: { type: 'docker_volume' },
+        },
+      },
+    });
+    const prepared = prepareSandboxAgent({
+      agent: new SandboxAgent({
+        name: 'sandbox',
+        baseInstructions: 'base instructions',
+      }),
+      session: dockerSessionWithManifest(manifest),
+      capabilities: [filesystem()],
+    });
+
+    const instructions = await prepared.getSystemPrompt(new RunContext());
+
+    expect(instructions).toContain('- /workspace/container (read-write)');
+    expect(instructions).toContain('- /workspace/volume (read-write)');
+    expect(instructions).not.toContain(
+      'Use `apply_patch` directly for text edits',
+    );
+    expect(instructions).toContain(
+      'For shell-based edits under a read-write mounted remote path',
+    );
+  });
+
+  it('keeps apply_patch guidance for mounts reachable by the active Docker editor', async () => {
+    const manifest = new Manifest({
+      entries: {
+        data: {
+          type: 'mount',
+          source: 's3://bucket/data',
+          readOnly: false,
+          mountStrategy: { type: 'in_container' },
+        },
+      },
+    });
+    const prepared = prepareSandboxAgent({
+      agent: new SandboxAgent({
+        name: 'sandbox',
+        baseInstructions: 'base instructions',
+        runAs: 'sandbox-user',
+      }),
+      session: dockerSessionWithManifest(manifest),
+      capabilities: [filesystem()],
+    });
+
+    const instructions = await prepared.getSystemPrompt(new RunContext());
+
+    expect(instructions).toContain(
+      'Use `apply_patch` directly for text edits only under these read-write mounted remote paths: `/workspace/data`.',
+    );
   });
 
   it('rejects mount additions on live provided sessions', async () => {
@@ -453,6 +653,7 @@ describe('prepareSandboxAgent', () => {
             type: 's3_mount',
             bucket: 'bucket',
             config: { b: 2, a: 1 },
+            mountStrategy: { type: 'modal_cloud_bucket' },
           },
         },
       }),
@@ -467,6 +668,7 @@ describe('prepareSandboxAgent', () => {
               type: 's3_mount',
               bucket: 'bucket',
               config: { a: 1, b: 2 },
+              mountStrategy: { type: 'modal_cloud_bucket' },
             },
           },
         }),
@@ -487,6 +689,109 @@ describe('prepareSandboxAgent', () => {
         }),
       ),
     ).rejects.toThrow('cannot change manifest environment variables');
+  });
+
+  it('allows additive updates that omit existing environment entries', async () => {
+    const session = sessionWithManifest(
+      new Manifest({ environment: { EXISTING: 'value' } }),
+    );
+    session.applyManifest = async (delta) => {
+      session.state.manifest = mergeManifestDelta(
+        session.state.manifest,
+        delta,
+      );
+    };
+
+    await expect(
+      applyManifestToProvidedSession(
+        session,
+        new Manifest({
+          entries: { added: { type: 'file', content: 'added' } },
+        }),
+      ),
+    ).resolves.toBeUndefined();
+    expect(session.state.manifest.entries.added).toMatchObject({
+      type: 'file',
+      content: 'added',
+    });
+    expect(session.state.manifest.environment.EXISTING).toBeDefined();
+  });
+
+  it('preserves concurrent provided-session manifest updates', async () => {
+    const session = sessionWithManifest(new Manifest({ root: '/workspace' }));
+    session.applyManifest = async (delta) => {
+      const staleBase = session.state.manifest;
+      await Promise.resolve();
+      session.state.manifest = mergeManifestDelta(staleBase, delta);
+    };
+
+    const applyingFirst = applyManifestToProvidedSession(
+      session,
+      new Manifest({
+        root: '/workspace',
+        entries: { first: { type: 'file', content: 'first' } },
+      }),
+    );
+    const applyingSecond = applyManifestToProvidedSession(
+      session,
+      new Manifest({
+        root: '/workspace',
+        entries: { second: { type: 'file', content: 'second' } },
+      }),
+    );
+    await Promise.all([applyingFirst, applyingSecond]);
+    expect(session.state.manifest.entries).toMatchObject({
+      first: { type: 'file', content: 'first' },
+      second: { type: 'file', content: 'second' },
+    });
+  });
+
+  it('commits state for released side-effect-only provided sessions', async () => {
+    const session = sessionWithManifest(new Manifest({ root: '/workspace' }));
+    session.applyManifest = async () => {};
+
+    await expect(
+      applyManifestToProvidedSession(
+        session,
+        new Manifest({
+          root: '/workspace',
+          entries: { added: { type: 'file', content: 'added' } },
+        }),
+      ),
+    ).resolves.toBeUndefined();
+    expect(session.state.manifest.entries.added).toMatchObject({
+      type: 'file',
+      content: 'added',
+    });
+  });
+
+  it('preserves prior and provider-added state after a destructive commit', async () => {
+    const session = sessionWithManifest(
+      new Manifest({
+        root: '/workspace',
+        entries: { existing: { type: 'file', content: 'existing' } },
+      }),
+    );
+    session.applyManifest = async () => {
+      session.state.manifest = new Manifest({
+        root: '/workspace',
+        entries: { provider: { type: 'file', content: 'provider' } },
+      });
+    };
+
+    await applyManifestToProvidedSession(
+      session,
+      new Manifest({
+        root: '/workspace',
+        entries: { added: { type: 'file', content: 'added' } },
+      }),
+    );
+
+    expect(session.state.manifest.entries).toMatchObject({
+      existing: { type: 'file', content: 'existing' },
+      provider: { type: 'file', content: 'provider' },
+      added: { type: 'file', content: 'added' },
+    });
   });
 
   it('resolves dynamic base instructions with the run context', async () => {

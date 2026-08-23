@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ModelResponse } from '../model';
 import { RunItem } from '../items';
 import { AgentInputItem } from '../types';
+import type { FinalOutputSource } from '../runState';
 
 export const nextStepSchema = z.discriminatedUnion('type', [
   z.object({
@@ -11,6 +12,8 @@ export const nextStepSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('next_step_final_output'),
     output: z.string(),
+    responseAccepted: z.literal(true).optional(),
+    localFinalizationStarted: z.literal(true).optional(),
   }),
   z.object({
     type: z.literal('next_step_run_again'),
@@ -30,6 +33,8 @@ export class SingleStepResult {
     public preStepItems: RunItem[],
     public newStepItems: RunItem[],
     public nextStep: NextStep,
+    public finalOutputSource?: FinalOutputSource,
+    public toolInvocationCommitItems: RunItem[] = newStepItems,
   ) {}
 
   get generatedItems(): RunItem[] {

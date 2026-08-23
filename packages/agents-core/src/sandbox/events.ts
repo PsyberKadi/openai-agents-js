@@ -4,6 +4,7 @@ export type SandboxEventError = {
   name?: string;
   message: string;
   code?: string;
+  retryable?: boolean | null;
 };
 
 export type SandboxOperationEvent = {
@@ -88,6 +89,8 @@ export function createSandboxJsonlEventSink(
 export function createSandboxHttpEventSink(
   options: SandboxHttpEventSinkOptions,
 ): SandboxEventSink {
+  const headers = { ...options.headers };
+
   return async (event) => {
     const fetch = options.fetch ?? readGlobalFetch();
     if (!fetch) {
@@ -100,7 +103,7 @@ export function createSandboxHttpEventSink(
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        ...options.headers,
+        ...headers,
       },
       body: JSON.stringify(event),
     });
@@ -132,10 +135,12 @@ export function createChainedSandboxEventSink(
 export function serializeSandboxEventError(error: unknown): SandboxEventError {
   if (error instanceof Error) {
     const code = readErrorCode(error);
+    const retryable = readErrorRetryability(error);
     return {
       name: error.name,
       message: error.message,
       ...(code ? { code } : {}),
+      ...(retryable !== undefined ? { retryable } : {}),
     };
   }
 
@@ -147,6 +152,13 @@ export function serializeSandboxEventError(error: unknown): SandboxEventError {
 function readErrorCode(error: Error): string | undefined {
   const code = (error as { code?: unknown }).code;
   return typeof code === 'string' ? code : undefined;
+}
+
+function readErrorRetryability(error: Error): boolean | null | undefined {
+  const retryable = (error as { retryable?: unknown }).retryable;
+  return typeof retryable === 'boolean' || retryable === null
+    ? retryable
+    : undefined;
 }
 
 function readGlobalFetch(): SandboxHttpEventFetch | undefined {

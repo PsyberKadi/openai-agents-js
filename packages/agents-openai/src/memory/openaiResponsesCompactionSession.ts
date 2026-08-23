@@ -12,20 +12,20 @@ import type {
   Session,
 } from '@openai/agents-core';
 import type { OpenAIResponsesCompactionResult } from '@openai/agents-core';
+import { logModelAndToolActionWarning } from '@openai/agents-core/utils/internal';
 import { DEFAULT_OPENAI_MODEL, getDefaultOpenAIClient } from '../defaults';
 import { getInputItems } from '../openaiResponsesModel';
 import {
   OPENAI_SESSION_API,
   type OpenAISessionApiTagged,
 } from './openaiSessionApi';
+import type { OpenAIClient } from '../openaiClient';
 
 const DEFAULT_COMPACTION_THRESHOLD = 10;
 const logger = getLogger('openai-agents:openai:compaction');
 
 export type OpenAIResponsesCompactionMode =
-  | 'previous_response_id'
-  | 'input'
-  | 'auto';
+  'previous_response_id' | 'input' | 'auto';
 
 export type OpenAIResponsesCompactionDecisionContext = {
   /**
@@ -56,7 +56,7 @@ export type OpenAIResponsesCompactionSessionOptions = {
    * When omitted, the session will use `getDefaultOpenAIClient()` if configured. Otherwise it
    * creates a new `OpenAI()` instance via `new OpenAI()`.
    */
-  client?: OpenAI;
+  client?: OpenAIClient;
   /**
    * Session store that receives items and holds the compacted history.
    *
@@ -125,6 +125,7 @@ export class OpenAIResponsesCompactionSession
   ) => boolean | Promise<boolean>;
   private compactionCandidateItems: AgentInputItem[] | undefined;
   private sessionItems: AgentInputItem[] | undefined;
+  private mutationOperation: Promise<void> = Promise.resolve();
 
   constructor(options: OpenAIResponsesCompactionSessionOptions) {
     this.client = resolveClient(options);
@@ -149,6 +150,12 @@ export class OpenAIResponsesCompactionSession
 
   async runCompaction(
     args: OpenAIResponsesCompactionArgs = {},
+  ): Promise<OpenAIResponsesCompactionResult | null> {
+    return this.runMutationOperation(() => this.runCompactionOperation(args));
+  }
+
+  private async runCompactionOperation(
+    args: OpenAIResponsesCompactionArgs,
   ): Promise<OpenAIResponsesCompactionResult | null> {
     this.responseId = args.responseId ?? this.responseId ?? undefined;
     if (args.store !== undefined) {
@@ -204,19 +211,21 @@ export class OpenAIResponsesCompactionSession
     const compacted = await this.client.responses.compact(compactRequest);
 
     const outputItems = normalizeCompactionOutputItems(compacted.output ?? []);
+    const outputCompactionCandidateItems =
+      selectCompactionCandidateItems(outputItems);
     const previousItems = await this.getAllUnderlyingSessionItems();
     await this.replaceUnderlyingSessionItems({
       outputItems,
       previousItems,
     });
-    this.compactionCandidateItems = selectCompactionCandidateItems(outputItems);
+    this.compactionCandidateItems = outputCompactionCandidateItems;
     this.sessionItems = outputItems;
 
     logger.debug('compact: done %o', {
       responseId: this.responseId,
       compactionMode: resolvedMode,
       outputItemCount: outputItems.length,
-      candidateCount: this.compactionCandidateItems.length,
+      candidateCount: outputCompactionCandidateItems.length,
     });
 
     return {
@@ -237,55 +246,70 @@ export class OpenAIResponsesCompactionSession
       return;
     }
 
-    await this.underlyingSession.addItems(items);
-    if (this.compactionCandidateItems) {
-      const candidates = selectCompactionCandidateItems(items);
-      if (candidates.length > 0) {
-        this.compactionCandidateItems = [
-          ...this.compactionCandidateItems,
-          ...candidates,
-        ];
+    await this.runMutationOperation(async () => {
+      await this.underlyingSession.addItems(items);
+      if (this.compactionCandidateItems) {
+        const candidates = selectCompactionCandidateItems(items);
+        if (candidates.length > 0) {
+          this.compactionCandidateItems = [
+            ...this.compactionCandidateItems,
+            ...candidates,
+          ];
+        }
       }
-    }
-    if (this.sessionItems) {
-      this.sessionItems = [...this.sessionItems, ...items];
-    }
+      if (this.sessionItems) {
+        this.sessionItems = [...this.sessionItems, ...items];
+      }
+    });
   }
 
   async popItem() {
-    const popped = await this.underlyingSession.popItem();
-    if (!popped) {
-      return popped;
-    }
-    if (this.sessionItems) {
-      const index = this.sessionItems.lastIndexOf(popped);
-      if (index >= 0) {
-        this.sessionItems.splice(index, 1);
-      } else {
-        this.sessionItems = await this.underlyingSession.getItems();
+    return this.runMutationOperation(async () => {
+      const popped = await this.underlyingSession.popItem();
+      if (!popped) {
+        return popped;
       }
-    }
-    if (this.compactionCandidateItems) {
-      const isCandidate = selectCompactionCandidateItems([popped]).length > 0;
-      if (isCandidate) {
-        const index = this.compactionCandidateItems.indexOf(popped);
+      if (this.sessionItems) {
+        const index = this.sessionItems.lastIndexOf(popped);
         if (index >= 0) {
-          this.compactionCandidateItems.splice(index, 1);
+          this.sessionItems.splice(index, 1);
         } else {
-          // Fallback when the popped item reference differs from stored candidates.
-          this.compactionCandidateItems = selectCompactionCandidateItems(
-            await this.underlyingSession.getItems(),
-          );
+          this.sessionItems = await this.underlyingSession.getItems();
         }
       }
-    }
-    return popped;
+      if (this.compactionCandidateItems) {
+        const isCandidate = selectCompactionCandidateItems([popped]).length > 0;
+        if (isCandidate) {
+          const index = this.compactionCandidateItems.indexOf(popped);
+          if (index >= 0) {
+            this.compactionCandidateItems.splice(index, 1);
+          } else {
+            // Fallback when the popped item reference differs from stored candidates.
+            this.compactionCandidateItems = selectCompactionCandidateItems(
+              await this.underlyingSession.getItems(),
+            );
+          }
+        }
+      }
+      return popped;
+    });
   }
 
   async clearSession() {
-    await this.underlyingSession.clearSession();
-    this.compactionCandidateItems = [];
-    this.sessionItems = [];
+    await this.runMutationOperation(async () => {
+      await this.underlyingSession.clearSession();
+      this.compactionCandidateItems = [];
+      this.sessionItems = [];
+    });
+  }
+
+  private runMutationOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.mutationOperation.then(operation);
+    this.mutationOperation = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   private async getAllUnderlyingSessionItems(): Promise<AgentInputItem[]> {
@@ -327,7 +351,8 @@ export class OpenAIResponsesCompactionSession
     try {
       currentItems = await this.getAllUnderlyingSessionItems();
     } catch (inspectionError) {
-      logger.warn(
+      logModelAndToolActionWarning(
+        logger,
         'Failed to inspect session history after compaction replacement clear failed.',
         inspectionError,
       );
@@ -366,14 +391,16 @@ export class OpenAIResponsesCompactionSession
         await this.underlyingSession.addItems(previousItems);
       }
     } catch (restoreError) {
-      logger.warn(
+      logModelAndToolActionWarning(
+        logger,
         'Failed to restore session history after compaction replacement failed.',
         restoreError,
       );
       return;
     }
 
-    logger.warn(
+    logModelAndToolActionWarning(
+      logger,
       'Restored previous session history after compaction replacement failed.',
       error,
     );
@@ -431,12 +458,12 @@ function resolveClient(
   options: OpenAIResponsesCompactionSessionOptions,
 ): OpenAI {
   if (options.client) {
-    return options.client;
+    return options.client as OpenAI;
   }
 
   const defaultClient = getDefaultOpenAIClient();
   if (defaultClient) {
-    return defaultClient;
+    return defaultClient as OpenAI;
   }
 
   return new OpenAI();

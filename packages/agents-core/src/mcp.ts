@@ -1,4 +1,4 @@
-import { FunctionTool, tool, Tool } from './tool';
+import { FunctionTool, tool, Tool, type ToolCallDetails } from './tool';
 import { UserError } from './errors';
 import {
   MCPServerStdio as UnderlyingMCPServerStdio,
@@ -12,9 +12,11 @@ import {
   type MCPListToolsSpanData,
   type Span,
 } from './tracing';
-import { logger as globalLogger, getLogger, Logger } from './logger';
-import debug from 'debug';
-import { z } from 'zod';
+import {
+  logger as globalLogger,
+  logToolActionWarning,
+  type Logger,
+} from './logger';
 import {
   JsonObjectSchema,
   JsonObjectSchemaNonStrict,
@@ -22,30 +24,61 @@ import {
   UnknownContext,
 } from './types';
 import type {
+  MCPToolCustomDataContext,
+  MCPToolCustomDataExtractor,
   MCPToolFilterCallable,
   MCPToolFilterStatic,
   MCPToolMetaContext,
   MCPToolMetaResolver,
 } from './mcpUtil';
+import { getMcpServerExternalName } from './mcpLogging';
 import type { RunContext } from './runContext';
 import type { Agent } from './agent';
+import { maybeExtractToolOutputCustomData } from './utils/customData';
+import {
+  BaseMCPServerSSE,
+  BaseMCPServerStdio,
+  BaseMCPServerStreamableHttp,
+  MCPTool,
+} from './mcpShared';
+import {
+  beginServerToolsCacheListing,
+  cachedMcpToolKeysByServer as _cachedToolKeysByServer,
+  cachedMcpTools as _cachedTools,
+} from './mcpToolCache';
+import { getToolCallParentSpanFromDetails } from './agentToolRunConfig';
+import {
+  assertOpenAIStrictToolSchemaPreservesOpenObjects,
+  isJsonSchemaDepthError,
+} from './utils/strictToolSchema';
 
-export const DEFAULT_STDIO_MCP_CLIENT_LOGGER_NAME =
-  'openai-agents:stdio-mcp-client';
-
-export const DEFAULT_STREAMABLE_HTTP_MCP_CLIENT_LOGGER_NAME =
-  'openai-agents:streamable-http-mcp-client';
-
-export const DEFAULT_SSE_MCP_CLIENT_LOGGER_NAME =
-  'openai-agents:sse-mcp-client';
+export {
+  BaseMCPServerSSE,
+  BaseMCPServerStdio,
+  BaseMCPServerStreamableHttp,
+  DEFAULT_SSE_MCP_CLIENT_LOGGER_NAME,
+  DEFAULT_STDIO_MCP_CLIENT_LOGGER_NAME,
+  DEFAULT_STREAMABLE_HTTP_MCP_CLIENT_LOGGER_NAME,
+  MCPTool,
+  attachCallToolResultMetadata,
+} from './mcpShared';
+export { invalidateServerToolsCache } from './mcpToolCache';
 
 export type MCPToolErrorFunction = (args: {
   context: RunContext;
   error: Error | unknown;
 }) => Promise<string> | string;
 
+export interface MCPCallToolOptions {
+  signal?: AbortSignal;
+}
+
 const MCP_FUNCTION_TOOL_NAME_MAX_LENGTH = 64;
 const MCP_FUNCTION_TOOL_HASH_LENGTH = 8;
+
+function snapshotMcpTools(tools: MCPTool[]): MCPTool[] {
+  return structuredClone(tools);
+}
 
 type PrefixedToolNameCandidate = {
   batchKey: string;
@@ -56,6 +89,70 @@ type PrefixedToolNameCandidate = {
   toolIndex: number;
 };
 
+class MCPToolsLifecycleGuard {
+  private generation = 0;
+  private activeOperations = 0;
+
+  private startLifecycleBranch(
+    operation: (() => Promise<void>) | undefined,
+  ): Promise<void> {
+    try {
+      return operation?.() ?? Promise.resolve();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  private beginLifecycleOperation(): void {
+    this.activeOperations += 1;
+    this.generation += 1;
+  }
+
+  private endLifecycleOperation(): void {
+    this.activeOperations -= 1;
+  }
+
+  async runLifecycleOperation(
+    invalidate: () => Promise<void>,
+    operation?: () => Promise<void>,
+  ): Promise<void> {
+    this.beginLifecycleOperation();
+    try {
+      const [invalidationResult, operationResult] = await Promise.allSettled([
+        this.startLifecycleBranch(invalidate),
+        this.startLifecycleBranch(operation),
+      ]);
+      if (invalidationResult.status === 'rejected') {
+        throw invalidationResult.reason;
+      }
+      if (operationResult.status === 'rejected') {
+        throw operationResult.reason;
+      }
+    } finally {
+      this.endLifecycleOperation();
+    }
+  }
+
+  invalidate(): void {
+    this.generation += 1;
+  }
+
+  beginListing(): number {
+    if (this.activeOperations > 0) {
+      throw new Error(
+        'Cannot list MCP tools while a server lifecycle operation is in progress.',
+      );
+    }
+    return this.generation;
+  }
+
+  assertListingIsCurrent(listingGeneration: number): void {
+    if (this.activeOperations > 0 || listingGeneration !== this.generation) {
+      throw new Error('MCP tool listing became stale before it completed.');
+    }
+  }
+}
+
 /**
  * Interface for MCP server implementations.
  * Provides methods for connecting, listing tools, calling tools, and cleanup.
@@ -64,6 +161,12 @@ export interface MCPServer {
   cacheToolsList: boolean;
   toolFilter?: MCPToolFilterCallable | MCPToolFilterStatic;
   toolMetaResolver?: MCPToolMetaResolver;
+  customDataExtractor?: MCPToolCustomDataExtractor;
+  /**
+   * Whether to use MCP `structuredContent` as the model-visible tool output when available.
+   * Defaults to false to preserve the existing content-based output behavior.
+   */
+  useStructuredContent?: boolean;
   /**
    * Optional function to convert MCP tool failures into model-visible messages.
    * Set to null to rethrow errors instead of converting them.
@@ -77,7 +180,17 @@ export interface MCPServer {
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResultContent>;
+  /**
+   * Invoke a tool and return the full serializable MCP result.
+   */
+  callToolResult?(
+    toolName: string,
+    args: Record<string, unknown> | null,
+    meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
+  ): Promise<CallToolResult>;
   invalidateToolsCache(): Promise<void>;
 }
 
@@ -137,8 +250,7 @@ export interface MCPBlobResourceContent {
 }
 
 export type MCPResourceContent =
-  | MCPTextResourceContent
-  | MCPBlobResourceContent;
+  MCPTextResourceContent | MCPBlobResourceContent;
 
 /**
  * Result returned by `listResources`.
@@ -179,166 +291,6 @@ export interface MCPServerWithResources extends MCPServer {
   readResource(uri: string): Promise<MCPReadResourceResult>;
 }
 
-export abstract class BaseMCPServerStdio implements MCPServer {
-  public cacheToolsList: boolean;
-  protected _cachedTools: any[] | undefined = undefined;
-  public toolFilter?: MCPToolFilterCallable | MCPToolFilterStatic;
-  public toolMetaResolver?: MCPToolMetaResolver;
-  public errorFunction?: MCPToolErrorFunction | null;
-
-  protected logger: Logger;
-  constructor(options: MCPServerStdioOptions) {
-    this.logger =
-      options.logger ?? getLogger(DEFAULT_STDIO_MCP_CLIENT_LOGGER_NAME);
-    this.cacheToolsList = options.cacheToolsList ?? false;
-    this.toolFilter = options.toolFilter;
-    this.toolMetaResolver = options.toolMetaResolver;
-    this.errorFunction = options.errorFunction;
-  }
-
-  abstract get name(): string;
-  abstract connect(): Promise<void>;
-  abstract close(): Promise<void>;
-  abstract listTools(): Promise<any[]>;
-  abstract callTool(
-    _toolName: string,
-    _args: Record<string, unknown> | null,
-    _meta?: Record<string, unknown> | null,
-  ): Promise<CallToolResultContent>;
-  abstract listResources(
-    _params?: MCPListResourcesParams,
-  ): Promise<MCPListResourcesResult>;
-  abstract listResourceTemplates(
-    _params?: MCPListResourcesParams,
-  ): Promise<MCPListResourceTemplatesResult>;
-  abstract readResource(_uri: string): Promise<MCPReadResourceResult>;
-  abstract invalidateToolsCache(): Promise<void>;
-
-  /**
-   * Logs a debug message when debug logging is enabled.
-   * @param buildMessage A function that returns the message to log.
-   */
-  protected debugLog(buildMessage: () => string): void {
-    if (debug.enabled(this.logger.namespace)) {
-      // only when this is true, the function to build the string is called
-      this.logger.debug(buildMessage());
-    }
-  }
-}
-
-export abstract class BaseMCPServerStreamableHttp implements MCPServer {
-  public cacheToolsList: boolean;
-  protected _cachedTools: any[] | undefined = undefined;
-  public toolFilter?: MCPToolFilterCallable | MCPToolFilterStatic;
-  public toolMetaResolver?: MCPToolMetaResolver;
-  public errorFunction?: MCPToolErrorFunction | null;
-
-  protected logger: Logger;
-  constructor(options: MCPServerStreamableHttpOptions) {
-    this.logger =
-      options.logger ??
-      getLogger(DEFAULT_STREAMABLE_HTTP_MCP_CLIENT_LOGGER_NAME);
-    this.cacheToolsList = options.cacheToolsList ?? false;
-    this.toolFilter = options.toolFilter;
-    this.toolMetaResolver = options.toolMetaResolver;
-    this.errorFunction = options.errorFunction;
-  }
-
-  abstract get name(): string;
-  abstract connect(): Promise<void>;
-  abstract close(): Promise<void>;
-  abstract listTools(): Promise<any[]>;
-  abstract callTool(
-    _toolName: string,
-    _args: Record<string, unknown> | null,
-    _meta?: Record<string, unknown> | null,
-  ): Promise<CallToolResultContent>;
-  abstract listResources(
-    _params?: MCPListResourcesParams,
-  ): Promise<MCPListResourcesResult>;
-  abstract listResourceTemplates(
-    _params?: MCPListResourcesParams,
-  ): Promise<MCPListResourceTemplatesResult>;
-  abstract readResource(_uri: string): Promise<MCPReadResourceResult>;
-  abstract get sessionId(): string | undefined;
-  abstract invalidateToolsCache(): Promise<void>;
-
-  /**
-   * Logs a debug message when debug logging is enabled.
-   * @param buildMessage A function that returns the message to log.
-   */
-  protected debugLog(buildMessage: () => string): void {
-    if (debug.enabled(this.logger.namespace)) {
-      // only when this is true, the function to build the string is called
-      this.logger.debug(buildMessage());
-    }
-  }
-}
-
-export abstract class BaseMCPServerSSE implements MCPServer {
-  public cacheToolsList: boolean;
-  protected _cachedTools: any[] | undefined = undefined;
-  public toolFilter?: MCPToolFilterCallable | MCPToolFilterStatic;
-  public toolMetaResolver?: MCPToolMetaResolver;
-  public errorFunction?: MCPToolErrorFunction | null;
-
-  protected logger: Logger;
-  constructor(options: MCPServerSSEOptions) {
-    this.logger =
-      options.logger ?? getLogger(DEFAULT_SSE_MCP_CLIENT_LOGGER_NAME);
-    this.cacheToolsList = options.cacheToolsList ?? false;
-    this.toolFilter = options.toolFilter;
-    this.toolMetaResolver = options.toolMetaResolver;
-    this.errorFunction = options.errorFunction;
-  }
-
-  abstract get name(): string;
-  abstract connect(): Promise<void>;
-  abstract close(): Promise<void>;
-  abstract listTools(): Promise<any[]>;
-  abstract callTool(
-    _toolName: string,
-    _args: Record<string, unknown> | null,
-    _meta?: Record<string, unknown> | null,
-  ): Promise<CallToolResultContent>;
-  abstract listResources(
-    _params?: MCPListResourcesParams,
-  ): Promise<MCPListResourcesResult>;
-  abstract listResourceTemplates(
-    _params?: MCPListResourcesParams,
-  ): Promise<MCPListResourceTemplatesResult>;
-  abstract readResource(_uri: string): Promise<MCPReadResourceResult>;
-  abstract invalidateToolsCache(): Promise<void>;
-
-  /**
-   * Logs a debug message when debug logging is enabled.
-   * @param buildMessage A function that returns the message to log.
-   */
-  protected debugLog(buildMessage: () => string): void {
-    if (debug.enabled(this.logger.namespace)) {
-      // only when this is true, the function to build the string is called
-      this.logger.debug(buildMessage());
-    }
-  }
-}
-
-/**
- * Minimum MCP tool data definition.
- * This type definition does not intend to cover all possible properties.
- * It supports the properties that are used in this SDK.
- */
-export const MCPTool = z.object({
-  name: z.string(),
-  description: z.string().optional(),
-  inputSchema: z.object({
-    type: z.literal('object'),
-    properties: z.record(z.string(), z.any()),
-    required: z.array(z.string()),
-    additionalProperties: z.boolean(),
-  }),
-});
-export type MCPTool = z.infer<typeof MCPTool>;
-
 /**
  * Public interface of an MCP server that provides tools.
  * You can use this class to pass MCP server settings to your agent.
@@ -348,6 +300,7 @@ export class MCPServerStdio
   implements MCPServerWithResources
 {
   private underlying: UnderlyingMCPServerStdio;
+  private readonly toolsLifecycle = new MCPToolsLifecycleGuard();
   constructor(options: MCPServerStdioOptions) {
     super(options);
     this.underlying = new UnderlyingMCPServerStdio(options);
@@ -355,28 +308,50 @@ export class MCPServerStdio
   get name(): string {
     return this.underlying.name;
   }
+  private async invalidateToolsCaches(): Promise<void> {
+    this._cachedTools = undefined;
+    await this.underlying.invalidateToolsCache();
+  }
   connect(): Promise<void> {
-    return this.underlying.connect();
+    return this.toolsLifecycle.runLifecycleOperation(
+      () => this.invalidateToolsCaches(),
+      () => this.underlying.connect(),
+    );
   }
   close(): Promise<void> {
-    return this.underlying.close();
+    return this.toolsLifecycle.runLifecycleOperation(
+      () => this.invalidateToolsCaches(),
+      () => this.underlying.close(),
+    );
   }
   async listTools(): Promise<MCPTool[]> {
+    const listingGeneration = this.toolsLifecycle.beginListing();
     if (this.cacheToolsList && this._cachedTools) {
-      return this._cachedTools;
+      return snapshotMcpTools(this._cachedTools);
     }
     const tools = await this.underlying.listTools();
+    this.toolsLifecycle.assertListingIsCurrent(listingGeneration);
     if (this.cacheToolsList) {
-      this._cachedTools = tools;
+      this._cachedTools = snapshotMcpTools(tools);
+      return snapshotMcpTools(this._cachedTools);
     }
-    return tools;
+    return snapshotMcpTools(tools);
   }
-  callTool(
+  async callTool(
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResultContent> {
-    return this.underlying.callTool(toolName, args, meta);
+    return (await this.callToolResult(toolName, args, meta, options)).content;
+  }
+  callToolResult(
+    toolName: string,
+    args: Record<string, unknown> | null,
+    meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
+  ): Promise<CallToolResult> {
+    return this.underlying.callToolResult(toolName, args, meta, options);
   }
   listResources(
     params?: MCPListResourcesParams,
@@ -392,7 +367,9 @@ export class MCPServerStdio
     return this.underlying.readResource(uri);
   }
   invalidateToolsCache(): Promise<void> {
-    return this.underlying.invalidateToolsCache();
+    return this.toolsLifecycle.runLifecycleOperation(() =>
+      this.invalidateToolsCaches(),
+    );
   }
 }
 
@@ -402,6 +379,7 @@ export class MCPServerStreamableHttp
 {
   private underlying: UnderlyingMCPServerStreamableHttp;
   private _cachedToolsSessionId: string | undefined = undefined;
+  private readonly toolsLifecycle = new MCPToolsLifecycleGuard();
   constructor(options: MCPServerStreamableHttpOptions) {
     super(options);
     this.underlying = new UnderlyingMCPServerStreamableHttp(options);
@@ -410,26 +388,36 @@ export class MCPServerStreamableHttp
     this._cachedTools = undefined;
     this._cachedToolsSessionId = undefined;
   }
+  private async invalidateToolsCaches(): Promise<void> {
+    this.clearLocalToolsCache();
+    await this.underlying.invalidateToolsCache();
+  }
   get name(): string {
     return this.underlying.name;
   }
   get sessionId(): string | undefined {
     return this.underlying.sessionId;
   }
-  async connect(): Promise<void> {
-    this.clearLocalToolsCache();
-    await this.underlying.connect();
+  connect(): Promise<void> {
+    return this.toolsLifecycle.runLifecycleOperation(
+      () => this.invalidateToolsCaches(),
+      () => this.underlying.connect(),
+    );
   }
-  async close(): Promise<void> {
-    this.clearLocalToolsCache();
-    await this.underlying.close();
+  close(): Promise<void> {
+    return this.toolsLifecycle.runLifecycleOperation(
+      () => this.invalidateToolsCaches(),
+      () => this.underlying.close(),
+    );
   }
   async listTools(): Promise<MCPTool[]> {
+    const listingGeneration = this.toolsLifecycle.beginListing();
     const sessionId = this.sessionId;
     if (sessionId === undefined) {
-      this.clearLocalToolsCache();
-      await this.underlying.invalidateToolsCache();
-      return this.underlying.listTools();
+      this.toolsLifecycle.invalidate();
+      await this.invalidateToolsCaches();
+      const tools = await this.underlying.listTools();
+      return snapshotMcpTools(tools);
     }
 
     if (
@@ -437,26 +425,43 @@ export class MCPServerStreamableHttp
       this._cachedTools &&
       this._cachedToolsSessionId === sessionId
     ) {
-      return this._cachedTools;
+      return snapshotMcpTools(this._cachedTools);
     }
     const tools = await this.underlying.listTools();
+    this.toolsLifecycle.assertListingIsCurrent(listingGeneration);
     if (this.cacheToolsList) {
-      this._cachedTools = tools;
+      this._cachedTools = snapshotMcpTools(tools);
       this._cachedToolsSessionId = sessionId;
+      return snapshotMcpTools(this._cachedTools);
     }
-    return tools;
+    return snapshotMcpTools(tools);
   }
   async callTool(
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResultContent> {
+    return (await this.callToolResult(toolName, args, meta, options)).content;
+  }
+  async callToolResult(
+    toolName: string,
+    args: Record<string, unknown> | null,
+    meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
+  ): Promise<CallToolResult> {
     const previousSessionId = this.sessionId;
     try {
-      return await this.underlying.callTool(toolName, args, meta);
+      return await this.underlying.callToolResult(
+        toolName,
+        args,
+        meta,
+        options,
+      );
     } finally {
       if (previousSessionId !== this.sessionId) {
-        this.clearLocalToolsCache();
+        this.toolsLifecycle.invalidate();
+        await this.invalidateToolsCaches();
       }
     }
   }
@@ -473,9 +478,10 @@ export class MCPServerStreamableHttp
   readResource(uri: string): Promise<MCPReadResourceResult> {
     return this.underlying.readResource(uri);
   }
-  async invalidateToolsCache(): Promise<void> {
-    this.clearLocalToolsCache();
-    await this.underlying.invalidateToolsCache();
+  invalidateToolsCache(): Promise<void> {
+    return this.toolsLifecycle.runLifecycleOperation(() =>
+      this.invalidateToolsCaches(),
+    );
   }
 }
 
@@ -484,6 +490,7 @@ export class MCPServerSSE
   implements MCPServerWithResources
 {
   private underlying: UnderlyingMCPServerSSE;
+  private readonly toolsLifecycle = new MCPToolsLifecycleGuard();
   constructor(options: MCPServerSSEOptions) {
     super(options);
     this.underlying = new UnderlyingMCPServerSSE(options);
@@ -491,28 +498,50 @@ export class MCPServerSSE
   get name(): string {
     return this.underlying.name;
   }
+  private async invalidateToolsCaches(): Promise<void> {
+    this._cachedTools = undefined;
+    await this.underlying.invalidateToolsCache();
+  }
   connect(): Promise<void> {
-    return this.underlying.connect();
+    return this.toolsLifecycle.runLifecycleOperation(
+      () => this.invalidateToolsCaches(),
+      () => this.underlying.connect(),
+    );
   }
   close(): Promise<void> {
-    return this.underlying.close();
+    return this.toolsLifecycle.runLifecycleOperation(
+      () => this.invalidateToolsCaches(),
+      () => this.underlying.close(),
+    );
   }
   async listTools(): Promise<MCPTool[]> {
+    const listingGeneration = this.toolsLifecycle.beginListing();
     if (this.cacheToolsList && this._cachedTools) {
-      return this._cachedTools;
+      return snapshotMcpTools(this._cachedTools);
     }
     const tools = await this.underlying.listTools();
+    this.toolsLifecycle.assertListingIsCurrent(listingGeneration);
     if (this.cacheToolsList) {
-      this._cachedTools = tools;
+      this._cachedTools = snapshotMcpTools(tools);
+      return snapshotMcpTools(this._cachedTools);
     }
-    return tools;
+    return snapshotMcpTools(tools);
   }
-  callTool(
+  async callTool(
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResultContent> {
-    return this.underlying.callTool(toolName, args, meta);
+    return (await this.callToolResult(toolName, args, meta, options)).content;
+  }
+  callToolResult(
+    toolName: string,
+    args: Record<string, unknown> | null,
+    meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
+  ): Promise<CallToolResult> {
+    return this.underlying.callToolResult(toolName, args, meta, options);
   }
   listResources(
     params?: MCPListResourcesParams,
@@ -528,7 +557,9 @@ export class MCPServerSSE
     return this.underlying.readResource(uri);
   }
   invalidateToolsCache(): Promise<void> {
-    return this.underlying.invalidateToolsCache();
+    return this.toolsLifecycle.runLifecycleOperation(() =>
+      this.invalidateToolsCaches(),
+    );
   }
 }
 
@@ -536,31 +567,6 @@ export class MCPServerSSE
  * Fetches and flattens all tools from multiple MCP servers.
  * Logs and skips any servers that fail to respond.
  */
-
-const _cachedTools: Record<string, MCPTool[]> = {};
-const _cachedToolKeysByServer: Record<string, Set<string>> = {};
-/**
- * Remove cached tools for the given server so the next lookup fetches fresh data.
- *
- * @param serverName - Name of the MCP server whose cache should be cleared.
- */
-export async function invalidateServerToolsCache(serverName: string) {
-  const cachedKeys = _cachedToolKeysByServer[serverName];
-  if (cachedKeys) {
-    for (const cacheKey of cachedKeys) {
-      delete _cachedTools[cacheKey];
-    }
-    delete _cachedToolKeysByServer[serverName];
-    return;
-  }
-
-  delete _cachedTools[serverName];
-  for (const cacheKey of Object.keys(_cachedTools)) {
-    if (cacheKey.startsWith(`${serverName}:`)) {
-      delete _cachedTools[cacheKey];
-    }
-  }
-}
 
 /**
  * Function signature for generating the MCP tool cache key.
@@ -586,6 +592,12 @@ export const defaultMCPToolCacheKey: MCPToolCacheKeyGenerator = ({
   return server.name;
 };
 
+function logMcpToolFilterDebug(buildMessage: () => string): void {
+  if (!globalLogger.dontLogToolData) {
+    globalLogger.debug(buildMessage());
+  }
+}
+
 /**
  * Fetches and filters raw MCP tools from a single MCP server.
  */
@@ -594,26 +606,30 @@ async function getMcpToolsFromServer<TContext = UnknownContext>({
   runContext,
   agent,
   generateMCPToolCacheKey,
+  tracingParent,
 }: {
   server: MCPServer;
   runContext?: RunContext<TContext>;
   agent?: Agent<any, any>;
   generateMCPToolCacheKey?: MCPToolCacheKeyGenerator;
+  tracingParent?: Span<any>;
 }): Promise<MCPTool[]> {
   const cacheKey = (generateMCPToolCacheKey || defaultMCPToolCacheKey)({
     server,
     agent,
     runContext,
   });
+  const serverName = server.name;
   // Use cache key generator injected from the outside, or the default if absent.
   if (server.cacheToolsList && _cachedTools[cacheKey]) {
-    return _cachedTools[cacheKey];
+    return snapshotMcpTools(_cachedTools[cacheKey]);
   }
+  const cacheListing = beginServerToolsCacheListing(serverName);
 
   const listToolsForServer = async (
     span?: Span<MCPListToolsSpanData>,
   ): Promise<MCPTool[]> => {
-    const fetchedMcpTools = await server.listTools();
+    const fetchedMcpTools = snapshotMcpTools(await server.listTools());
     let mcpTools: MCPTool[] = fetchedMcpTools;
 
     if (runContext && agent) {
@@ -623,10 +639,12 @@ async function getMcpToolsFromServer<TContext = UnknownContext>({
         const filter = server.toolFilter;
         if (filter) {
           if (typeof filter === 'function') {
-            const filtered = await filter(context, tool);
+            const [detachedTool] = snapshotMcpTools([tool]);
+            const filtered = await filter(context, detachedTool);
             if (!filtered) {
-              globalLogger.debug(
-                `MCP Tool (server: ${server.name}, tool: ${tool.name}) is blocked by the callable filter.`,
+              logMcpToolFilterDebug(
+                () =>
+                  `MCP Tool (server: ${getMcpServerExternalName(server.name)}, tool: ${tool.name}) is blocked by the callable filter.`,
               );
               continue;
             }
@@ -644,12 +662,14 @@ async function getMcpToolsFromServer<TContext = UnknownContext>({
                   : false;
               if (!allowed || blocked) {
                 if (blocked) {
-                  globalLogger.debug(
-                    `MCP Tool (server: ${server.name}, tool: ${tool.name}) is blocked by the static filter.`,
+                  logMcpToolFilterDebug(
+                    () =>
+                      `MCP Tool (server: ${getMcpServerExternalName(server.name)}, tool: ${tool.name}) is blocked by the static filter.`,
                   );
                 } else if (!allowed) {
-                  globalLogger.debug(
-                    `MCP Tool (server: ${server.name}, tool: ${tool.name}) is not allowed by the static filter.`,
+                  logMcpToolFilterDebug(
+                    () =>
+                      `MCP Tool (server: ${getMcpServerExternalName(server.name)}, tool: ${tool.name}) is not allowed by the static filter.`,
                   );
                 }
                 continue;
@@ -666,23 +686,31 @@ async function getMcpToolsFromServer<TContext = UnknownContext>({
       span.spanData.result = mcpTools.map((t) => t.name);
     }
     // Cache store
-    if (server.cacheToolsList) {
-      _cachedTools[cacheKey] = mcpTools;
-      if (!_cachedToolKeysByServer[server.name]) {
-        _cachedToolKeysByServer[server.name] = new Set();
+    if (server.cacheToolsList && cacheListing.isCurrent()) {
+      _cachedTools[cacheKey] = snapshotMcpTools(mcpTools);
+      if (!_cachedToolKeysByServer[serverName]) {
+        _cachedToolKeysByServer[serverName] = new Set();
       }
-      _cachedToolKeysByServer[server.name].add(cacheKey);
+      _cachedToolKeysByServer[serverName].add(cacheKey);
     }
-    return mcpTools;
+    return snapshotMcpTools(mcpTools);
   };
 
-  if (!getCurrentTrace()) {
-    return listToolsForServer();
-  }
+  try {
+    if (!tracingParent && !getCurrentTrace()) {
+      return await listToolsForServer();
+    }
 
-  return withMCPListToolsSpan(listToolsForServer, {
-    data: { server: server.name },
-  });
+    return await withMCPListToolsSpan(
+      listToolsForServer,
+      {
+        data: { server: getMcpServerExternalName(server.name) },
+      },
+      tracingParent,
+    );
+  } finally {
+    cacheListing.release();
+  }
 }
 
 function convertMcpToolsToFunctionTools<TContext = UnknownContext>({
@@ -716,6 +744,7 @@ async function getFunctionToolsFromServer<TContext = UnknownContext>({
   agent,
   generateMCPToolCacheKey,
   errorFunction,
+  tracingParent,
 }: {
   server: MCPServer;
   convertSchemasToStrict: boolean;
@@ -723,12 +752,14 @@ async function getFunctionToolsFromServer<TContext = UnknownContext>({
   agent?: Agent<any, any>;
   generateMCPToolCacheKey?: MCPToolCacheKeyGenerator;
   errorFunction?: MCPToolErrorFunction | null;
+  tracingParent?: Span<any>;
 }): Promise<FunctionTool<TContext, any, unknown>[]> {
   const mcpTools = await getMcpToolsFromServer({
     server,
     runContext,
     agent,
     generateMCPToolCacheKey,
+    tracingParent,
   });
   return convertMcpToolsToFunctionTools({
     mcpTools,
@@ -750,6 +781,7 @@ export type GetAllMcpToolsOptions<TContext> = {
   errorFunction?: MCPToolErrorFunction | null;
   includeServerInToolNames?: boolean;
   reservedToolNames?: Set<string>;
+  tracingParent?: Span<any>;
 };
 
 /**
@@ -780,6 +812,7 @@ export async function getAllMcpTools<TContext = UnknownContext>(
     errorFunction,
     includeServerInToolNames = false,
     reservedToolNames,
+    tracingParent,
   } = opts;
   const allTools: Tool<TContext>[] = [];
   const toolNames = new Set<string>();
@@ -794,6 +827,7 @@ export async function getAllMcpTools<TContext = UnknownContext>(
           runContext: runContextFromOpts,
           agent: agentFromOpts,
           generateMCPToolCacheKey,
+          tracingParent,
         }),
       })),
     );
@@ -837,6 +871,7 @@ export async function getAllMcpTools<TContext = UnknownContext>(
       agent: agentFromOpts,
       generateMCPToolCacheKey,
       errorFunction,
+      tracingParent,
     });
     const serverToolNames = new Set(serverTools.map((t) => t.name));
     const intersection = [...serverToolNames]
@@ -1006,17 +1041,30 @@ function buildPrefixedToolNameOverrides(
 ): Map<string, string> {
   const baseNameCounts = new Map<string, number>();
   for (const { server, mcpTools } of serverToolBatches) {
+    const serverName = getMcpServerExternalName(server.name);
     for (const mcpTool of mcpTools) {
-      const baseName = buildPrefixedToolBaseName(server.name, mcpTool.name);
+      const baseName = buildPrefixedToolBaseName(serverName, mcpTool.name);
       baseNameCounts.set(baseName, (baseNameCounts.get(baseName) ?? 0) + 1);
     }
   }
 
   const candidates: PrefixedToolNameCandidate[] = [];
+  const rawServerNamesBySeed = new Map<string, string>();
   for (const { server, serverIndex, mcpTools } of serverToolBatches) {
+    const serverName = getMcpServerExternalName(server.name);
     mcpTools.forEach((mcpTool, toolIndex) => {
-      const baseName = buildPrefixedToolBaseName(server.name, mcpTool.name);
-      const seed = `${server.name}\0${mcpTool.name}`;
+      const baseName = buildPrefixedToolBaseName(serverName, mcpTool.name);
+      const seed = `${serverName}\0${mcpTool.name}`;
+      const previousRawServerName = rawServerNamesBySeed.get(seed);
+      if (
+        previousRawServerName !== undefined &&
+        previousRawServerName !== server.name
+      ) {
+        throw new UserError(
+          `MCP server names are indistinguishable after URL redaction for tool '${mcpTool.name}': '${serverName}'. Configure unique safe server names when includeServerInToolNames is enabled.`,
+        );
+      }
+      rawServerNamesBySeed.set(seed, server.name);
       const forceHash =
         (baseNameCounts.get(baseName) ?? 0) > 1 || reservedNames.has(baseName);
       candidates.push({
@@ -1103,6 +1151,10 @@ export function mcpToFunctionTool(
   options: MCPFunctionToolConversionOptions = {},
 ) {
   const toolName = options.toolNameOverride ?? mcpTool.name;
+  const customDataByCall = new WeakMap<
+    RunContext<any>,
+    Map<string, MCPToolCustomDataContext<any>>
+  >();
   const serverErrorFunction = server.errorFunction;
   const mcpErrorFunction =
     serverErrorFunction !== undefined
@@ -1113,38 +1165,100 @@ export function mcpToFunctionTool(
       ? (context: RunContext, error: Error | unknown) =>
           mcpErrorFunction({ context, error })
       : mcpErrorFunction;
-  async function invoke(input: any, runContext?: RunContext<any>) {
+  async function invoke(
+    input: any,
+    runContext?: RunContext<any>,
+    details?: ToolCallDetails,
+  ) {
     let args = {};
     if (typeof input === 'string' && input) {
       args = JSON.parse(input);
     } else if (typeof input === 'object' && input != null) {
       args = input;
     }
-    const currentSpan = getCurrentSpan();
+    const currentSpan =
+      getToolCallParentSpanFromDetails(details) ?? getCurrentSpan();
     if (currentSpan) {
-      currentSpan.spanData['mcp_data'] = { server: server.name };
+      currentSpan.spanData['mcp_data'] = {
+        server: getMcpServerExternalName(server.name),
+      };
     }
     const meta = runContext
       ? await resolveMcpToolMeta(server, runContext, mcpTool.name, args)
       : undefined;
-    const content =
-      meta === undefined
-        ? await server.callTool(mcpTool.name, args)
-        : await server.callTool(mcpTool.name, args, meta);
-    return content.length === 1 ? content[0] : content;
+    const callOptions = details?.signal
+      ? { signal: details.signal }
+      : undefined;
+    const useFullResult =
+      (server.useStructuredContent === true ||
+        server.customDataExtractor !== undefined) &&
+      server.callToolResult !== undefined;
+    let result: CallToolResult;
+    if (useFullResult) {
+      result = callOptions
+        ? await server.callToolResult!(mcpTool.name, args, meta, callOptions)
+        : meta === undefined
+          ? await server.callToolResult!(mcpTool.name, args)
+          : await server.callToolResult!(mcpTool.name, args, meta);
+    } else {
+      result = {
+        content: callOptions
+          ? await server.callTool(mcpTool.name, args, meta, callOptions)
+          : meta === undefined
+            ? await server.callTool(mcpTool.name, args)
+            : await server.callTool(mcpTool.name, args, meta),
+      };
+    }
+    const content = result.content as CallToolResultContent;
+    const resultMeta = result._meta ?? content._meta;
+    const structuredContent =
+      result.structuredContent ?? content.structuredContent;
+    const isError = result.isError ?? content.isError;
+    const toolOutput =
+      server.useStructuredContent === true &&
+      isError !== true &&
+      structuredContent !== undefined
+        ? JSON.stringify(structuredContent)
+        : content.length === 1
+          ? content[0]
+          : content;
+    if (runContext && details?.toolCall?.callId && server.customDataExtractor) {
+      let byCall = customDataByCall.get(runContext);
+      if (!byCall) {
+        byCall = new Map();
+        customDataByCall.set(runContext, byCall);
+      }
+      byCall.set(details.toolCall.callId, {
+        runContext,
+        serverName: server.name,
+        toolName: mcpTool.name,
+        toolDisplayName: toolName,
+        arguments: cloneMcpCustomDataContextValue(args),
+        resultMeta: cloneMcpCustomDataContextValue(resultMeta),
+        structuredContent: cloneMcpCustomDataContextValue(structuredContent),
+        isError,
+        toolOutput: cloneMcpCustomDataContextValue(toolOutput),
+      });
+    }
+    return toolOutput;
   }
 
-  const schema: JsonObjectSchema<any> = {
-    ...mcpTool.inputSchema,
-    type: mcpTool.inputSchema?.type ?? 'object',
-    properties: mcpTool.inputSchema?.properties ?? {},
-    required: mcpTool.inputSchema?.required ?? [],
-    additionalProperties: mcpTool.inputSchema?.additionalProperties ?? false,
-  };
+  const inputSchema = mcpTool.inputSchema ?? {};
+  const inputSchemaIsEmpty = Object.keys(inputSchema).length === 0;
+  const schema = {
+    ...inputSchema,
+    type: inputSchema.type ?? 'object',
+    properties: inputSchema.properties ?? {},
+    required: inputSchema.required ?? [],
+  } as JsonObjectSchema<any>;
+  const strictSchema = (
+    inputSchemaIsEmpty ? { ...schema, additionalProperties: false } : schema
+  ) as JsonObjectSchemaStrict<any>;
+  let preserveSchemaOnFallback = false;
 
   if (convertSchemasToStrict || schema.additionalProperties === true) {
     try {
-      const strictSchema = ensureStrictJsonSchema(schema);
+      assertOpenAIStrictToolSchemaPreservesOpenObjects(strictSchema);
       return tool({
         name: toolName,
         description: mcpTool.description || '',
@@ -1152,16 +1266,40 @@ export function mcpToFunctionTool(
         strict: true,
         execute: invoke,
         errorFunction,
+        customDataExtractor: async (context) => {
+          const mcpContext = getMcpCustomDataContext(
+            customDataByCall,
+            context.runContext,
+            context.toolCall.callId,
+          );
+          return mcpContext
+            ? maybeExtractToolOutputCustomData(
+                server.customDataExtractor,
+                mcpContext,
+              )
+            : undefined;
+        },
       });
     } catch (e) {
-      globalLogger.warn(`Error converting MCP schema to strict mode: ${e}`);
+      if (convertSchemasToStrict && isJsonSchemaDepthError(e)) {
+        throw e;
+      }
+      preserveSchemaOnFallback = true;
+      logToolActionWarning(
+        globalLogger,
+        'Error converting MCP schema to strict mode:',
+        e,
+      );
     }
   }
 
   const nonStrictSchema: JsonObjectSchemaNonStrict<any> = {
     ...schema,
-    additionalProperties: true,
-  };
+    additionalProperties:
+      preserveSchemaOnFallback && 'additionalProperties' in schema
+        ? schema.additionalProperties
+        : true,
+  } as JsonObjectSchemaNonStrict<any>;
   return tool({
     name: toolName,
     description: mcpTool.description || '',
@@ -1169,21 +1307,42 @@ export function mcpToFunctionTool(
     strict: false,
     execute: invoke,
     errorFunction,
+    customDataExtractor: async (context) => {
+      const mcpContext = getMcpCustomDataContext(
+        customDataByCall,
+        context.runContext,
+        context.toolCall.callId,
+      );
+      return mcpContext
+        ? maybeExtractToolOutputCustomData(
+            server.customDataExtractor,
+            mcpContext,
+          )
+        : undefined;
+    },
   });
 }
 
-/**
- * Ensures the given JSON schema is strict (no additional properties, required fields set).
- */
-function ensureStrictJsonSchema(
-  schema: JsonObjectSchemaNonStrict<any> | JsonObjectSchemaStrict<any>,
-): JsonObjectSchemaStrict<any> {
-  const out: JsonObjectSchemaStrict<any> = {
-    ...schema,
-    additionalProperties: false,
-  };
-  if (!out.required) out.required = [];
-  return out;
+function getMcpCustomDataContext(
+  contexts: WeakMap<
+    RunContext<any>,
+    Map<string, MCPToolCustomDataContext<any>>
+  >,
+  runContext: RunContext<any>,
+  callId: string,
+): MCPToolCustomDataContext<any> | undefined {
+  const byCall = contexts.get(runContext);
+  const context = byCall?.get(callId);
+  byCall?.delete(callId);
+  return context;
+}
+
+function cloneMcpCustomDataContextValue<T>(value: T): T {
+  try {
+    return structuredClone(value);
+  } catch {
+    return value;
+  }
 }
 
 /**
@@ -1208,6 +1367,14 @@ export interface BaseMCPServerStdioOptions {
    */
   toolMetaResolver?: MCPToolMetaResolver;
   /**
+   * Whether to use MCP `structuredContent` as model-visible output when available.
+   */
+  useStructuredContent?: boolean;
+  /**
+   * Optional callback that attaches SDK-only custom data to local MCP tool output items.
+   */
+  customDataExtractor?: MCPToolCustomDataExtractor;
+  /**
    * Optional function to convert MCP tool failures into model-visible messages.
    * Set to null to rethrow errors instead of converting them.
    */
@@ -1222,8 +1389,7 @@ export interface FullCommandMCPServerStdioOptions extends BaseMCPServerStdioOpti
   fullCommand: string;
 }
 export type MCPServerStdioOptions =
-  | DefaultMCPServerStdioOptions
-  | FullCommandMCPServerStdioOptions;
+  DefaultMCPServerStdioOptions | FullCommandMCPServerStdioOptions;
 
 export interface MCPServerStreamableHttpOptions {
   url: string;
@@ -1238,6 +1404,14 @@ export interface MCPServerStreamableHttpOptions {
    */
   toolMetaResolver?: MCPToolMetaResolver;
   /**
+   * Whether to use MCP `structuredContent` as model-visible output when available.
+   */
+  useStructuredContent?: boolean;
+  /**
+   * Optional callback that attaches SDK-only custom data to local MCP tool output items.
+   */
+  customDataExtractor?: MCPToolCustomDataExtractor;
+  /**
    * Optional function to convert MCP tool failures into model-visible messages.
    * Set to null to rethrow errors instead of converting them.
    */
@@ -1246,14 +1420,14 @@ export interface MCPServerStreamableHttpOptions {
 
   // ----------------------------------------------------
   // OAuth
-  // import { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
+  // import { OAuthClientProvider } from '@modelcontextprotocol/client';
   authProvider?: any;
   // RequestInit
   requestInit?: any;
   // Custom fetch implementation used for all network requests.
-  // import { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
+  // import { FetchLike } from '@modelcontextprotocol/client';
   fetch?: any;
-  // import { StreamableHTTPReconnectionOptions } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+  // import { StreamableHTTPReconnectionOptions } from '@modelcontextprotocol/client';
   reconnectionOptions?: any;
   sessionId?: string;
   // ----------------------------------------------------
@@ -1272,6 +1446,14 @@ export interface MCPServerSSEOptions {
    */
   toolMetaResolver?: MCPToolMetaResolver;
   /**
+   * Whether to use MCP `structuredContent` as model-visible output when available.
+   */
+  useStructuredContent?: boolean;
+  /**
+   * Optional callback that attaches SDK-only custom data to local MCP tool output items.
+   */
+  customDataExtractor?: MCPToolCustomDataExtractor;
+  /**
    * Optional function to convert MCP tool failures into model-visible messages.
    * Set to null to rethrow errors instead of converting them.
    */
@@ -1280,14 +1462,14 @@ export interface MCPServerSSEOptions {
 
   // ----------------------------------------------------
   // OAuth
-  // import { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
+  // import { OAuthClientProvider } from '@modelcontextprotocol/client';
   authProvider?: any;
   // RequestInit
   requestInit?: any;
   // Custom fetch implementation used for all network requests.
-  // import { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
+  // import { FetchLike } from '@modelcontextprotocol/client';
   fetch?: any;
-  // import { SSEReconnectionOptions } from '@modelcontextprotocol/sdk/client/sse.js';
+  // import { SSEClientTransportOptions } from '@modelcontextprotocol/client';
   eventSourceInit?: any;
   // ----------------------------------------------------
 }
@@ -1323,11 +1505,19 @@ export interface JsonRpcResponse {
 
 export interface CallToolResponse extends JsonRpcResponse {
   result: {
-    content: { type: string; text: string }[];
+    content: Array<{ type: string; [key: string]: unknown }>;
+    _meta?: Record<string, unknown>;
+    structuredContent?: Record<string, unknown>;
+    isError?: boolean;
   };
 }
 export type CallToolResult = CallToolResponse['result'];
-export type CallToolResultContent = CallToolResult['content'];
+export type CallToolResultMetadata = Pick<
+  CallToolResult,
+  '_meta' | 'structuredContent' | 'isError'
+>;
+export type CallToolResultContent = CallToolResult['content'] &
+  CallToolResultMetadata;
 
 export interface InitializeResponse extends JsonRpcResponse {
   result: {
