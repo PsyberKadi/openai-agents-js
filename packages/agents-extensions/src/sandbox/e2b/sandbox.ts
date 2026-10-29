@@ -33,6 +33,7 @@ import {
   assertSandboxManifestMetadataSupported,
   SANDBOX_MANIFEST_METADATA_SUPPORT,
   closeRemoteSessionOnManifestError,
+  resolveCreateArchiveLimits,
   decodeNativeSnapshotRef,
   encodeNativeSnapshotRef,
   materializeEnvironment,
@@ -42,7 +43,7 @@ import {
   shellQuote,
   shellCommandForPty,
   serializeRemoteSandboxSessionState,
-  watchPtyProcess,
+  watchPtyOutput,
   isRecord,
   readOptionalBoolean,
   readOptionalNumber,
@@ -313,7 +314,7 @@ export class E2BSandboxSession extends RemoteSandboxSessionBase<E2BSandboxSessio
         requestTimeoutMs: this.state.requestTimeoutMs,
       });
     };
-    watchPtyProcess(
+    watchPtyOutput(
       entry,
       async () => (handle.wait ? await handle.wait() : undefined),
       (result, error) =>
@@ -882,6 +883,11 @@ export class E2BSandboxClient implements SandboxClient<
     manifestOptions?: E2BSandboxClientOptions,
   ): Promise<E2BSandboxSession> {
     const createArgs = normalizeSandboxClientCreateArgs(args, manifestOptions);
+    const archiveLimits = resolveCreateArchiveLimits(
+      createArgs.archiveLimits,
+      createArgs.options?.archiveLimits,
+      this.options.archiveLimits,
+    );
     assertCoreSnapshotUnsupported('E2BSandboxClient', createArgs.snapshot);
     const manifest = createArgs.manifest;
     return await withSandboxSpan(
@@ -917,7 +923,7 @@ export class E2BSandboxClient implements SandboxClient<
         const session = new E2BSandboxSession({
           sandbox,
           concurrencyLimits: createArgs.concurrencyLimits,
-          archiveLimits: createArgs.archiveLimits,
+          archiveLimits,
           state: {
             manifest,
             sandboxId: sandbox.sandboxId,

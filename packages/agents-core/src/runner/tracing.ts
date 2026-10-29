@@ -47,10 +47,10 @@ export type RunnerSpanLifecycle<TSpanData extends TaskSpanData | TurnSpanData> =
   };
 
 function sumUsageDetail(usage: Usage, key: string): number {
-  return usage.inputTokensDetails.reduce(
-    (total, details) => total + (details[key] ?? 0),
-    0,
-  );
+  return usage.inputTokensDetails.reduce((total, details) => {
+    const value = details[key];
+    return total + (typeof value === 'number' ? value : 0);
+  }, 0);
 }
 
 function snapshotUsage(usage: Usage): UsageSnapshot {
@@ -250,7 +250,7 @@ export function getRunnerSpanErrorDetails(
   if (traceIncludeSensitiveData) {
     return String(error);
   }
-  return error instanceof Error ? error.name : 'Error';
+  return 'Error';
 }
 
 /**

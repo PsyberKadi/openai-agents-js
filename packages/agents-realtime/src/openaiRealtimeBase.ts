@@ -1,4 +1,4 @@
-import { RuntimeEventEmitter, Usage } from '@openai/agents-core';
+import { RuntimeEventEmitter, UserError, Usage } from '@openai/agents-core';
 import { normalizeHostedMcpRequireApproval } from '@openai/agents-core/utils';
 import {
   logModelActionError,
@@ -128,7 +128,7 @@ function normalizeRealtimeMessageContent(
   role: string | undefined,
   content: unknown,
 ): unknown {
-  if (role !== 'assistant' || !Array.isArray(content)) {
+  if (!Array.isArray(content)) {
     return content;
   }
   return content.map((part) => {
@@ -136,12 +136,21 @@ function normalizeRealtimeMessageContent(
       part &&
       typeof part === 'object' &&
       'type' in part &&
+      role === 'assistant' &&
       part.type === 'audio'
     ) {
       return {
         ...part,
         type: 'output_audio',
       };
+    }
+    if (
+      role === 'user' &&
+      part &&
+      typeof part === 'object' &&
+      part.type === 'input_audio'
+    ) {
+      return { ...part, transcript: part.transcript ?? null };
     }
     return part;
   });
@@ -155,6 +164,12 @@ function cloneRealtimeEvent<T>(event: T): T {
   return JSON.parse(JSON.stringify(event)) as T;
 }
 
+/**
+ * Sentinel accepted by `conversation.item.create` that places the item at the
+ * beginning of the conversation. Omitting `previous_item_id` appends instead.
+ */
+const CONVERSATION_ROOT = 'root';
+
 export abstract class OpenAIRealtimeBase
   extends EventEmitterDelegate<OpenAIRealtimeEventTypes>
   implements RealtimeTransportLayer
@@ -163,6 +178,13 @@ export abstract class OpenAIRealtimeBase
   #apiKey: ApiKey | undefined;
   #tracingConfig: RealtimeTracingConfig | null = null;
   #rawSessionConfig: Record<string, any> | null = null;
+  // Requests stay in wire order so placement can project both removals and
+  // recreations while the session still exposes server-confirmed history.
+  #pendingHistoryRequests = new Map<
+    string,
+    { itemId: string; kind: 'create' | 'delete' }
+  >();
+  #historyRequestSeq = 0;
 
   protected eventEmitter: RuntimeEventEmitter<OpenAIRealtimeEventTypes> =
     new RuntimeEventEmitter<OpenAIRealtimeEventTypes>();
@@ -229,19 +251,26 @@ export abstract class OpenAIRealtimeBase
 
   protected _onMessage(event: MessageEvent | WebSocketMessageEvent): void {
     const result = parseRealtimeEvent(event);
-    if (result.data === null) {
-      return;
-    }
-    const { data: parsed, raw, isGeneric } = result;
-
+    const { data: parsed, raw } = result;
+    if (raw === null) return;
     this.emit('*', cloneRealtimeEvent(raw));
-    if (isGeneric) {
-      return;
+    if (parsed === null) return;
+
+    if (parsed.type === 'conversation.item.added' && parsed.item.id) {
+      this.#settleHistoryRequest(parsed.item.id, 'create');
     }
 
     if (parsed.type === 'error') {
+      // The Realtime API reports the offending client event under `error.event_id`.
+      const causedBy = (parsed.error as { event_id?: unknown } | undefined)
+        ?.event_id;
+      if (typeof causedBy === 'string') {
+        this.#pendingHistoryRequests.delete(causedBy);
+      }
       this.emit('error', { type: 'error', error: parsed });
-    } else {
+    } else if (parsed.type.includes('.')) {
+      // Wire notifications use dotted names. Undotted names belong to SDK
+      // action/lifecycle channels; unknown ones remain observable through '*'.
       this.emit(parsed.type, parsed);
     }
 
@@ -308,6 +337,7 @@ export abstract class OpenAIRealtimeBase
     }
 
     if (parsed.type === 'conversation.item.deleted') {
+      this.#settleHistoryRequest(parsed.item_id, 'delete');
       this.emit('item_deleted', {
         itemId: parsed.item_id,
       });
@@ -363,7 +393,14 @@ export abstract class OpenAIRealtimeBase
         parsed.type === 'conversation.item.done'
       ) {
         const serverLabel = parsed.item.server_label ?? '';
-        const tools = (parsed.item.tools ?? []) as any[];
+        const tools = parsed.item.tools ?? [];
+        if (
+          typeof serverLabel !== 'string' ||
+          !Array.isArray(tools) ||
+          tools.some((tool) => !tool || typeof tool.name !== 'string')
+        ) {
+          return;
+        }
         try {
           this.emit('mcp_tools_listed', {
             serverLabel,
@@ -381,12 +418,16 @@ export abstract class OpenAIRealtimeBase
         return;
       }
       if (parsed.item.type === 'message') {
+        // `null` here is the server saying the item has nothing before it, which
+        // is what decides where local history puts it. An event that does not
+        // carry the field says nothing about placement, so it stays undefined
+        // rather than claiming the front.
         const previousItemId =
           parsed.type === 'conversation.item.added' ||
           parsed.type === 'conversation.item.done'
             ? parsed.previous_item_id
-            : null;
-        const item = realtimeMessageItemSchema.parse({
+            : undefined;
+        const item = realtimeMessageItemSchema.safeParse({
           itemId: parsed.item.id,
           previousItemId,
           type: parsed.item.type,
@@ -401,7 +442,9 @@ export abstract class OpenAIRealtimeBase
               ? 'in_progress'
               : 'completed'),
         });
-        this.emit('item_update', item);
+        if (item.success) {
+          this.emit('item_update', item.data);
+        }
         return;
       }
 
@@ -410,16 +453,26 @@ export abstract class OpenAIRealtimeBase
         parsed.type === 'conversation.item.done'
       ) {
         const item = parsed.item;
-        const mcpApprovalRequest = realtimeMcpCallApprovalRequestItem.parse({
-          itemId: item.id,
-          type: item.type,
-          serverLabel: item.server_label,
-          name: item.name,
-          arguments: JSON.parse(item.arguments || '{}'),
-          approved: item.approved,
-        });
-        this.emit('item_update', mcpApprovalRequest);
-        this.emit('mcp_approval_request', mcpApprovalRequest);
+        if (
+          item.arguments !== undefined &&
+          typeof item.arguments !== 'string'
+        ) {
+          return;
+        }
+        const mcpApprovalRequest = realtimeMcpCallApprovalRequestItem.safeParse(
+          {
+            itemId: item.id,
+            type: item.type,
+            serverLabel: item.server_label,
+            name: item.name,
+            arguments: JSON.parse(item.arguments || '{}'),
+            approved: item.approved,
+          },
+        );
+        if (mcpApprovalRequest.success) {
+          this.emit('item_update', mcpApprovalRequest.data);
+          this.emit('mcp_approval_request', mcpApprovalRequest.data);
+        }
         return;
       }
 
@@ -431,18 +484,21 @@ export abstract class OpenAIRealtimeBase
           parsed.type === 'conversation.item.done'
             ? 'completed'
             : 'in_progress';
-        const mcpCall = realtimeMcpCallItem.parse({
+        const mcpCall = realtimeMcpCallItem.safeParse({
           itemId: parsed.item.id,
           type: parsed.item.type,
           status,
           arguments: parsed.item.arguments,
           name: parsed.item.name,
-          output: parsed.item.output,
+          output: parsed.item.output ?? null,
         });
 
-        this.emit('item_update', mcpCall);
+        if (!mcpCall.success) {
+          return;
+        }
+        this.emit('item_update', mcpCall.data);
         if (parsed.type === 'conversation.item.done') {
-          this.emit('mcp_tool_call_completed', mcpCall);
+          this.emit('mcp_tool_call_completed', mcpCall.data);
         }
         return;
       }
@@ -473,7 +529,7 @@ export abstract class OpenAIRealtimeBase
     ) {
       const item = parsed.item;
       if (item.type === 'function_call' && item.status === 'completed') {
-        const toolCall = realtimeToolCallItem.parse({
+        const toolCall = realtimeToolCallItem.safeParse({
           itemId: item.id,
           type: item.type,
           status: 'in_progress', // we set it to in_progress for the UI as it will only be completed with the output
@@ -481,7 +537,13 @@ export abstract class OpenAIRealtimeBase
           name: item.name,
           output: null,
         });
-        this.emit('item_update', toolCall);
+        if (
+          !toolCall.success ||
+          (item.call_id !== undefined && typeof item.call_id !== 'string')
+        ) {
+          return;
+        }
+        this.emit('item_update', toolCall.data);
         this.emit('function_call', {
           id: item.id,
           type: 'function_call',
@@ -494,7 +556,7 @@ export abstract class OpenAIRealtimeBase
       }
 
       if (item.type === 'mcp_tool_call' || item.type === 'mcp_call') {
-        const mcpCall = realtimeMcpCallItem.parse({
+        const mcpCall = realtimeMcpCallItem.safeParse({
           itemId: item.id,
           type: item.type,
           status:
@@ -503,27 +565,29 @@ export abstract class OpenAIRealtimeBase
               : 'in_progress', // we set it to in_progress for the UI as it will only be completed with the output
           arguments: item.arguments,
           name: item.name,
-          output: item.output,
+          output: item.output ?? null,
         });
-        this.emit('item_update', mcpCall);
+        if (!mcpCall.success) {
+          return;
+        }
+        this.emit('item_update', mcpCall.data);
         return;
       }
 
       if (item.type === 'message') {
-        const realtimeItem = realtimeMessageItemSchema.parse({
-          itemId: parsed.item.id,
-          type: parsed.item.type,
-          role: parsed.item.role,
-          content: normalizeRealtimeMessageContent(
-            parsed.item.role,
-            parsed.item.content,
-          ),
+        const realtimeItem = realtimeMessageItemSchema.safeParse({
+          itemId: item.id,
+          type: item.type,
+          role: item.role,
+          content: normalizeRealtimeMessageContent(item.role, item.content),
           status:
             parsed.type === 'response.output_item.done'
               ? (item.status ?? 'completed')
               : (item.status ?? 'in_progress'),
         });
-        this.emit('item_update', realtimeItem);
+        if (realtimeItem.success) {
+          this.emit('item_update', realtimeItem.data);
+        }
         return;
       }
     }
@@ -540,7 +604,35 @@ export abstract class OpenAIRealtimeBase
     this.emit('connected');
   }
 
+  // Successful replies identify the item, so retire its oldest matching request.
+  // `done` finalizes content and must not settle another create of the same ID.
+  #settleHistoryRequest(itemId: string, kind: 'create' | 'delete'): void {
+    for (const [eventId, request] of this.#pendingHistoryRequests) {
+      if (request.itemId === itemId && request.kind === kind) {
+        this.#pendingHistoryRequests.delete(eventId);
+        return;
+      }
+    }
+  }
+
+  #sendHistoryRequest(
+    itemId: string,
+    kind: 'create' | 'delete',
+    event: RealtimeClientMessage,
+  ): void {
+    const eventId = `agents_${kind}_${++this.#historyRequestSeq}`;
+    this.#pendingHistoryRequests.set(eventId, { itemId, kind });
+    try {
+      this.sendEvent({ ...event, event_id: eventId });
+    } catch (error) {
+      this.#pendingHistoryRequests.delete(eventId);
+      throw error;
+    }
+  }
+
   protected _onClose() {
+    // Unacknowledged requests belong only to the connection that sent them.
+    this.#pendingHistoryRequests.clear();
     this.emit('disconnected');
   }
 
@@ -978,6 +1070,35 @@ export abstract class OpenAIRealtimeBase
       newHistory,
     );
 
+    // MCP items cannot be recreated once their conversation entry is deleted, so
+    // reject additions/updates before sending a single client event. A same-ID
+    // cross-type replacement surfaces in `updates` as the new non-MCP item, so
+    // classify by the old item's type as well. Explicit removals (item present
+    // in oldHistory but absent from newHistory) and unchanged items are
+    // unaffected and continue to work.
+    const isMcpItem = (item: RealtimeItem): boolean =>
+      item.type === 'mcp_call' ||
+      item.type === 'mcp_tool_call' ||
+      item.type === 'mcp_approval_request';
+    const oldMcpItemIds = new Set(
+      oldHistory.filter(isMcpItem).map((item) => item.itemId),
+    );
+    const rejectedMcpItem = [...additions, ...updates].find(
+      (item) => isMcpItem(item) || oldMcpItemIds.has(item.itemId),
+    );
+    if (rejectedMcpItem) {
+      const replaced = oldHistory.find(
+        (item) => item.itemId === rejectedMcpItem.itemId,
+      );
+      const detail =
+        replaced && isMcpItem(replaced)
+          ? `itemId ${rejectedMcpItem.itemId} replaces an existing '${replaced.type}' item with a '${rejectedMcpItem.type}' item`
+          : `a '${rejectedMcpItem.type}' item (itemId: ${rejectedMcpItem.itemId}) would be added or updated`;
+      throw new UserError(
+        `MCP items cannot be added or updated via updateHistory(). Found ${detail}. Leave existing MCP items unchanged, or remove them from history entirely, before calling updateHistory().`,
+      );
+    }
+
     const removalIds = new Set(removals.map((item) => item.itemId));
     // we don't have an update event for items so we will remove and re-add what's there
     for (const update of updates) {
@@ -986,34 +1107,76 @@ export abstract class OpenAIRealtimeBase
 
     if (removalIds.size > 0) {
       for (const itemId of removalIds) {
-        this.sendEvent({
+        this.#sendHistoryRequest(itemId, 'delete', {
           type: 'conversation.item.delete',
           item_id: itemId,
         });
       }
     }
 
-    const additionsAndUpdates = [...additions, ...updates];
+    // Walk the new history in order so each created item can name the item it
+    // follows. `conversation.item.create` appends to the end of the
+    // conversation when `previous_item_id` is omitted, which would move a
+    // corrected or inserted item behind everything after it.
+    const pendingIds = new Set(
+      [...additions, ...updates].map((item) => item.itemId),
+    );
+    // Apply outstanding operations in send order. A recreation restores an
+    // anchor even before its earlier deletion is acknowledged; a later delete
+    // removes it again. Keep this projection separate from confirmed history.
+    const projectedPresence = new Map<string, boolean>();
+    for (const request of this.#pendingHistoryRequests.values()) {
+      projectedPresence.set(request.itemId, request.kind === 'create');
+    }
+    const survives = (item: RealtimeItem) =>
+      !pendingIds.has(item.itemId) &&
+      projectedPresence.get(item.itemId) !== false;
+    // Only a create that has to land before something the server keeps needs to
+    // name an anchor. Past the last such item there is nothing to sit in front
+    // of, so those stay plain appends.
+    let lastAnchoredIndex = -1;
+    for (const [index, item] of newHistory.entries()) {
+      if (survives(item)) {
+        lastAnchoredIndex = index;
+      }
+    }
 
-    for (const addition of additionsAndUpdates) {
-      if (addition.type === 'message') {
+    // `root` places the item at the beginning; omitting the field appends it.
+    let previousItemId = CONVERSATION_ROOT;
+
+    for (const [index, item] of newHistory.entries()) {
+      if (!pendingIds.has(item.itemId)) {
+        // An item on its way out cannot anchor anything: the anchor stays on
+        // the last one that will still be there when the create arrives.
+        if (survives(item)) {
+          previousItemId = item.itemId;
+        }
+        continue;
+      }
+
+      if (item.type === 'message') {
         const itemEntry: Record<string, any> = {
           type: 'message',
-          role: addition.role,
-          content: addition.content,
-          id: addition.itemId,
+          role: item.role,
+          content: item.content,
+          id: item.itemId,
         };
-        if (addition.role !== 'system' && addition.status) {
-          itemEntry.status = addition.status;
+        if (item.role !== 'system' && item.status) {
+          itemEntry.status = item.status;
         }
-        this.sendEvent({
+        this.#sendHistoryRequest(item.itemId, 'create', {
           type: 'conversation.item.create',
+          ...(index < lastAnchoredIndex
+            ? { previous_item_id: previousItemId }
+            : {}),
           item: itemEntry,
         });
-      } else if (addition.type === 'function_call') {
+        previousItemId = item.itemId;
+      } else if (item.type === 'function_call') {
         logger.warn(
           'Function calls cannot be manually added or updated at the moment. Ignoring.',
         );
+        // Not created, so it cannot anchor the next insert.
       }
     }
   }

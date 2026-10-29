@@ -62,11 +62,11 @@ export {
   appendPtyOutput,
   createPtyProcessEntry,
   formatPtyExecUpdate,
-  markPtyDone,
+  closePtyOutput,
   openPtyWebSocket,
   PtyProcessRegistry,
   shellCommandForPty,
-  watchPtyProcess,
+  watchPtyOutput,
   writePtyStdin,
 } from './pty';
 export {
@@ -85,6 +85,7 @@ export {
   assertResumeRecreateAllowed,
   assertRunAsUnsupported,
   closeRemoteSessionOnManifestError,
+  resolveCreateArchiveLimits,
   isProviderSandboxNotFoundError,
   providerErrorDetails,
   providerErrorMessage,

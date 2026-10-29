@@ -1,5 +1,157 @@
 # @openai/agents-extensions
 
+## 0.21.0
+
+### Minor Changes
+
+- 7b05470: feat: Remove the Runloop sandbox provider and its public API; see the [migration guide](https://github.com/openai/openai-agents-js/tree/main/examples/sandbox/extensions#migrating-from-runloop) for supported alternatives.
+
+### Patch Changes
+
+- 4521cf5: fix: refresh WebSocket dependencies and development tooling.
+- 980423f: fix: preserve Twilio audio format defaults when session audio configuration is omitted (#2072).
+- Updated dependencies [989513a]
+- Updated dependencies [7b05470]
+- Updated dependencies [976579e]
+  - @openai/agents-core@0.21.0
+
+## 0.20.0
+
+### Minor Changes
+
+- edfa410: fix: Use current Vercel authentication configuration for restored sessions and disable legacy authentication fallback when current authentication is configured; retain per-create authentication choices for live sessions. Keep restoration credentials runtime-only and honor per-run resume overrides.
+
+### Patch Changes
+
+- 2f3591b: fix: preserve sticky permission bits through manifest normalization and local and remote materialization, and reapply manifest sticky intent to restored Unix-local and Docker snapshot directories
+- Updated dependencies [40f7de2]
+- Updated dependencies [836cb50]
+- Updated dependencies [05241c7]
+- Updated dependencies [4137680]
+- Updated dependencies [8ee5055]
+- Updated dependencies [b89905c]
+- Updated dependencies [d8fa6c3]
+- Updated dependencies [9e32e88]
+- Updated dependencies [2f3591b]
+- Updated dependencies [8567e09]
+  - @openai/agents-core@0.20.0
+
+## 0.19.0
+
+### Minor Changes
+
+- 38cee6d: fix: require Daytona SDK ^0.201.0 for patched OpenTelemetry dependencies while preserving polling-based sandbox lifecycle behavior.
+
+### Patch Changes
+
+- 742423e: fix: treat a blank CODEX_API_KEY as unconfigured so OPENAI_API_KEY can be used
+- 9c94138: fix: honor the invoking Runner's sensitive-data tracing policy in Codex spans, including mixed CommonJS and ESM applications.
+- 817161d: build: Generate package metadata with native Node.js TypeScript support.
+- 194fea9: fix: omit supported generation reasoning from default OpenAI trace exports while preserving original spans and custom destinations
+- 5edcc76: fix: Redact MCP authentication and headers from AI SDK UI tool-search output while preserving server-side replay configuration.
+- 3515c29: fix: redact default function-tool and Realtime approval parse failures; require explicit invocation policy for sensitive error traces and clarify when custom errorFunction feedback applies.
+- 7f135af: fix: update compatible runtime and development dependencies.
+- 610fd72: fix: update AI SDK development dependencies to use patched provider response handling.
+- 130a8d3: fix: honor configured archive limits when creating remote sandbox sessions.
+- 056bef8: fix: trim Blaxel S3-compatible bucket prefixes in linear time while preserving mount targets.
+- 7efc536: fix: update compatible workspace dependencies while preserving supported provider and Expo versions.
+- 649f3b4: fix: trim Blaxel GCS mount prefixes in linear time while preserving mount behavior.
+- a73577e: fix: omit raw provider response bodies, headers, and causes from AI SDK error traces while preserving caller errors.
+- e6e43dd: fix: Honor local directory file concurrency across recursive sandbox source copies and drain active work before cleanup.
+- 12d1b92: fix: preserve tar name trimming with a linear suffix scan.
+- a01f687: fix: remove unused dependency declarations while retaining shared logging through agents-core.
+- Updated dependencies [39d5e9e]
+- Updated dependencies [c55d64d]
+- Updated dependencies [c345409]
+- Updated dependencies [a0b1c6f]
+- Updated dependencies [9c94138]
+- Updated dependencies [f0f3066]
+- Updated dependencies [c3e02d2]
+- Updated dependencies [f80c91c]
+- Updated dependencies [3949bb1]
+- Updated dependencies [186f6ec]
+- Updated dependencies [fdaf0a6]
+- Updated dependencies [aeef9e1]
+- Updated dependencies [817161d]
+- Updated dependencies [20e5946]
+- Updated dependencies [39decd7]
+- Updated dependencies [ec8bb33]
+- Updated dependencies [9623a22]
+- Updated dependencies [58844c7]
+- Updated dependencies [d0e5d43]
+- Updated dependencies [2127475]
+- Updated dependencies [3515c29]
+- Updated dependencies [b9a4fb8]
+- Updated dependencies [7f135af]
+- Updated dependencies [ee65014]
+- Updated dependencies [00eef0c]
+- Updated dependencies [218a2b8]
+- Updated dependencies [8ac97df]
+- Updated dependencies [96aa754]
+- Updated dependencies [7efc536]
+- Updated dependencies [8a26e30]
+- Updated dependencies [4ef9008]
+- Updated dependencies [f507590]
+- Updated dependencies [d187747]
+- Updated dependencies [fc2d2a4]
+- Updated dependencies [0bdea85]
+- Updated dependencies [a9b543b]
+- Updated dependencies [06bbcc0]
+  - @openai/agents-core@0.19.0
+
+## 0.18.0
+
+### Patch Changes
+
+- a0f48ff: fix: Preserve the requested working directory for Cloudflare and Runloop shell command lists and stop execution if the directory transition fails.
+- Updated dependencies [b665b0e]
+- Updated dependencies [19d0b5f]
+- Updated dependencies [064fcb2]
+  - @openai/agents-core@0.18.0
+
+## 0.17.2
+
+### Patch Changes
+
+- Updated dependencies [8d1f019]
+  - @openai/agents-core@0.17.2
+
+## 0.17.1
+
+### Patch Changes
+
+- 9be3e39: fix: prevent sandbox Git repository inputs from being interpreted as host Git options.
+- e6c3663: Decode sandbox PTY output with a streaming decoder so multi-byte UTF-8 characters split across WebSocket frames are no longer corrupted
+- 49b3b34: fix: retain final PTY output until collection completes
+- 85e6304: refactor: organize AI SDK message conversion and its tests without changing adapter behavior.
+- a9e3214: fix: bound WebSocket startup cleanup, settle acquired PTY resources, and stabilize local PTY exit regression coverage
+- Updated dependencies [dd1becb]
+- Updated dependencies [0b94437]
+- Updated dependencies [d7ed6b2]
+- Updated dependencies [b09622f]
+- Updated dependencies [6721ccd]
+- Updated dependencies [c15c3ac]
+- Updated dependencies [3261264]
+- Updated dependencies [9be3e39]
+- Updated dependencies [b4fa898]
+- Updated dependencies [8e862b3]
+- Updated dependencies [05e5851]
+- Updated dependencies [0b949bc]
+- Updated dependencies [c0a6718]
+- Updated dependencies [b1a41cf]
+- Updated dependencies [5c3c3b4]
+- Updated dependencies [cd5a2c8]
+- Updated dependencies [e668ea1]
+- Updated dependencies [eb690a4]
+- Updated dependencies [c3bfb2c]
+- Updated dependencies [d364ef2]
+- Updated dependencies [0035d33]
+- Updated dependencies [d19101e]
+- Updated dependencies [a9e3214]
+- Updated dependencies [92d1d9c]
+- Updated dependencies [2dc21b6]
+  - @openai/agents-core@0.17.1
+
 ## 0.17.0
 
 ### Patch Changes

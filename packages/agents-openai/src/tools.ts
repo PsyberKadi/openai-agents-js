@@ -6,29 +6,8 @@ import {
   UserError,
 } from '@openai/agents-core';
 import type OpenAI from 'openai';
-import { z } from 'zod';
 import { normalizeToolAllowedCallers } from '@openai/agents-core/utils/internal';
 import * as ProviderData from './types/providerData';
-
-// -----------------------------------------------------
-// Status enums
-// -----------------------------------------------------
-
-export const WebSearchStatus = z
-  .enum(['in_progress', 'completed', 'searching', 'failed'])
-  .default('failed');
-
-export const FileSearchStatus = z
-  .enum(['in_progress', 'completed', 'searching', 'failed', 'incomplete'])
-  .default('failed');
-
-export const CodeInterpreterStatus = z
-  .enum(['in_progress', 'completed', 'interpreting'])
-  .default('in_progress');
-
-export const ImageGenerationStatus = z
-  .enum(['in_progress', 'completed', 'generating', 'failed'])
-  .default('failed');
 
 // -----------------------------------------------------
 // The tools below are OpenAI specific tools
@@ -63,6 +42,27 @@ export type WebSearchTool = {
    * default is used.
    */
   externalWebAccess?: boolean;
+
+  /**
+   * The kinds of search results to return. When omitted, the API default is used.
+   * Including `image` also requests raw results, available on web search call
+   * items in `providerData.results`.
+   */
+  searchContentTypes?: ProviderData.WebSearchTool['search_content_types'];
+
+  /**
+   * Image result settings when `searchContentTypes` includes `image`.
+   */
+  imageSettings?: {
+    /**
+     * The positive number of image results to request.
+     */
+    maxResults?: number;
+    /**
+     * Whether to request a short caption for each image when available.
+     */
+    caption?: boolean;
+  };
 };
 
 /**
@@ -84,6 +84,15 @@ export function webSearchTool(
   };
   if (options.externalWebAccess !== undefined) {
     providerData.external_web_access = options.externalWebAccess;
+  }
+  if (options.searchContentTypes !== undefined) {
+    providerData.search_content_types = options.searchContentTypes;
+  }
+  if (options.imageSettings !== undefined) {
+    providerData.image_settings = {
+      max_results: options.imageSettings.maxResults,
+      caption: options.imageSettings.caption,
+    };
   }
   return {
     type: 'hosted_tool',
@@ -271,6 +280,7 @@ export function toolSearchTool<Context = unknown>(
 export type ImageGenerationTool = {
   type: 'image_generation';
   name?: 'image_generation' | (string & {});
+  action?: OpenAI.Responses.Tool.ImageGeneration['action'];
   background?: 'transparent' | 'opaque' | 'auto' | (string & {});
   inputFidelity?: 'high' | 'low' | null;
   inputImageMask?: OpenAI.Responses.Tool.ImageGeneration.InputImageMask;
@@ -294,6 +304,7 @@ export function imageGenerationTool(
   const providerData: ProviderData.ImageGenerationTool = {
     type: 'image_generation',
     name: options.name ?? 'image_generation',
+    action: options.action,
     background: options.background,
     input_fidelity: options.inputFidelity,
     input_image_mask: options.inputImageMask,

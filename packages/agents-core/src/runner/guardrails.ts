@@ -418,6 +418,7 @@ export async function finalizeOutputGuardrails<
   ) => false | string | Promise<false | string>;
   persistBlockedOutput?: () => Promise<void>;
   persistUnblockedFailure?: () => Promise<void>;
+  onBlockedOutput?: () => void;
   releaseBlockedOutputPersistence: (state: RunState<TContext, TAgent>) => void;
 }): Promise<void> {
   const {
@@ -430,6 +431,7 @@ export async function finalizeOutputGuardrails<
     sanitizeRejectedOutput,
     persistBlockedOutput,
     persistUnblockedFailure,
+    onBlockedOutput,
     releaseBlockedOutputPersistence,
   } = options;
   if (
@@ -497,7 +499,14 @@ export async function finalizeOutputGuardrails<
       completedTripwireResult !== undefined &&
       guardrailError instanceof OutputGuardrailTripwireTriggered;
 
-    if (outputBlocked || completedOutputTripwireError) {
+    // Assistant output is unvetted whenever its guardrail batch fails, even
+    // when no guardrail completed with a tripwire verdict.
+    if (
+      outputBlocked ||
+      completedOutputTripwireError ||
+      !guardedTerminalToolOutput
+    ) {
+      onBlockedOutput?.();
       if (persistBlockedOutput && !signal?.aborted) {
         try {
           await persistBlockedOutput();

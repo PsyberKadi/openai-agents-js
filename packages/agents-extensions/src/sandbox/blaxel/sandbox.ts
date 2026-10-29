@@ -33,6 +33,7 @@ import {
   SANDBOX_MANIFEST_METADATA_SUPPORT,
   assertRunAsUnsupported,
   closeRemoteSessionOnManifestError,
+  resolveCreateArchiveLimits,
   assertShellEnvironmentName,
   rehydrateRemoteSandboxSessionStateValues,
   formatPtyExecUpdate,
@@ -47,7 +48,7 @@ import {
   shellQuote,
   shellCommandForPty,
   toUint8Array,
-  markPtyDone,
+  closePtyOutput,
   writePtyStdin,
   isRecord,
   readOptionalBoolean,
@@ -65,6 +66,7 @@ import {
   type PtyProcessEntry,
   type ManifestMountMaterializationContext,
 } from '../shared';
+import { closePtyWebSocket } from '../shared/pty';
 import {
   configuredMountCredentialFields,
   validateMountCredentialBoundaries,
@@ -278,11 +280,11 @@ export class BlaxelSandboxSession extends RemoteSandboxSessionBase<BlaxelSandbox
       socket,
       'close',
       (event) => {
-        markPtyDone(entry, blaxelPtyCloseExitCode(entry, event));
+        closePtyOutput(entry, blaxelPtyCloseExitCode(entry, event));
       },
     );
     const removeErrorListener = addPtyWebSocketListener(socket, 'error', () => {
-      markPtyDone(entry, 1);
+      closePtyOutput(entry, 1);
     });
     entry.sendInput = async (chars) => {
       socket.send(JSON.stringify({ type: 'input', data: chars }));
@@ -318,7 +320,10 @@ export class BlaxelSandboxSession extends RemoteSandboxSessionBase<BlaxelSandbox
       });
     } finally {
       if (!registered) {
-        await entry.terminate?.().catch(() => {});
+        removeMessageListener();
+        removeCloseListener();
+        removeErrorListener();
+        await closePtyWebSocket(socket).catch(() => {});
       }
     }
   }
@@ -860,6 +865,11 @@ export class BlaxelSandboxClient implements SandboxClient<
     internalOptions: BlaxelCreateInternalOptions = {},
   ): Promise<BlaxelSandboxSession> {
     const createArgs = normalizeSandboxClientCreateArgs(args, manifestOptions);
+    const archiveLimits = resolveCreateArchiveLimits(
+      createArgs.archiveLimits,
+      createArgs.options?.archiveLimits,
+      this.options.archiveLimits,
+    );
     assertCoreSnapshotUnsupported('BlaxelSandboxClient', createArgs.snapshot);
     const manifest = createArgs.manifest;
     const resolvedOptions = {
@@ -967,7 +977,7 @@ export class BlaxelSandboxClient implements SandboxClient<
           apiKey: resolvedOptions.apiKey ?? loadEnv().BL_API_KEY,
           ownsSandbox,
           concurrencyLimits: createArgs.concurrencyLimits,
-          archiveLimits: createArgs.archiveLimits,
+          archiveLimits,
           state: {
             manifest,
             sandboxName,
@@ -1643,7 +1653,7 @@ function handleBlaxelPtyMessage(entry: PtyProcessEntry, event: unknown): void {
     if (typeof data === 'string') {
       appendPtyOutput(entry, data);
     }
-    markPtyDone(entry, 1);
+    closePtyOutput(entry, 1);
   }
 }
 

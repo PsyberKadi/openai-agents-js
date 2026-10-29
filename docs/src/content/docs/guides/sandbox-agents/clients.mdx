@@ -3,7 +3,7 @@ title: Sandbox clients
 description: Choose where sandbox work should run and how sessions, snapshots, mounts, and ports behave.
 ---
 
-import { Aside, Code } from '@astrojs/starlight/components';
+import { Code } from '@astrojs/starlight/components';
 import developerOwnedSessionExample from '../../../../../../examples/docs/sandbox-agents/developer-owned-session.ts?raw';
 import dockerClientExample from '../../../../../../examples/docs/sandbox-agents/docker-client.ts?raw';
 import exposedPortsExample from '../../../../../../examples/docs/sandbox-agents/exposed-ports.ts?raw';
@@ -13,19 +13,13 @@ import selectLocalClientExample from '../../../../../../examples/docs/sandbox-ag
 
 Use this page to choose where sandbox work should run. In most cases, the `SandboxAgent` definition stays the same while the sandbox client and client-specific options change in the `sandbox` run option.
 
-<Aside type="caution" title="Beta feature">
-  Sandbox agents are in beta. API details, defaults, and supported capabilities
-  may change before general availability, and more advanced features are
-  expected over time.
-</Aside>
-
 ## Decision guide
 
 | Goal | Start with | Why |
 | --- | --- | --- |
-| Fastest local iteration on macOS or Linux | `UnixLocalSandboxClient` | No extra service dependency and a simple local filesystem workflow. |
+| Trusted local development on macOS or Linux | `UnixLocalSandboxClient` | Runs host processes with a managed workspace; adds no OS-level confinement. |
 | Basic container isolation | `DockerSandboxClient` | Runs work inside Docker with a specific image. |
-| Hosted execution or production-style isolation | A hosted sandbox client | Moves the workspace boundary to a provider-managed environment. |
+| Hosted execution | A hosted sandbox client | Uses a provider-managed environment; isolation depends on the provider and configuration. |
 
 ## Local clients
 
@@ -33,10 +27,16 @@ For most users, start with one of these two sandbox clients:
 
 | Client | Install | Choose it when |
 | --- | --- | --- |
-| `UnixLocalSandboxClient` | none | Fastest local iteration on macOS or Linux. Good default for local development. |
+| `UnixLocalSandboxClient` | none | Trusted local development on macOS or Linux, or execution within an externally isolated environment. |
 | `DockerSandboxClient` | Docker CLI available locally | You want container isolation or a specific image for local parity. |
 
-Unix-local is the easiest way to start developing against a local filesystem. Move to Docker or a hosted provider when you need stronger environment isolation or production-style parity.
+`UnixLocalSandboxClient` runs shell commands as host processes on both macOS and Linux, including commands that use a PTY. The client does not add OS-level filesystem or network isolation. Commands run with the permissions of the selected host user, subject to any externally enforced isolation. The workspace directory, command working directory, and `HOME` environment variable do not confine commands to the workspace.
+
+Each new Unix-local session receives a separate temporary workspace. `Manifest.root` is a logical path, and `workspaceBaseDir` selects the parent directory for temporary workspaces. Using the same value for either setting does not make newly created sessions share a workspace. Reusing a live session shares that session's workspace. Separate Unix-local sessions and workspaces do not establish an OS isolation boundary.
+
+Unix-local path grants restrict supported host source access and SDK file APIs. A `readOnly` grant prevents SDK file API writes to the granted path; the grant does not restrict arbitrary shell commands. Commands can access host paths allowed by the process's permissions and external isolation even without a path grant. See [manifest path grants](/openai-agents-js/guides/sandbox-agents/concepts#manifest).
+
+For untrusted commands, including commands influenced by untrusted inputs, choose an appropriately configured `DockerSandboxClient` or hosted backend, or provide external isolation. Select the backend and configuration for the filesystem, network, and process isolation your application requires.
 
 To switch from Unix-local to Docker, keep the agent definition the same and change only the client:
 
@@ -51,6 +51,10 @@ The same agent can usually run with either local client:
 />
 
 `DockerSandboxClient` uses Docker's default networking unless you set `networkMode: 'none'` in the client constructor or the per-run `sandbox.options`. The `'none'` mode starts the container with networking disabled. It cannot be combined with `exposedPorts`; the SDK rejects that configuration before creating or resuming a container. No other explicit `networkMode` value is currently supported.
+
+Set `labels: Record<string, string>` in the `DockerSandboxClient` constructor or per-run `sandbox.options` to apply user-defined labels to the created container. A per-run `labels` record replaces the constructor record instead of merging with it. The SDK rejects non-string values and reserves `openai-agents-sandbox`, `openai-agents-sandbox.session-identity`, and `openai-agents-sandbox.mount-authority-fingerprint` for its own ownership checks.
+
+The SDK copies user-defined labels into serialized Docker session state. When you explicitly resume that state, caller-provided labels must exactly match the persisted label record; start a fresh sandbox session to change them. Live-container reuse also verifies that every configured label still has its required value. Unrelated labels added outside the SDK do not prevent reuse.
 
 ### Session ownership
 
@@ -153,7 +157,6 @@ Install `@openai/agents-extensions` and satisfy its package-level peers. Each pr
 | `DaytonaSandboxClient` | `@openai/agents-extensions/sandbox/daytona` | npm peer: `@daytonaio/sdk` |
 | `E2BSandboxClient` | `@openai/agents-extensions/sandbox/e2b` | npm peer: `e2b` or `@e2b/code-interpreter` |
 | `ModalSandboxClient` | `@openai/agents-extensions/sandbox/modal` | npm peer: `modal` |
-| `RunloopSandboxClient` | `@openai/agents-extensions/sandbox/runloop` | npm peer: `@runloop/api-client` |
 | `VercelSandboxClient` | `@openai/agents-extensions/sandbox/vercel` | npm peer: `@vercel/sandbox` |
 
 When `ModalSandboxClient` creates a sandbox, use `cpu` and `memoryMiB` to request CPU and memory reservations. Use `cpuLimit` and `memoryLimitMiB` to set upper limits. You can set these options on the client constructor or in per-run `sandbox.options`; per-run values override constructor defaults. Every value must be a positive finite number. `cpuLimit` requires `cpu` and cannot be lower than it, while `memoryLimitMiB` requires `memoryMiB` and cannot be lower than it.
@@ -170,7 +173,7 @@ If an in-sandbox helper is required, acknowledge each trusted effective mount pa
 
 Credential files referenced by a mount cannot resolve directly or through symlinks to serializable manifest entries. Dynamic manifest mutations are serialized per session; if a privileged mount transition or replacement unmount fails after provider effects may have started, the SDK invalidates and terminates that session instead of reusing or persisting ambiguous state.
 
-Serialized sandbox state omits mount credentials, including ambient environment credentials selected by an in-sandbox mount helper. Any persisted mount topology requires a current trusted manifest before resume. For resumable external or provider-native mounts, the SDK restores credentials only after the credential-free current and persisted mount topologies match. Explicit `sessionState` can reconnect an existing provider-native mount only when its unredacted live authority still matches the current trusted manifest; redacted, rotated, or removed authority requires a fresh sandbox. Opaque configuration that cannot be separated into credential-free topology is non-resumable. When the Runner restores a serialized `RunState` entry that used an in-sandbox mount helper, it discards that stored session and creates a fresh sandbox from current trusted configuration. Caller-supplied explicit `sessionState` and direct provider resume instead reject in-container mount state; start a fresh sandbox explicitly. Runloop credential-file variables supplied through opaque `secretRefs` are rejected for in-container mounts; provide the current trusted path through `managedSecrets` so the SDK can validate its effective path before mounting.
+Serialized sandbox state omits mount credentials, including ambient environment credentials selected by an in-sandbox mount helper. Any persisted mount topology requires a current trusted manifest before resume. For resumable external or provider-native mounts, the SDK restores credentials only after the credential-free current and persisted mount topologies match. Explicit `sessionState` can reconnect an existing provider-native mount only when its unredacted live authority still matches the current trusted manifest; redacted, rotated, or removed authority requires a fresh sandbox. Opaque configuration that cannot be separated into credential-free topology is non-resumable. When the Runner restores a serialized `RunState` entry that used an in-sandbox mount helper, it discards that stored session and creates a fresh sandbox from current trusted configuration. Caller-supplied explicit `sessionState` and direct provider resume instead reject in-container mount state; start a fresh sandbox explicitly.
 
 | Backend | Mount notes |
 | --- | --- |
@@ -180,10 +183,9 @@ Serialized sandbox state omits mount credentials, including ambient environment 
 | `BlaxelSandboxClient` | Supports cloud bucket mounts with `BlaxelCloudBucketMountStrategy` on S3, R2, and GCS mount entries. Credential-bearing cloud mounts require an SDK-owned sandbox; reused unowned named sandboxes can use credentialless cloud mounts or persistent Blaxel Drives with `BlaxelDriveMount` and `BlaxelDriveMountStrategy`. |
 | `DaytonaSandboxClient` | Supports rclone-backed mounts with `DaytonaCloudBucketMountStrategy` on S3, GCS, R2, Azure Blob, and Box mount entries. |
 | `E2BSandboxClient` | Supports rclone-backed mounts with `E2BCloudBucketMountStrategy` on S3, GCS, R2, Azure Blob, and Box mount entries. |
-| `RunloopSandboxClient` | Supports rclone-backed mounts with `RunloopCloudBucketMountStrategy` on S3, GCS, R2, Azure Blob, and Box mount entries. |
 | `VercelSandboxClient` | Supports create-time S3 mounts with `VercelCloudBucketMountStrategy`. For new code, acknowledge inline credentials with `withInContainerMountCredentialExposureAcknowledged()` for each exact mount path. The deprecated `allowS3CredentialExposure: true` option remains accepted for compatibility with released inline S3 credential configurations, but it does not authorize ambient credentials or other broad authority. Reuse the live mounted session because serialized mount state cannot be resumed directly. |
 
-For E2B and Runloop rclone-backed mounts, the SDK uses an existing `rclone` binary when available. Otherwise it installs an SDK-pinned Linux archive only after verifying its SHA-256 checksum; unsupported architectures and checksum failures abort the mount.
+For E2B rclone-backed mounts, the SDK uses an existing `rclone` binary when available. Otherwise it installs an SDK-pinned Linux archive only after verifying its SHA-256 checksum; unsupported architectures and checksum failures abort the mount.
 
 The table below summarizes which remote storage entries each backend can mount directly:
 
@@ -195,10 +197,9 @@ The table below summarizes which remote storage entries each backend can mount d
 | `BlaxelSandboxClient` | yes | yes | yes | no | no | no |
 | `DaytonaSandboxClient` | yes | yes | yes | yes | yes | no |
 | `E2BSandboxClient` | yes | yes | yes | yes | yes | no |
-| `RunloopSandboxClient` | yes | yes | yes | yes | yes | no |
 | `VercelSandboxClient` | yes | no | no | no | no | no |
 
-A "yes" means that the backend can execute that storage mount type; it does not bypass the credential boundary described above. Docker's `dockerVolumeMountStrategy()`, Modal cloud bucket mounts, and Cloudflare bucket mounts keep mount credentials outside the model-controlled sandbox. Docker's `inContainerMountStrategy()` and the Daytona, E2B, and Runloop rclone strategies require exact-path acknowledgement whenever they receive credentials. Box mounts require authentication, so choose the acknowledgement that matches whether the Box authority is supplied through typed mount fields or through external credential or configuration files. Docker S3 Files mounts use broad workload identity and therefore require `withInContainerMountBroadCredentialExposureAcknowledged()`.
+A "yes" means that the backend can execute that storage mount type; it does not bypass the credential boundary described above. Docker's `dockerVolumeMountStrategy()`, Modal cloud bucket mounts, and Cloudflare bucket mounts keep mount credentials outside the model-controlled sandbox. Docker's `inContainerMountStrategy()` and the Daytona and E2B rclone strategies require exact-path acknowledgement whenever they receive credentials. Box mounts require authentication, so choose the acknowledgement that matches whether the Box authority is supplied through typed mount fields or through external credential or configuration files. Docker S3 Files mounts use broad workload identity and therefore require `withInContainerMountBroadCredentialExposureAcknowledged()`.
 
 ### Exposed ports
 

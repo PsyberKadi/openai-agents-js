@@ -15,7 +15,7 @@ describe('Node.js', () => {
     await execa`rm -rf node_modules`;
     console.log('[node] Installing dependencies');
     await execa`npm install`;
-  }, 60000);
+  });
 
   test('should be able to run using CommonJS', { timeout: 15000 }, async () => {
     const { stdout } = await execa`npm run start:cjs`;
@@ -40,7 +40,7 @@ describe('Node.js', () => {
       expect(stdout).toContain('codex thread started:');
       expect(stdout).toContain('codex turn completed, usage:');
       expect(stdout).toMatch(
-        /\[CODEX_TOOL_RESPONSE\].*\^0\.147\.0.*\[\/CODEX_TOOL_RESPONSE\]/s,
+        /\[CODEX_TOOL_RESPONSE\].*\^0\.160\.0.*\[\/CODEX_TOOL_RESPONSE\]/s,
       );
       expect(stdout).toContain('[CODEX_RESPONSE]');
     },

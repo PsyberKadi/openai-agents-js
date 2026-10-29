@@ -2600,6 +2600,7 @@ describe('approved tool output guardrail session persistence', () => {
         const resumed = await runOnce(first.state);
         expect(resumed.finalOutput).toBe('approved-result');
       }
+      expect(first.state._pendingSessionWrite).toBeUndefined();
 
       const persistedItems = await session.getItems();
       expect(
@@ -3077,7 +3078,7 @@ describe('approved tool output guardrail session persistence', () => {
       ) => {
         const options = {
           session,
-          maxTurns: 1,
+          maxTurns: 2,
           callModelInputFilter: ({ modelData }: CallModelInputFilterArgs) => ({
             ...modelData,
             input: modelData.input.filter(

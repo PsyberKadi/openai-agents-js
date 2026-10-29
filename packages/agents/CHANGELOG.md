@@ -1,5 +1,171 @@
 # @openai/agents
 
+## 0.21.0
+
+### Patch Changes
+
+- Updated dependencies [4521cf5]
+- Updated dependencies [989513a]
+- Updated dependencies [1163b0c]
+- Updated dependencies [9687b54]
+- Updated dependencies [7b05470]
+- Updated dependencies [976579e]
+- Updated dependencies [980423f]
+- Updated dependencies [0dd1ef8]
+  - @openai/agents-realtime@0.21.0
+  - @openai/agents-core@0.21.0
+  - @openai/agents-openai@0.21.0
+
+## 0.20.0
+
+### Patch Changes
+
+- Updated dependencies [40f7de2]
+- Updated dependencies [836cb50]
+- Updated dependencies [05241c7]
+- Updated dependencies [4137680]
+- Updated dependencies [8ee5055]
+- Updated dependencies [df20529]
+- Updated dependencies [b89905c]
+- Updated dependencies [d8fa6c3]
+- Updated dependencies [9e32e88]
+- Updated dependencies [2f3591b]
+- Updated dependencies [8567e09]
+  - @openai/agents-core@0.20.0
+  - @openai/agents-realtime@0.20.0
+  - @openai/agents-openai@0.20.0
+
+## 0.19.0
+
+### Patch Changes
+
+- 817161d: build: Generate package metadata with native Node.js TypeScript support.
+- ec8bb33: fix: Preserve post-construction agent storage settings through model requests and cloning.
+- 7bc7368: docs: Remove the beta label from the sandbox agent documentation.
+- 7f135af: fix: update compatible runtime and development dependencies.
+- 7efc536: fix: update compatible workspace dependencies while preserving supported provider and Expo versions.
+- a01f687: fix: remove unused dependency declarations while retaining shared logging through agents-core.
+- Updated dependencies [39d5e9e]
+- Updated dependencies [c55d64d]
+- Updated dependencies [c345409]
+- Updated dependencies [a0b1c6f]
+- Updated dependencies [9c94138]
+- Updated dependencies [f0f3066]
+- Updated dependencies [506f736]
+- Updated dependencies [c3e02d2]
+- Updated dependencies [f80c91c]
+- Updated dependencies [3949bb1]
+- Updated dependencies [186f6ec]
+- Updated dependencies [fdaf0a6]
+- Updated dependencies [aeef9e1]
+- Updated dependencies [817161d]
+- Updated dependencies [20e5946]
+- Updated dependencies [39decd7]
+- Updated dependencies [194fea9]
+- Updated dependencies [ec8bb33]
+- Updated dependencies [9623a22]
+- Updated dependencies [58844c7]
+- Updated dependencies [d0e5d43]
+- Updated dependencies [734144c]
+- Updated dependencies [3626398]
+- Updated dependencies [24946f3]
+- Updated dependencies [2127475]
+- Updated dependencies [7b534bb]
+- Updated dependencies [3515c29]
+- Updated dependencies [b9a4fb8]
+- Updated dependencies [7f135af]
+- Updated dependencies [ee65014]
+- Updated dependencies [00eef0c]
+- Updated dependencies [218a2b8]
+- Updated dependencies [8ac97df]
+- Updated dependencies [96aa754]
+- Updated dependencies [7efc536]
+- Updated dependencies [8a26e30]
+- Updated dependencies [4ef9008]
+- Updated dependencies [f507590]
+- Updated dependencies [d187747]
+- Updated dependencies [fc2d2a4]
+- Updated dependencies [0bdea85]
+- Updated dependencies [efd907f]
+- Updated dependencies [a9b543b]
+- Updated dependencies [58b08f8]
+- Updated dependencies [202563c]
+- Updated dependencies [a01f687]
+- Updated dependencies [06bbcc0]
+  - @openai/agents-core@0.19.0
+  - @openai/agents-openai@0.19.0
+  - @openai/agents-realtime@0.19.0
+
+## 0.18.0
+
+### Patch Changes
+
+- a3a9215: feat: support the image generation tool action option
+- Updated dependencies [f3bfca2]
+- Updated dependencies [b665b0e]
+- Updated dependencies [a3a9215]
+- Updated dependencies [19d0b5f]
+- Updated dependencies [064fcb2]
+  - @openai/agents-realtime@0.18.0
+  - @openai/agents-core@0.18.0
+  - @openai/agents-openai@0.18.0
+
+## 0.17.2
+
+### Patch Changes
+
+- Updated dependencies [8d1f019]
+  - @openai/agents-core@0.17.2
+  - @openai/agents-openai@0.17.2
+  - @openai/agents-realtime@0.17.2
+
+## 0.17.1
+
+### Patch Changes
+
+- Updated dependencies [dd1becb]
+- Updated dependencies [0b94437]
+- Updated dependencies [d7ed6b2]
+- Updated dependencies [b09622f]
+- Updated dependencies [6721ccd]
+- Updated dependencies [c15c3ac]
+- Updated dependencies [3261264]
+- Updated dependencies [9be3e39]
+- Updated dependencies [b4fa898]
+- Updated dependencies [8e862b3]
+- Updated dependencies [4351bd1]
+- Updated dependencies [c25fede]
+- Updated dependencies [05e5851]
+- Updated dependencies [0b949bc]
+- Updated dependencies [c0a6718]
+- Updated dependencies [b1a41cf]
+- Updated dependencies [5c3c3b4]
+- Updated dependencies [02720cd]
+- Updated dependencies [cd5a2c8]
+- Updated dependencies [e668ea1]
+- Updated dependencies [5e999b5]
+- Updated dependencies [b55e89f]
+- Updated dependencies [eb690a4]
+- Updated dependencies [a8422bf]
+- Updated dependencies [c242bfb]
+- Updated dependencies [a690858]
+- Updated dependencies [c3bfb2c]
+- Updated dependencies [8a98743]
+- Updated dependencies [82d6b59]
+- Updated dependencies [b0bc62d]
+- Updated dependencies [d364ef2]
+- Updated dependencies [6b555c8]
+- Updated dependencies [4b539bb]
+- Updated dependencies [0035d33]
+- Updated dependencies [d19101e]
+- Updated dependencies [a9e3214]
+- Updated dependencies [92d1d9c]
+- Updated dependencies [2dc21b6]
+- Updated dependencies [ffaaba6]
+  - @openai/agents-core@0.17.1
+  - @openai/agents-openai@0.17.1
+  - @openai/agents-realtime@0.17.1
+
 ## 0.17.0
 
 ### Patch Changes

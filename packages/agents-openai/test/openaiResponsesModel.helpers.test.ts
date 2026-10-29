@@ -1,3 +1,4 @@
+import type OpenAI from 'openai';
 import { describe, it, expect, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
 import {
@@ -6,8 +7,19 @@ import {
   getInputItems,
   convertToOutputItem,
 } from '../src/openaiResponsesModel';
+import {
+  getInputItems as converterGetInputItems,
+  convertToOutputItem as converterConvertToOutputItem,
+} from '../src/openaiResponsesConverter';
 import { UserError } from '@openai/agents-core';
 import logger from '../src/logger';
+
+describe('Responses item conversion exports', () => {
+  it('preserves helper identity through the model module', () => {
+    expect(getInputItems).toBe(converterGetInputItems);
+    expect(convertToOutputItem).toBe(converterConvertToOutputItem);
+  });
+});
 
 describe('getToolChoice', () => {
   it('returns default choices', () => {
@@ -628,6 +640,54 @@ describe('convertTool', () => {
 });
 
 describe('getInputItems', () => {
+  it.each(['failed', 'incomplete'] as const)(
+    'round-trips SDK-typed code interpreter results with status %s',
+    (status) => {
+      const item = {
+        type: 'code_interpreter_call',
+        id: 'ci_contract',
+        status,
+        code: 'print(1)',
+        container_id: 'container_contract',
+        outputs: [],
+      } satisfies OpenAI.Responses.ResponseCodeInterpreterToolCall;
+      expect(getInputItems(convertToOutputItem([item]))).toEqual([item]);
+    },
+  );
+
+  it.each(['incomplete', 'future_status'])(
+    'preserves web-search status %s even when the installed SDK union is older',
+    (status) => {
+      const item = {
+        type: 'web_search_call',
+        id: 'ws_contract',
+        action: { type: 'search', query: 'test' },
+        status,
+      };
+      // Synthetic wire data can precede the installed SDK's generated types.
+      const output = convertToOutputItem([
+        item as OpenAI.Responses.ResponseFunctionWebSearch,
+      ]);
+      expect(getInputItems(output)).toEqual([item]);
+    },
+  );
+
+  it('keeps SDK tool-search ownership out of provider input and output conversion', () => {
+    const raw = {
+      type: 'tool_search_output' as const,
+      id: 'search-output',
+      execution: 'server' as const,
+      status: 'completed',
+      tools: [],
+    };
+    const owned = { ...raw, toolSearchAgentName: 'Owner' };
+    expect(getInputItems([owned])).toEqual(getInputItems([raw]));
+    expect(owned.toolSearchAgentName).toBe('Owner');
+    expect(
+      convertToOutputItem(getInputItems([owned]) as any)[0],
+    ).not.toHaveProperty('toolSearchAgentName');
+  });
+
   it('replays caller linkage on MCP approval requests and responses', () => {
     expect(
       getInputItems([
@@ -2447,6 +2507,28 @@ describe('convertToOutputItem', () => {
       caller: { type: 'program', callerId: 'call_prog_1' },
     });
     expect(output.providerData).not.toHaveProperty('caller');
+  });
+
+  it('preserves empty hosted MCP outputs', () => {
+    const [output] = convertToOutputItem([
+      {
+        type: 'mcp_call',
+        id: 'mcp_1',
+        name: 'lookup',
+        arguments: '{}',
+        server_label: 'server',
+        status: 'completed',
+        output: '',
+      },
+    ] as any);
+
+    expect(output).toMatchObject({
+      type: 'hosted_tool_call',
+      id: 'mcp_1',
+      name: 'mcp_call',
+      output: '',
+    });
+    expect(output.providerData).not.toHaveProperty('output');
   });
 
   it('converts Programmatic Tool Calling items and caller linkage', () => {

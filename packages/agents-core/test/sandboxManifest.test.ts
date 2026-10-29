@@ -71,6 +71,39 @@ function parseTestSecretReference(
 }
 
 describe('Manifest', () => {
+  it.each(['--upload-pack=marker #://', '  --upload-pack=marker #://  '])(
+    'rejects option-like repository URLs in nested entries: %s',
+    (repo) => {
+      expect(
+        () =>
+          new Manifest({
+            entries: {
+              deps: {
+                type: 'dir',
+                children: {
+                  app: { type: 'git_repo', repo },
+                },
+              },
+            },
+          }),
+      ).toThrow('git_repo repository URL must not start with "-".');
+    },
+  );
+
+  it.each([
+    'https://example.test/repo.git',
+    'ssh://git@example.test/repo.git',
+    'git@example.test:owner/repo.git',
+    'file:///tmp/repo',
+    'owner/repo',
+    '-owner/repo',
+  ])('preserves supported repository spelling: %s', (repo) => {
+    const manifest = new Manifest({
+      entries: { app: { type: 'git_repo', repo } },
+    });
+    expect(manifest.entries.app.repo).toBe(repo);
+  });
+
   it('infers inline entry types from entry discriminators', () => {
     const entries = {
       'README.md': {
@@ -1106,6 +1139,71 @@ describe('Manifest', () => {
     expect(specialWithoutExec.group & FileMode.EXEC).toBe(FileMode.NONE);
     expect(specialWithoutExec.other & FileMode.EXEC).toBe(FileMode.NONE);
   });
+
+  it.each([
+    ['drwxrwxrwt', 0o41777],
+    ['drwxrwxrwT', 0o41776],
+    ['drwxrwxrwt+', 0o41777],
+  ])(
+    'preserves sticky permissions through manifest cloning: %s',
+    (value, mode) => {
+      const permissions = Permissions.fromString(value);
+      expect(permissions.toMode()).toBe(mode);
+      expect(new Permissions(permissions).toMode()).toBe(mode);
+      expect(Permissions.fromMode(mode).toString()).toBe(value.slice(0, 10));
+
+      const manifest = new Manifest({
+        entries: { shared: { type: 'dir', permissions: value } },
+      });
+      const cloned = cloneManifest(manifest);
+      const restored = new Manifest(JSON.parse(JSON.stringify(cloned)));
+      expect(restored.entries.shared.permissions).toEqual({
+        owner: 7,
+        group: 7,
+        other: mode === 0o41776 ? 6 : 7,
+        directory: true,
+        sticky: true,
+      });
+      expect(
+        new Permissions(restored.entries.shared.permissions).toMode(),
+      ).toBe(mode);
+    },
+  );
+
+  it.each(['false', 1, null])(
+    'rejects raw manifest sticky value %s',
+    (sticky) => {
+      const raw = JSON.parse(
+        JSON.stringify({
+          entries: { shared: { type: 'dir', permissions: { sticky } } },
+        }),
+      );
+      expect(() => new Manifest(raw)).toThrow(
+        'Permission sticky must be a boolean.',
+      );
+    },
+  );
+
+  it.each([true, false, undefined])(
+    'normalizes boolean or absent sticky value %s',
+    (sticky) => {
+      const manifest = new Manifest({
+        entries: {
+          shared: {
+            type: 'dir',
+            permissions: { owner: 7, group: 7, other: 7, sticky },
+          },
+        },
+      });
+      expect(manifest.entries.shared.permissions).toEqual({
+        owner: 7,
+        group: 7,
+        other: 7,
+        directory: false,
+        ...(sticky === true ? { sticky: true } : {}),
+      });
+    },
+  );
 
   it.each([
     '-rwTr--r--',

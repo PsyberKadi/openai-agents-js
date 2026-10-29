@@ -1,5 +1,126 @@
 # @openai/agents-core
 
+## 0.21.0
+
+### Minor Changes
+
+- 989513a: fix: Preserve bounded nested numeric token usage breakdowns across streamed runs, usage accounting, and saved run state (schema 1.23, with backward reads of earlier snapshots; #2082); usage detail values now require narrowing to numbers before arithmetic.
+- 7b05470: feat: Remove the Runloop sandbox provider and its public API; see the [migration guide](https://github.com/openai/openai-agents-js/tree/main/examples/sandbox/extensions#migrating-from-runloop) for supported alternatives.
+
+### Patch Changes
+
+- 976579e: fix: recognize GPT-6 Astra, Sol, Luna, and GPT-6.1 Sol in sandbox dynamic compaction thresholds (#2068).
+
+## 0.20.0
+
+### Minor Changes
+
+- 836cb50: fix: default automatic MCP tool discovery to 64 pages; set maxListPages explicitly for larger listings
+- 8ee5055: fix: Require trusted Python 3 for UnixLocal file operations and reject disabled protection. Honor `runAs` for file tools and replace edited files without modifying other hardlinks. Updates now require writable parent directories and preserve ordinary permissions and ownership.
+- 8567e09: fix: count model calls after approval resumes toward maxTurns; callers needing a follow-up model response at the limit must increase maxTurns.
+
+### Patch Changes
+
+- 40f7de2: fix: redact unchecked terminal tool output in cancelled session checkpoints while preserving completion history; defer validation for caller-owned RunState resumes
+- 05241c7: fix: preserve hosted MCP discovery provenance across tool identity collisions and session reuse; older namespace-only history requires rediscovery.
+- 4137680: fix: recognize namespace-shaped tool search discovery for deferred hosted MCP calls (#2044).
+- b89905c: fix: Preserve computer tool initializers and serialize each run's resolved computer across overlapping runs.
+- d8fa6c3: fix: Warn when computer calls have pending safety checks without an onSafetyCheck handler, and clarify the callback's opt-in behavior.
+- 9e32e88: fix: Bound streamable HTTP session termination by the client session timeout and cancel stalled cleanup requests.
+- 2f3591b: fix: preserve sticky permission bits through manifest normalization and local and remote materialization, and reapply manifest sticky intent to restored Unix-local and Docker snapshot directories
+
+## 0.19.0
+
+### Minor Changes
+
+- 39d5e9e: fix: bound agent tool streaming callbacks to 1024 pending events by default, with onStreamMaxPendingEvents to adjust the limit or restore unlimited buffering with null.
+- f0f3066: fix: reject started checkpoints without completed initial input validation, including older snapshots without completion evidence; restart with the original input and context.
+- aeef9e1: fix: bind resumed MCP calls to their original recipients and require a fresh run for historical pending function calls without recipient provenance.
+- 39decd7: fix: bind conditional tool approvals to isolated normalized execution input in core and Realtime, re-evaluate current policies on durable approval resumes, reject uncopyable normalized values before conditional approval, and preserve invalid-input handling (#1914, #1915).
+- 3515c29: fix: redact default function-tool and Realtime approval parse failures; require explicit invocation policy for sensitive error traces and clarify when custom errorFunction feedback applies.
+
+### Patch Changes
+
+- c55d64d: fix: add an optional rollback item budget for Responses session compaction.
+- c345409: feat: add optional page limits for automatic MCP tool listing
+- a0b1c6f: fix: Preserve current permanent function approval decisions when restoring nested runs from saved state.
+- 9c94138: fix: honor the invoking Runner's sensitive-data tracing policy in Codex spans, including mixed CommonJS and ESM applications.
+- c3e02d2: fix: Refresh cached sandbox application tools and preserve public agent identity in tool filters.
+- f80c91c: fix: Preserve guarded final outputs, including empty strings, in default Agent.asTool output extraction.
+- 3949bb1: fix: Apply static MCP tool filters when discovering tools without full agent and run context.
+- 186f6ec: fix: Trim local workspace logical path separators in linear time.
+- fdaf0a6: fix: handle MCP tools from one server whose names normalize to the same function tool name
+- 817161d: build: Generate package metadata with native Node.js TypeScript support.
+- 20e5946: chore: Run PTY signal regression tests with native Node.js instead of the tsx CLI.
+- ec8bb33: fix: Preserve post-construction agent storage settings through model requests and cloning.
+- 9623a22: fix: preserve multiline skill frontmatter descriptions and keep nested fields out of skill index metadata.
+- 58844c7: fix: Withhold unvetted final assistant output from session history when output guardrails fail to complete.
+- d0e5d43: fix: Keep parent transport overrides out of agent tool runs with an explicit Model while preserving common settings and explicit child overrides.
+- 2127475: fix: preserve stored history excluded from the latest successful model exchange during automatic compaction.
+- b9a4fb8: fix: respect sensitive-data trace settings for escaping tool callbacks.
+- 7f135af: fix: update compatible runtime and development dependencies.
+- ee65014: fix: Reject read-only host binds combined with privileged in-container Docker storage before provider or filesystem effects.
+- 00eef0c: fix: Reject selected handoff input filters with server-managed conversationId or previousResponseId before handoff side effects; use client-managed history or a Session without continuation options instead.
+- 218a2b8: fix: snapshot configured tool candidates during asynchronous enablement so in-place array changes do not duplicate or skip tools.
+- 8ac97df: fix: Reject computer calls without aborting the run when onSafetyCheck explicitly returns false.
+- 96aa754: fix: respect sensitive tracing settings for computer safety-check callback errors and enclosing run-span error names.
+- 7efc536: fix: update compatible workspace dependencies while preserving supported provider and Expo versions.
+- 8a26e30: fix: Serialize hosted MCP approval tool references without live configuration.
+- 4ef9008: fix: Preserve cached MCP tools for unrelated servers with colon-suffixed names when invalidating another server's cache (#1976).
+- f507590: fix: accept deferred hosted MCP listings before tool-search results (#1978)
+- d187747: fix: Apply current MCP tool filters on every lookup while reusing cached tool discovery.
+- fc2d2a4: feat: allow configuring phase-two memory consolidation turns.
+- 0bdea85: fix: Compute sandbox parent paths in linear time while preserving existing path semantics.
+- a9b543b: fix: preserve prompt formatting when rendering large multiline skill descriptions.
+- 06bbcc0: chore: migrate tracing test mocks to Vitest 5.
+
+## 0.18.0
+
+### Minor Changes
+
+- 064fcb2: fix: protect UnixLocal file/editor operations with optional auto/required/off Python support, and run Docker file APIs inside a running container with GNU utilities and mounted path grants; Docker editor updates enforce a 10 MB source limit.
+
+### Patch Changes
+
+- b665b0e: fix: recover unloaded deferred calls through opt-in model-visible errors and built-in client search, with required Responses wire defaults, live source-Agent ownership, and server-side search preserved for deferred hosted MCP tools (#1855).
+- 19d0b5f: fix: capture the final computer screenshot once per action batch (#1735)
+
+## 0.17.2
+
+### Patch Changes
+
+- 8d1f019: fix: preserve explicit settings for GPT-5-and-newer models and concrete model instances, default gpt-6-astra reasoning to low, and use adapter-declared prompt model selection when applying implicit defaults (#1849).
+
+## 0.17.1
+
+### Patch Changes
+
+- dd1becb: feat: allow labels on Docker sandbox containers
+- 0b94437: fix: detach source usage records during aggregation
+- d7ed6b2: feat: allow custom messages for output guardrail-blocked tool results
+- b09622f: fix: deduplicate MCP server ownership and refresh active server state after close
+- 6721ccd: fix: isolate cached MCP tool definitions from caller and filter mutations
+- c15c3ac: fix: correct typo in agent tools JSDoc comment
+- 3261264: fix: preserve buffered PTY output without waiting for background descendants.
+- 9be3e39: fix: prevent sandbox Git repository inputs from being interpreted as host Git options.
+- b4fa898: fix: handle rejected async tracing processor hooks from synchronous span lifecycle methods
+- 8e862b3: fix: honor end-of-file hunks when the file ends in a newline
+- 05e5851: feat: add server-wide MCP tool guardrails
+- 0b949bc: fix: preserve serialized approval resume ownership
+- c0a6718: fix: preserve pending approvals before handoffs and recover resumed handoffs after Session append failures
+- b1a41cf: fix: preserve concurrent wrapper writes by skipping automatic session compaction when the run no longer owns its history snapshot.
+- 5c3c3b4: fix: preserve CRLF line endings when applyDiff inserts or replaces lines in CRLF files. (#1804)
+- cd5a2c8: fix(core): preserve handoff callback errors after input validation
+- e668ea1: refactor: isolate historical RunState compaction restoration without changing snapshot compatibility or session reconciliation.
+- eb690a4: fix: recover failed resumed Session writes before continuing runs
+- c3bfb2c: fix: reject unsuccessful OpenAI Responses terminal states without losing billed usage
+- d364ef2: refactor: share Zod description lookup across structured agent input and JSON Schema conversion.
+- 0035d33: fix: strip output-only created_by metadata at replay boundaries
+- d19101e: fix: preserve deferred tool identity across approval checkpoints
+- a9e3214: fix: bound WebSocket startup cleanup, settle acquired PTY resources, and stabilize local PTY exit regression coverage
+- 92d1d9c: fix: Preserve tool-search Agent attribution across handoffs and history replay; persisted discovery requires a unique logical Agent name, and unattributed or ambiguous history requires a new search.
+- 2dc21b6: fix(core): wait for in-flight trace exports during force flush (#1812)
+
 ## 0.17.0
 
 ### Minor Changes

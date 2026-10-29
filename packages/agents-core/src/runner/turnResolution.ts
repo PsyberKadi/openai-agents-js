@@ -1,8 +1,8 @@
 import { z } from 'zod';
 import { Agent } from '../agent';
 import { getAgentToolSourceAgent } from '../agentToolSourceRegistry';
-import type { Handoff } from '../handoff';
-import { ModelBehaviorError, ModelRefusalError } from '../errors';
+import type { Handoff, HandoffInputData } from '../handoff';
+import { ModelBehaviorError, ModelRefusalError, UserError } from '../errors';
 import {
   RunHandoffCallItem,
   RunItem,
@@ -57,6 +57,7 @@ import {
   getFunctionToolStateKeyForCall,
   getFunctionToolStateKeyForResolvedCall,
   getFunctionToolStateKeys,
+  matchesFunctionToolRecipient,
   getToolCallNamespace,
   resolveFunctionToolCall,
   getHostedMcpApprovalRequestIdentity,
@@ -95,6 +96,8 @@ export function preflightModelResponseToolInvocations<TContext>(
   modelResponse: ModelResponse,
   tools: Tool<TContext>[],
   handoffs: Handoff<any, any>[],
+  runner: Runner,
+  signal?: AbortSignal,
 ): void {
   const functionMap = buildFunctionToolLookupMap(
     tools.filter(
@@ -108,19 +111,24 @@ export function preflightModelResponseToolInvocations<TContext>(
   const shell = tools.find((tool) => tool.type === 'shell');
   const applyPatch = tools.find((tool) => tool.type === 'apply_patch');
   const seen = new Map<string, string>();
+  let selectedHandoff: Handoff<any, any> | undefined;
   const validate = (
     toolName: string | undefined,
     rawItem: ApprovalCapableToolCall,
   ) => {
     if (!toolName) {
-      return;
+      return false;
     }
     const { callId, fingerprint } = state._context._validateToolInvocation(
       agent,
       toolName,
       rawItem,
     );
-    state._preflightToolInvocation(agent, callId, fingerprint);
+    const completed = state._preflightToolInvocation(
+      agent,
+      callId,
+      fingerprint,
+    );
     const previous = seen.get(callId);
     if (previous !== undefined && previous !== fingerprint) {
       throw new ModelBehaviorError(
@@ -129,6 +137,7 @@ export function preflightModelResponseToolInvocations<TContext>(
       );
     }
     seen.set(callId, fingerprint);
+    return !completed && previous !== fingerprint;
   };
 
   for (const output of modelResponse.output) {
@@ -137,7 +146,13 @@ export function preflightModelResponseToolInvocations<TContext>(
         ? handoffMap.get(output.name)
         : undefined;
       if (handoff) {
-        validate(getHandoffToolInvocationName(handoff.toolName), output);
+        const shouldRun = validate(
+          getHandoffToolInvocationName(handoff.toolName),
+          output,
+        );
+        if (shouldRun && !selectedHandoff) {
+          selectedHandoff = handoff;
+        }
         continue;
       }
       const resolvedTool = resolveFunctionToolCall(output, functionMap);
@@ -176,6 +191,9 @@ export function preflightModelResponseToolInvocations<TContext>(
       );
     }
   }
+  if (selectedHandoff && !signal?.aborted) {
+    validateHandoffInputFilter(selectedHandoff, runner, state);
+  }
 }
 
 export function preflightToolInvocations<TContext>(
@@ -208,11 +226,26 @@ export function preflightToolInvocations<TContext>(
   };
 
   for (const run of processedResponse.functions ?? []) {
-    observe(
+    const toolName =
       getFunctionToolStateKey(run.tool) ??
-        getFunctionToolStateKeyForCall(run.toolCall, run.tool.name),
-      run.toolCall,
-    );
+      getFunctionToolStateKeyForCall(run.toolCall, run.tool.name);
+    const observation = observe(toolName, run.toolCall);
+    if (
+      observation &&
+      !observation.shouldSuppress &&
+      !matchesFunctionToolRecipient(run.mcpToolBinding ?? null, run.tool) &&
+      state._context.isToolApproved({
+        toolName: toolName!,
+        callId: observation.callId,
+        agent,
+        functionTool: false,
+      }) !== false
+    ) {
+      throw new UserError(
+        'Cannot resume a function tool call with a missing or different MCP recipient binding. Restore the original MCP configuration and tool listing, or start a new run.',
+        state,
+      );
+    }
   }
   for (const run of processedResponse.functionToolsNotFound ?? []) {
     observe(
@@ -338,7 +371,10 @@ async function resolveToolNotFoundMessage<TContext>(
   toolRun: ToolRunFunctionNotFound,
   toolErrorFormatter?: ToolErrorFormatter<TContext>,
 ): Promise<string> {
-  const defaultMessage = DEFAULT_TOOL_NOT_FOUND_MESSAGE(toolRun.toolName);
+  const defaultMessage =
+    toolRun.reason === 'not_loaded'
+      ? `Error: Tool ${toolRun.toolName} is not loaded for the current agent. The requested function was not executed. Call tool_search to load it, then retry the original function call with the same arguments.`
+      : DEFAULT_TOOL_NOT_FOUND_MESSAGE(toolRun.toolName);
   if (!toolErrorFormatter) {
     return defaultMessage;
   }
@@ -991,12 +1027,22 @@ export async function resolveInterruptedTurn<TContext>(
   agentToolParentRunConfig?: Partial<RunConfig>,
   signal?: AbortSignal,
   validateHandoffAgent?: (agent: Agent<any, any>) => void,
+  beforeHandoffInputFilter?: (input: HandoffInputData) => void,
 ): Promise<SingleStepResult> {
   const suppressedToolCalls = preflightToolInvocations(
     agent,
     state,
     processedResponse as ProcessedResponse<TContext>,
   );
+  const handoffRuns = processedResponse.handoffs.filter(
+    (run) => !suppressedToolCalls.has(run.toolCall),
+  );
+  if (handoffRuns.length > 0) {
+    if (!signal?.aborted) {
+      validateHandoffInputFilter(handoffRuns[0].handoff, runner, state);
+    }
+    validateHandoffAgent?.(handoffRuns[0].handoff.agent);
+  }
   // call_ids for function tools
   const functionCallIds = originalPreStepItems
     .filter(
@@ -1303,6 +1349,25 @@ export async function resolveInterruptedTurn<TContext>(
     state.rewindTurnPersistence(removedApprovalCount);
   }
 
+  const handoffStep = await resolveHandoffAfterTools({
+    agent,
+    originalInput,
+    preStepItems,
+    newItems,
+    newResponse,
+    handoffRuns,
+    functionResults,
+    additionalInterruptions,
+    runner,
+    state,
+    signal,
+    validateHandoffAgent,
+    beforeHandoffInputFilter,
+  });
+  if (handoffStep) {
+    return handoffStep;
+  }
+
   const completedStep = await maybeCompleteTurnFromToolResults({
     agent,
     runner,
@@ -1375,6 +1440,9 @@ export async function resolveTurnAfterModelResponse<
     (run) => !suppressedToolCalls.has(run.toolCall),
   );
   if (handoffRuns.length > 0) {
+    if (!signal?.aborted) {
+      validateHandoffInputFilter(handoffRuns[0].handoff, runner, state);
+    }
     validateHandoffAgent?.(handoffRuns[0].handoff.agent);
   }
   const functionRuns = processedResponse.functions.filter(
@@ -1510,27 +1578,22 @@ export async function resolveTurnAfterModelResponse<
     });
   }
 
-  // process handoffs
-  if (handoffRuns.length > 0) {
-    if (signal?.aborted) {
-      for (const { toolCall } of handoffRuns) {
-        const rawItem = buildFunctionAbortResult(toolCall);
-        appendIfNew(new RunToolCallOutputItem(rawItem, agent, rawItem.output));
-      }
-    } else {
-      return await executeHandoffCalls(
-        agent,
-        originalInput,
-        preStepItems,
-        newItems,
-        newResponse,
-        handoffRuns as ToolRunHandoff[],
-        runner,
-        state._context,
-        getRunStateTurnSpanParent(state) ?? state._currentAgentSpan,
-        validateHandoffAgent,
-      );
-    }
+  const handoffStep = await resolveHandoffAfterTools({
+    agent,
+    originalInput,
+    preStepItems,
+    newItems,
+    newResponse,
+    handoffRuns,
+    functionResults,
+    additionalInterruptions,
+    runner,
+    state,
+    signal,
+    validateHandoffAgent,
+  });
+  if (handoffStep) {
+    return handoffStep;
   }
 
   const completedStep = await maybeCompleteTurnFromToolResults({
@@ -1761,6 +1824,93 @@ type TurnFinalizationParams<TContext> = {
   newItems: RunItem[];
   additionalInterruptions?: RunToolApprovalItem[];
 };
+
+// Local handoff filters cannot remove history already owned by the server.
+function validateHandoffInputFilter(
+  handoff: Handoff<any, any>,
+  runner: Runner,
+  state: RunState<any, any>,
+): void {
+  const inputFilter = handoff.inputFilter ?? runner.config.handoffInputFilter;
+  if (
+    inputFilter != null &&
+    (state._conversationId || state._previousResponseId)
+  ) {
+    throw new UserError(
+      'Handoff input filters cannot be used with conversationId or previousResponseId because server-managed history cannot be filtered locally. Use explicit client-managed history or a Session without either continuation option.',
+    );
+  }
+}
+
+// Handoffs retain precedence over terminal tool behavior, but cannot discard pending approvals.
+async function resolveHandoffAfterTools<TContext>(
+  options: TurnFinalizationParams<TContext> & {
+    handoffRuns: ToolRunHandoff[];
+    signal?: AbortSignal;
+    validateHandoffAgent?: (agent: Agent<any, any>) => void;
+    beforeHandoffInputFilter?: (input: HandoffInputData) => void;
+  },
+): Promise<SingleStepResult | undefined> {
+  const {
+    agent,
+    originalInput,
+    preStepItems,
+    newItems,
+    newResponse,
+    handoffRuns,
+    functionResults,
+    additionalInterruptions,
+    runner,
+    state,
+    signal,
+    validateHandoffAgent,
+    beforeHandoffInputFilter,
+  } = options;
+  if (handoffRuns.length === 0) {
+    return undefined;
+  }
+  if (signal?.aborted) {
+    const appendContext = buildAppendContext([...preStepItems, ...newItems]);
+    for (const { toolCall } of handoffRuns) {
+      const rawItem = buildFunctionAbortResult(toolCall);
+      appendRunItemIfNew(
+        new RunToolCallOutputItem(rawItem, agent, rawItem.output),
+        newItems,
+        appendContext,
+      );
+    }
+    return undefined;
+  }
+  const interruptions = collectInterruptions(
+    functionResults,
+    additionalInterruptions,
+  );
+  if (interruptions.length > 0) {
+    return new SingleStepResult(
+      originalInput,
+      newResponse,
+      preStepItems,
+      newItems,
+      {
+        type: 'next_step_interruption',
+        data: { interruptions },
+      },
+    );
+  }
+  return executeHandoffCalls(
+    agent,
+    originalInput,
+    preStepItems,
+    newItems,
+    newResponse,
+    handoffRuns,
+    runner,
+    state._context,
+    getRunStateTurnSpanParent(state) ?? state._currentAgentSpan,
+    validateHandoffAgent,
+    beforeHandoffInputFilter,
+  );
+}
 
 // Consolidates the logic that determines whether tool results yielded a final answer,
 // triggered an interruption, or require the agent loop to continue running.

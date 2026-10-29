@@ -5,8 +5,11 @@ import {
   SandboxProviderError,
   SandboxUnsupportedFeatureError,
 } from '@openai/agents-core/sandbox';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 import { ONE_BY_ONE_PNG } from './imageFixture';
 import {
@@ -189,6 +192,107 @@ describe('E2BSandboxClient', () => {
     killMock.mockResolvedValue(undefined);
   });
 
+  test.each(['constructor', 'create options', 'undefined override'] as const)(
+    'enforces archive limits from %s before hydration side effects',
+    async (source) => {
+      const archiveLimits = { maxExtractedBytes: 1 };
+      const client = new E2BSandboxClient({
+        archiveLimits: source !== 'create options' ? archiveLimits : undefined,
+      });
+      const session = await client.create({
+        options:
+          source === 'create options'
+            ? { archiveLimits }
+            : source === 'undefined override'
+              ? { archiveLimits: undefined }
+              : undefined,
+      });
+      const archive = makeTarArchive([{ name: 'README.md', content: 'large' }]);
+      writeMock.mockClear();
+      runMock.mockClear();
+      await expect(session.hydrateWorkspace(archive)).rejects.toThrow(
+        'archive extracted size exceeds limit',
+      );
+      expect(writeMock).not.toHaveBeenCalled();
+      expect(runMock).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each(['constructor', 'create options', 'top-level'] as const)(
+    'rejects invalid archive limits from %s before provisioning',
+    async (source) => {
+      const archiveLimits = { maxExtractedBytes: 0 };
+      const client = new E2BSandboxClient({
+        archiveLimits: source === 'constructor' ? archiveLimits : undefined,
+      });
+      await expect(
+        client.create({
+          options: source === 'create options' ? { archiveLimits } : undefined,
+          archiveLimits: source === 'top-level' ? archiveLimits : undefined,
+        }),
+      ).rejects.toThrow('archiveLimits.maxExtractedBytes must be at least 1.');
+      expect(createMock).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each([null, { maxExtractedBytes: 5 }])(
+    'validates only the effective archive policy %j',
+    async (archiveLimits) => {
+      const client = new E2BSandboxClient({
+        archiveLimits: { maxExtractedBytes: 0 },
+      });
+      const session = await client.create({
+        options: { archiveLimits: { maxExtractedBytes: 0 } },
+        archiveLimits,
+      });
+      await expect(
+        session.hydrateWorkspace(
+          makeTarArchive([{ name: 'ok.txt', content: 'small' }]),
+        ),
+      ).resolves.toBeUndefined();
+    },
+  );
+
+  test.each(['create options', 'top-level', 'manifest overload'] as const)(
+    'preserves explicit null archive limits from %s',
+    async (source) => {
+      const client = new E2BSandboxClient({
+        archiveLimits: { maxExtractedBytes: 1 },
+      });
+      const session =
+        source === 'manifest overload'
+          ? await client.create(new Manifest(), { archiveLimits: null })
+          : await client.create(
+              source === 'top-level'
+                ? { archiveLimits: null }
+                : { options: { archiveLimits: null } },
+            );
+      await expect(
+        session.hydrateWorkspace(
+          makeTarArchive([{ name: 'README.md', content: 'large' }]),
+        ),
+      ).resolves.toBeUndefined();
+    },
+  );
+
+  test('top-level archive limits override provider options', async () => {
+    const client = new E2BSandboxClient({ archiveLimits: null });
+    const session = await client.create({
+      options: { archiveLimits: null },
+      archiveLimits: { maxExtractedBytes: 5 },
+    });
+    await expect(
+      session.hydrateWorkspace(
+        makeTarArchive([{ name: 'ok.txt', content: 'small' }]),
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      session.hydrateWorkspace(
+        makeTarArchive([{ name: 'large.txt', content: 'too large' }]),
+      ),
+    ).rejects.toThrow('archive extracted size exceeds limit');
+  });
+
   test('rejects unsupported core create options instead of ignoring them', async () => {
     const client = new E2BSandboxClient();
 
@@ -275,6 +379,71 @@ describe('E2BSandboxClient', () => {
     expect(output).toContain('boom');
   });
 
+  test('rejects repository options before provider creation or update effects', async () => {
+    const client = new E2BSandboxClient();
+    const session = await client.create(new Manifest());
+    vi.clearAllMocks();
+    const manifest = new Manifest({
+      entries: { app: { type: 'git_repo', repo: 'owner/repo' } },
+    });
+    manifest.entries.app.repo = '--upload-pack=unused #://';
+    await expect(client.create(manifest)).rejects.toThrow(
+      'git_repo repository URL must not start with "-".',
+    );
+    await expect(session.applyManifest(manifest)).rejects.toThrow(
+      'git_repo repository URL must not start with "-".',
+    );
+    expect(createMock).not.toHaveBeenCalled();
+    expect(runMock).not.toHaveBeenCalled();
+    expect(writeMock).not.toHaveBeenCalled();
+    expect(removeMock).not.toHaveBeenCalled();
+    expect(processMocks.runSandboxProcess).not.toHaveBeenCalled();
+  });
+
+  test('clones a local Git source before uploading its selected file', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agents-e2b-git-test-'));
+    const exec = promisify(execFile);
+    try {
+      await exec('git', ['init', root]);
+      await writeFile(join(root, 'selected.txt'), 'local Git contents');
+      await exec('git', ['-C', root, 'add', 'selected.txt']);
+      await exec('git', [
+        '-C',
+        root,
+        '-c',
+        'user.name=Test',
+        '-c',
+        'user.email=test@example.com',
+        'commit',
+        '-m',
+        'fixture',
+      ]);
+      // Keep the provider mocked but exercise the actual host Git materializer.
+      processMocks.runSandboxProcess.mockImplementation(
+        async (command: string, args: string[]) => {
+          const { stdout } = await exec(command, args);
+          return processSuccess(stdout);
+        },
+      );
+      await new E2BSandboxClient().create(
+        new Manifest({
+          entries: {
+            'selected.txt': {
+              type: 'git_repo',
+              repo: `file://${root}`,
+              subpath: 'selected.txt',
+            },
+          },
+        }),
+      );
+      expect(
+        Buffer.from(files.get('/workspace/selected.txt')!).toString(),
+      ).toBe('local Git contents');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test('materializes git_repo file subpaths as files', async () => {
     processMocks.runSandboxProcess.mockImplementation(
       async (_command: string, args: string[]) => {
@@ -282,6 +451,10 @@ describe('E2BSandboxClient', () => {
           return processSuccess('git version 2.0.0');
         }
         if (args[0] === 'clone') {
+          expect(args.slice(-3, -1)).toEqual([
+            '--',
+            'https://example.test/repo.git',
+          ]);
           const tempDir = args[args.length - 1];
           await mkdir(join(tempDir, 'nested'), { recursive: true });
           await writeFile(join(tempDir, 'nested', 'selected.txt'), 'selected');
@@ -617,12 +790,21 @@ describe('E2BSandboxClient', () => {
       chars: 'echo next\n',
       yieldTimeMs: 250,
     });
+    // Deliver the final character in separate callbacks before the SDK reader closes.
+    onData(new Uint8Array([0xe5]));
+    const pendingDone = session.writeStdin({ sessionId, yieldTimeMs: 250 });
+    await Promise.resolve();
+    onData(new Uint8Array([0xae, 0x8c]));
     finishWait({ exitCode: 0 });
-    const done = await session.writeStdin({
+    const done = await pendingDone;
+    expect(done).toContain('完');
+    expect(done).not.toContain('\uFFFD');
+    const missing = await session.writeStdin({
       sessionId,
       yieldTimeMs: 250,
     });
 
+    expect(missing).toContain('session not found');
     expect(next).toContain('echo next');
     expect(done).toContain('Process exited with code 0');
     expect(ptyCreateMock).toHaveBeenCalledWith(
@@ -641,14 +823,21 @@ describe('E2BSandboxClient', () => {
   });
 
   test('terminates PTY execution when the initial stdin write fails', async () => {
-    const handleKillMock = vi.fn(async () => true);
+    let failCleanup!: (error: Error) => void;
+    const handleKillMock = vi.fn(
+      () =>
+        new Promise<boolean>((_resolve, reject) => {
+          failCleanup = reject;
+        }),
+    );
+    const failure = new Error('stdin unavailable');
     const ptyCreateMock = vi.fn(async () => ({
       pid: 42,
       wait: async () => ({ exitCode: 1 }),
       kill: handleKillMock,
     }));
     const ptySendInputMock = vi.fn(async () => {
-      throw new Error('stdin unavailable');
+      throw failure;
     });
     createMock.mockResolvedValueOnce({
       sandboxId: 'sbx_test',
@@ -673,9 +862,17 @@ describe('E2BSandboxClient', () => {
     const client = new E2BSandboxClient();
     const session = await client.create(new Manifest());
 
-    await expect(
-      session.execCommand({ cmd: 'echo ready', tty: true }),
-    ).rejects.toThrow('stdin unavailable');
+    let settled = false;
+    const result = session
+      .execCommand({ cmd: 'echo ready', tty: true })
+      .catch((error) => {
+        settled = true;
+        return error;
+      });
+    await vi.waitFor(() => expect(handleKillMock).toHaveBeenCalledOnce());
+    expect(settled).toBe(false);
+    failCleanup(new Error('kill failed'));
+    expect(await result).toBe(failure);
 
     expect(ptySendInputMock).toHaveBeenCalledOnce();
     expect(handleKillMock).toHaveBeenCalledOnce();
@@ -1140,6 +1337,27 @@ describe('E2BSandboxClient', () => {
     ).toBe(true);
     expect(writeMock).toHaveBeenCalledWith('/workspace/notes.txt', 'hello\n');
   });
+
+  test.each([
+    ['drwxrwxrwt', '1777'],
+    ['drwxrwxrwT', '1776'],
+  ])(
+    'applies sticky directory metadata through the provider: %s',
+    async (permissions, mode) => {
+      const client = new E2BSandboxClient();
+      await client.create(
+        new Manifest({
+          entries: { shared: { type: 'dir', permissions } },
+        }),
+      );
+      const commands = runMock.mock.calls.map(([command]) => String(command));
+      expect(
+        commands.some((command) =>
+          command.includes(`chmod ${mode} -- '/workspace/shared'`),
+        ),
+      ).toBe(true);
+    },
+  );
 
   test('preserves client env while manifest values take precedence', async () => {
     const client = new E2BSandboxClient({

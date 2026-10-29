@@ -1,14 +1,15 @@
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import {
   Agent,
   run,
   withTrace,
   applyPatchTool,
-  Editor,
-  ApplyPatchOperation,
-  ApplyPatchResult,
+  type Editor,
+  type ApplyPatchOperation,
+  type ApplyPatchResult,
 } from '@openai/agents';
 import { applyDiff } from '@openai/agents';
 import chalk from 'chalk';
@@ -26,8 +27,12 @@ function printDiff(diff: string) {
   }
 }
 
-class WorkspaceEditor implements Editor {
-  constructor(private readonly root: string) {}
+export class WorkspaceEditor implements Editor {
+  private readonly root: string;
+
+  constructor(root: string) {
+    this.root = root;
+  }
 
   async createFile(
     operation: Extract<ApplyPatchOperation, { type: 'create_file' }>,
@@ -64,7 +69,12 @@ class WorkspaceEditor implements Editor {
 
   private async resolve(relativePath: string): Promise<string> {
     const resolved = path.resolve(this.root, relativePath);
-    if (!resolved.startsWith(this.root)) {
+    const relative = path.relative(this.root, resolved);
+    if (
+      relative === '..' ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative)
+    ) {
       throw new Error(`Operation outside workspace: ${relativePath}`);
     }
     return resolved;
@@ -171,7 +181,12 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

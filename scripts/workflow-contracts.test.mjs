@@ -36,13 +36,30 @@ async function pathExists(filePath) {
 }
 
 describe('repository workflow contracts', () => {
+  it('requires manual execution of both host shell aliases without injecting approval', async () => {
+    const toolsPackage = JSON.parse(
+      await readFile(
+        path.join(repositoryRoot, 'examples/tools/package.json'),
+        'utf8',
+      ),
+    );
+    for (const alias of ['start:shell', 'start:local-shell']) {
+      expect(toolsPackage.scripts[alias]).toBe('node local-shell.ts');
+      expect(DEFAULT_AUTO_SKIP).toContain(`tools:${alias}`);
+    }
+    const runner = await readFile(
+      path.join(repositoryRoot, 'scripts/run-example-starts.mjs'),
+      'utf8',
+    );
+    expect(runner).not.toContain('SHELL_AUTO_APPROVE');
+  });
+
   it('skips unsupported provider and process examples in automatic runs', () => {
     expect(DEFAULT_AUTO_SKIP).toContain('sandbox:start:cloudflare');
 
     expect([...CODEX_SANDBOX_AUTO_SKIP.keys()].sort()).toEqual([
       'agent-patterns:start:hosted-multi-agent',
       'sandbox:start:e2b',
-      'sandbox:start:runloop',
       'tools:start:computer-use',
       'tools:start:computer-use-hitl',
     ]);

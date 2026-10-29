@@ -52,22 +52,28 @@ describe('Compaction', () => {
     });
   });
 
-  it.each(['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])(
-    'uses the 1M context window for %s compaction',
-    (model) => {
-      const capability = compaction();
+  it.each([
+    'gpt-6-astra',
+    'gpt-6-sol',
+    'gpt-6-luna',
+    'gpt-6.1-sol',
+    'gpt-5.6',
+    'gpt-5.6-sol',
+    'gpt-5.6-terra',
+    'gpt-5.6-luna',
+  ])('uses the 1M context window for %s compaction', (model) => {
+    const capability = compaction();
 
-      expect(CompactionModelInfo.forModel(model)?.contextWindow).toBe(1047576);
-      expect(capability.samplingParams({ model })).toEqual({
-        context_management: [
-          {
-            type: 'compaction',
-            compact_threshold: 942818,
-          },
-        ],
-      });
-    },
-  );
+    expect(CompactionModelInfo.forModel(model)?.contextWindow).toBe(1047576);
+    expect(capability.samplingParams({ model })).toEqual({
+      context_management: [
+        {
+          type: 'compaction',
+          compact_threshold: 942818,
+        },
+      ],
+    });
+  });
 
   it('tracks Python sandbox model context windows for compaction', () => {
     expect(CompactionModelInfo.forModel('o1-pro')?.contextWindow).toBe(200000);
@@ -328,6 +334,7 @@ describe('Memory', () => {
       maxRawMemoriesForConsolidation: 256,
       phaseOneModel: 'gpt-5.4-mini',
       phaseTwoModel: 'gpt-5.4',
+      phaseTwoMaxTurns: 500,
     });
     expect(() => memory({ read: false, generate: false })).toThrow(
       'Memory requires at least one of `read` or `generate`.',
@@ -342,6 +349,23 @@ describe('Memory', () => {
     ).toThrow(
       'MemoryGenerateConfig.maxRawMemoriesForConsolidation must be an integer between 1 and 4096.',
     );
+  });
+
+  it.each([undefined, true, {}, { phaseTwoMaxTurns: 2 }])(
+    'normalizes the phase-two turn budget for %j',
+    (generate) => {
+      expect(memory({ generate }).generate?.phaseTwoMaxTurns).toBe(
+        typeof generate === 'object' && 'phaseTwoMaxTurns' in generate
+          ? 2
+          : 500,
+      );
+    },
+  );
+
+  it('keeps memory generation disabled with a configured turn budget', () => {
+    expect(
+      memory({ generate: { enabled: false, phaseTwoMaxTurns: 2 } }).generate,
+    ).toBeNull();
   });
 
   it('rejects known snake_case memory config aliases', () => {
@@ -363,6 +387,10 @@ describe('Memory', () => {
       {
         args: { generate: { phase_one_model_settings: {} } },
         key: 'phase_one_model_settings',
+      },
+      {
+        args: { generate: { phase_two_max_turns: 2 } },
+        key: 'phase_two_max_turns',
       },
       {
         args: { generate: { phase_two_model: 'gpt-5.4' } },

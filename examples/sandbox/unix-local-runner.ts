@@ -6,7 +6,7 @@ import {
   getStringArg,
   requireOpenAIKey,
   runExampleMain,
-} from './support';
+} from './support.ts';
 
 const DEFAULT_QUESTION =
   'Review this renewal packet. Summarize the customer situation, likely blockers, and the next two account-team actions.';
@@ -58,8 +58,12 @@ async function main() {
   const model = getStringArg('--model', DEFAULT_MODEL);
   const question = getStringArg('--question', DEFAULT_QUESTION);
   const manifest = buildManifest();
-  const client = new UnixLocalSandboxClient();
+  // 'auto' and 'required' both require a trusted Python 3 interpreter.
+  // 'off' is unsupported. Missing file I/O support fails before workspace setup.
+  // This applies to file APIs; shell commands still run directly on the host.
+  const client = new UnixLocalSandboxClient({ fileIOProtection: 'auto' });
   const session = await client.create(manifest);
+  console.log(`[host file backend] ${session.fileIOBackend}`);
 
   const agent = new SandboxAgent({
     name: 'Unix Local Renewal Analyst',

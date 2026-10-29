@@ -320,6 +320,365 @@ describe('Runner.run', () => {
       expect(result.finalOutput).toBe('done');
     });
 
+    it.each([
+      {
+        label: 'Zod',
+        parameters: z.object({
+          to: z.string(),
+          cc: z.array(z.string()).optional(),
+        }),
+      },
+      {
+        label: 'strict JSON schema',
+        parameters: {
+          type: 'object' as const,
+          properties: {
+            to: { type: 'string' as const },
+            cc: {
+              type: 'array' as const,
+              items: { type: 'string' as const },
+            },
+          },
+          required: ['to'],
+          additionalProperties: false,
+        },
+      },
+    ])(
+      'passes normalized optional fields to dynamic approval for $label tools',
+      async ({ parameters }) => {
+        const needsApproval = vi.fn(
+          async (_context: RunContext, { cc }: { cc?: string[] }) =>
+            cc !== undefined && cc.length > 0,
+        );
+        const execute = vi.fn(async () => 'sent');
+        const sendEmail = tool<any>({
+          name: 'send_email',
+          description: 'Send an email',
+          parameters,
+          needsApproval,
+          execute,
+        });
+        const model = new ScriptedModel([
+          modelResponse({
+            output: [
+              {
+                ...TEST_MODEL_FUNCTION_CALL,
+                name: sendEmail.name,
+                arguments: JSON.stringify({
+                  to: 'bob@example.com',
+                  cc: null,
+                }),
+              },
+            ],
+            usage: new Usage(),
+          }),
+          modelResponse({
+            output: [fakeModelMessage('done')],
+            usage: new Usage(),
+          }),
+        ]);
+        const agent = new Agent({
+          name: 'NormalizedApprovalAgent',
+          model,
+          tools: [sendEmail],
+        });
+
+        const result = await run(agent, 'send it');
+
+        expect(needsApproval).toHaveBeenCalledTimes(1);
+        expect(needsApproval.mock.calls[0]?.[1]).toEqual({
+          to: 'bob@example.com',
+        });
+        expect(execute).toHaveBeenCalledWith(
+          { to: 'bob@example.com' },
+          expect.any(RunContext),
+          expect.anything(),
+        );
+        expect(result.finalOutput).toBe('done');
+      },
+    );
+
+    it.each([false, true])(
+      'reuses one normalized snapshot for dynamic approval and execution (stream=%s)',
+      async (stream) => {
+        let normalizeCount = 0;
+        let approvalInput: { value: number } | undefined;
+        const parameters = z
+          .object({ value: z.number() })
+          .transform(({ value }) => ({ value: value + ++normalizeCount }));
+        const needsApproval = vi.fn(
+          async (_context: RunContext, input: { value: number }) => {
+            expect(input.value).toBe(2);
+            approvalInput = { ...input };
+            input.value = 99;
+            return false;
+          },
+        );
+        const execute = vi.fn(async ({ value }: { value: number }) => value);
+        const snapshotTool = tool({
+          name: 'snapshot_tool',
+          description: 'Uses one normalized input snapshot.',
+          parameters,
+          needsApproval,
+          execute,
+        });
+        const model = new ScriptedModel([
+          modelResponse({
+            output: [
+              {
+                ...TEST_MODEL_FUNCTION_CALL,
+                name: snapshotTool.name,
+                arguments: JSON.stringify({ value: 1 }),
+              },
+            ],
+            usage: new Usage(),
+          }),
+          modelResponse({
+            output: [fakeModelMessage('done')],
+            usage: new Usage(),
+          }),
+        ]);
+        const agent = new Agent({
+          name: 'NormalizedSnapshotAgent',
+          model,
+          tools: [snapshotTool],
+        });
+
+        const result = stream
+          ? await run(agent, 'run it', { stream: true })
+          : await run(agent, 'run it');
+        if ('completed' in result) await result.completed;
+
+        expect(normalizeCount).toBe(1);
+        expect(approvalInput).toEqual({ value: 2 });
+        expect(execute).toHaveBeenCalledWith(
+          { value: 2 },
+          expect.any(RunContext),
+          expect.anything(),
+        );
+        expect(result.finalOutput).toBe('done');
+      },
+    );
+
+    it.each([
+      ['Zod', 'memory'],
+      ['Standard Schema', 'memory'],
+      ['Zod', 'stable'],
+      ['Standard Schema', 'changed'],
+      ['Zod', 'rejected'],
+    ] as const)(
+      'binds normalized input across core approval resumes (%s, %s)',
+      async (schema, resume) => {
+        let count = 0;
+        const normalize = () => {
+          count += 1;
+          return {
+            value: resume === 'stable' ? 1 : count,
+          };
+        };
+        const standard: StandardSchemaWithJSON<object, { value: number }> = {
+          '~standard': {
+            version: 1,
+            vendor: 'test',
+            validate: () => ({ value: normalize() }),
+            jsonSchema: {
+              input: () => ({
+                type: 'object',
+                properties: {},
+                additionalProperties: false,
+              }),
+              output: () => ({ type: 'object' }),
+            },
+          },
+        };
+        const needsApproval = vi.fn(
+          async (_context: RunContext, input: { value: number }) => {
+            expect(input.value).toBe(resume === 'stable' ? 1 : count);
+            return true;
+          },
+        );
+        const execute = vi.fn(async ({ value }: { value: number }) => value);
+        const pendingTool = tool({
+          name: 'pending_normalized_input',
+          description: 'Keep the normalized value checked before interruption.',
+          parameters:
+            schema === 'Zod' ? z.object({}).transform(normalize) : standard,
+          needsApproval,
+          execute,
+        });
+        const model = new ScriptedModel([
+          modelResponse({
+            output: [
+              {
+                ...TEST_MODEL_FUNCTION_CALL,
+                name: pendingTool.name,
+                arguments: '{}',
+              },
+            ],
+            usage: new Usage(),
+          }),
+          modelResponse({
+            output: [fakeModelMessage('done')],
+            usage: new Usage(),
+          }),
+        ]);
+        const agent = new Agent({
+          name: 'PendingNormalizedInput',
+          model,
+          tools: [pendingTool],
+        });
+        const pending =
+          schema === 'Zod'
+            ? await run(agent, 'start', { stream: true })
+            : await run(agent, 'start');
+        if ('completed' in pending) await pending.completed;
+        expect(pending.interruptions).toHaveLength(1);
+        expect(execute).not.toHaveBeenCalled();
+        let state = pending.state;
+        if (resume !== 'memory') {
+          const json = JSON.parse(state.toString());
+          expect(json.$schemaVersion).toBe('1.23');
+          expect(json).not.toHaveProperty('pendingFunctionToolApprovals');
+          state = await RunState.fromString(agent, JSON.stringify(json));
+        }
+        if (resume === 'rejected') state.reject(state.getInterruptions()[0]);
+        else state.approve(state.getInterruptions()[0]);
+        const resumed =
+          schema === 'Zod'
+            ? await run(agent, state, { stream: true })
+            : await run(agent, state);
+        if ('completed' in resumed) await resumed.completed;
+        expect(resumed.finalOutput).toBe('done');
+        if (resume === 'rejected') expect(execute).not.toHaveBeenCalled();
+        else
+          expect(execute).toHaveBeenCalledWith(
+            { value: resume === 'changed' ? 2 : 1 },
+            expect.any(RunContext),
+            expect.anything(),
+          );
+        expect(state._pendingFunctionToolApprovals.size).toBe(0);
+        expect(needsApproval).toHaveBeenCalledTimes(
+          resume === 'stable' || resume === 'changed' ? 2 : 1,
+        );
+        expect(count).toBe(resume === 'memory' ? 1 : 2);
+      },
+    );
+
+    it('requires approval when normalization produces undefined', async () => {
+      const parameters = z
+        .object({ value: z.string() })
+        .transform(() => undefined);
+      const needsApproval = vi.fn(async () => false);
+      const execute = vi.fn(async () => 'unexpected');
+      const undefinedTool = tool({
+        name: 'undefined_tool',
+        description: 'Normalizes input to undefined.',
+        parameters,
+        needsApproval,
+        execute,
+      });
+      const model = new ScriptedModel([
+        modelResponse({
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              name: undefinedTool.name,
+              arguments: JSON.stringify({ value: 'input' }),
+            },
+          ],
+          usage: new Usage(),
+        }),
+      ]);
+      const agent = new Agent({
+        name: 'UndefinedApprovalAgent',
+        model,
+        tools: [undefinedTool],
+      });
+
+      const interrupted = await run(agent, 'run it');
+
+      expect(needsApproval).not.toHaveBeenCalled();
+      expect(execute).not.toHaveBeenCalled();
+      expect(interrupted.interruptions).toHaveLength(1);
+    });
+
+    it.each(['dynamic', 'static'] as const)(
+      'supports custom Standard Schema output only with %s approval',
+      async (policy) => {
+        class Output {
+          #value: string;
+          constructor(value: string) {
+            this.#value = value;
+          }
+          read() {
+            return this.#value;
+          }
+        }
+        const validate = vi.fn(() => ({ value: new Output('normalized') }));
+        const parameters: StandardSchemaWithJSON<object, Output> = {
+          '~standard': {
+            version: 1,
+            vendor: 'test',
+            validate,
+            jsonSchema: {
+              input: () => ({
+                type: 'object',
+                properties: {},
+                additionalProperties: false,
+              }),
+              output: () => ({ type: 'object' }),
+            },
+          },
+        };
+        const needsApproval = vi.fn(async () => false);
+        const execute = vi.fn(async (input: Output) => input.read());
+        const customTool = tool({
+          name: 'custom_output',
+          description: 'Use a custom output after approval.',
+          parameters,
+          needsApproval: policy === 'static' ? true : needsApproval,
+          execute,
+        });
+        const model = new ScriptedModel([
+          modelResponse({
+            output: [
+              {
+                ...TEST_MODEL_FUNCTION_CALL,
+                name: customTool.name,
+                arguments: '{}',
+              },
+            ],
+            usage: new Usage(),
+          }),
+          modelResponse({
+            output: [fakeModelMessage('done')],
+            usage: new Usage(),
+          }),
+        ]);
+        const agent = new Agent({
+          name: 'CustomOutput',
+          model,
+          tools: [customTool],
+        });
+        if (policy === 'dynamic') {
+          await expect(run(agent, 'start')).rejects.toThrow(
+            'Conditional tool approval requires copyable plain normalized input',
+          );
+          expect(needsApproval).not.toHaveBeenCalled();
+          expect(execute).not.toHaveBeenCalled();
+        } else {
+          const pending = await run(agent, 'start');
+          expect(pending.interruptions).toHaveLength(1);
+          pending.state.approve(pending.interruptions[0]);
+          const result = await run(agent, pending.state);
+          expect(result.finalOutput).toBe('done');
+          expect(execute).toHaveBeenCalledTimes(1);
+          expect(execute.mock.calls[0][0]).toBeInstanceOf(Output);
+          expect(execute.mock.calls[0][0].read()).toBe('normalized');
+        }
+      },
+    );
+
     it('isolates interruption arrays from pending approvals', async () => {
       const approvalTool = tool({
         name: 'snapshot_approval',
@@ -2539,6 +2898,109 @@ describe('Runner.run', () => {
       expect(model.calls).toHaveLength(0);
     });
 
+    it.each([false, true])(
+      'preserves cancellation during client-managed filtered handoff processing (stream=%s)',
+      async (stream) => {
+        const controller = new AbortController();
+        const abortReason = new Error('stop before filtered handoff');
+        let markSearchStarted!: () => void;
+        const searchStarted = new Promise<void>((resolve) => {
+          markSearchStarted = resolve;
+        });
+        let releaseSearch!: () => void;
+        const searchCanFinish = new Promise<void>((resolve) => {
+          releaseSearch = resolve;
+        });
+        const toolSearch = attachClientToolSearchExecutor(
+          {
+            type: 'hosted_tool',
+            name: 'tool_search',
+            providerData: { type: 'tool_search', execution: 'client' },
+          },
+          async () => {
+            markSearchStarted();
+            await searchCanFinish;
+            return [];
+          },
+        );
+        const receiverModel = new ScriptedModel([
+          modelResponse(TEST_MODEL_RESPONSE_BASIC),
+        ]);
+        const receiver = new Agent({ name: 'receiver', model: receiverModel });
+        const onHandoff = vi.fn();
+        const inputFilter = vi.fn((input) => input);
+        const transfer = handoff(receiver, { onHandoff, inputFilter });
+        const source = new Agent({
+          name: 'source',
+          model: new ScriptedModel([
+            modelResponse({
+              output: [
+                {
+                  type: 'function_call',
+                  id: 'fc_handoff',
+                  callId: 'call_handoff',
+                  name: transfer.toolName,
+                  arguments: '{}',
+                  status: 'completed',
+                },
+                {
+                  type: 'tool_search_call',
+                  id: 'ts_lookup',
+                  status: 'completed',
+                  arguments: {},
+                  providerData: { call_id: 'call_lookup' },
+                },
+              ],
+              responseId: 'resp_source',
+              usage: new Usage(),
+            }),
+          ]),
+          tools: [toolSearch],
+          handoffs: [transfer],
+        });
+        const state = new RunState(new RunContext(), 'start', source, 10);
+        const outcome = (async () => {
+          const options = {
+            signal: controller.signal,
+          };
+          if (stream) {
+            const result = await new Runner().run(source, state, {
+              ...options,
+              stream: true,
+            });
+            await result.completed;
+            if (result.error) throw result.error;
+            return { cancelled: result.cancelled, error: result.error };
+          } else {
+            await new Runner().run(source, state, options);
+          }
+        })().catch((error: unknown) => error);
+
+        await searchStarted;
+        controller.abort(abortReason);
+        releaseSearch();
+
+        const result = await outcome;
+        if (stream) {
+          expect(result).toEqual({ cancelled: true, error: null });
+        } else {
+          expect(result).toBe(abortReason);
+        }
+        expect(onHandoff).not.toHaveBeenCalled();
+        expect(inputFilter).not.toHaveBeenCalled();
+        expect(receiverModel.calls).toHaveLength(0);
+        expect(
+          state._generatedItems.map((item) => item.rawItem),
+        ).toContainEqual(
+          expect.objectContaining({
+            type: 'function_call_result',
+            callId: 'call_handoff',
+            status: 'incomplete',
+          }),
+        );
+      },
+    );
+
     it('loads runtime tools from custom client tool_search execute callbacks across turns', async () => {
       const lookupAccount = tool({
         name: 'lookup_account',
@@ -2885,7 +3347,7 @@ describe('Runner.run', () => {
       expect(restored.getToolSearchRuntimeTools(agent)).toEqual([]);
     });
 
-    it('treats prior tool_search outputs in input history as loaded deferred tools', async () => {
+    it('treats attributed tool_search outputs in input history as loaded deferred tools', async () => {
       const getShippingEta = tool({
         name: 'get_shipping_eta',
         description: 'Look up a shipping ETA.',
@@ -2925,6 +3387,7 @@ describe('Runner.run', () => {
         user('Load shipping tools first.'),
         {
           type: 'tool_search_output',
+          toolSearchAgentName: 'ShippingAgent',
           status: 'completed',
           tools: [
             {
@@ -3563,6 +4026,214 @@ describe('Runner.run', () => {
       expect(runnerEndEvents[0].output).toBe('Hello World');
     });
 
+    it.each(
+      [false, true].flatMap((stream) =>
+        ['missing', 'no-checks', 'accept', 'reject', 'void'].map((mode) => ({
+          stream,
+          mode,
+        })),
+      ),
+    )(
+      'warns only for unhandled computer safety checks (stream=$stream, mode=$mode)',
+      async ({ stream, mode }) => {
+        const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+        try {
+          const computer = new FakeComputer();
+          const click = vi.spyOn(computer, 'click');
+          const screenshot = vi.spyOn(computer, 'screenshot');
+          const checks = [
+            'malicious_instructions',
+            'irrelevant_domain',
+            'sensitive_domain',
+            'future_check',
+          ].map((code, index) => ({
+            id: `check-${index}`,
+            code,
+            message: 'synthetic private message',
+          }));
+          const model = new ScriptedModel([
+            modelResponse({
+              output: [
+                {
+                  type: 'computer_call',
+                  callId: 'computer-call',
+                  status: 'completed',
+                  action: { type: 'click', x: 1, y: 2, button: 'left' },
+                  providerData: {
+                    pending_safety_checks: mode === 'no-checks' ? [] : checks,
+                  },
+                },
+              ],
+              usage: new Usage(),
+            }),
+            modelResponse({
+              output: [fakeModelMessage('done')],
+              usage: new Usage(),
+            }),
+          ]);
+          const agent = new Agent({
+            name: 'Computer safety checks',
+            model,
+            tools: [
+              computerTool({
+                computer,
+                onSafetyCheck:
+                  mode === 'missing' || mode === 'no-checks'
+                    ? undefined
+                    : async () =>
+                        mode === 'void' ? undefined : mode === 'accept',
+              }),
+            ],
+          });
+          const runner = new Runner({ tracingDisabled: true });
+          const result = stream
+            ? await runner.run(agent, 'start', { stream: true })
+            : await runner.run(agent, 'start');
+          if ('completed' in result) {
+            await result.completed;
+          }
+
+          expect(result.finalOutput).toBe('done');
+          expect(click).toHaveBeenCalledTimes(mode === 'reject' ? 0 : 1);
+          expect(screenshot).toHaveBeenCalledTimes(mode === 'reject' ? 0 : 1);
+          expect(warn).toHaveBeenCalledTimes(mode === 'missing' ? 1 : 0);
+          if (mode === 'missing') {
+            expect(warn).toHaveBeenCalledWith(
+              'Computer call has pending safety checks, but no onSafetyCheck handler is configured. ' +
+                'The action will proceed without acknowledging the checks. ' +
+                'Configure computerTool({ onSafetyCheck }) to review or reject them.',
+            );
+            expect(warn.mock.invocationCallOrder[0]).toBeLessThan(
+              click.mock.invocationCallOrder[0],
+            );
+          }
+          const output = result.newItems.find(
+            (item) => item.rawItem.type === 'computer_call_result',
+          );
+          expect(output).toBeDefined();
+          expect(
+            output?.rawItem.providerData?.acknowledgedSafetyChecks,
+          ).toEqual(mode === 'accept' ? checks : undefined);
+        } finally {
+          warn.mockRestore();
+        }
+      },
+    );
+
+    it.each([
+      { stream: false, needsApproval: false },
+      { stream: true, needsApproval: false },
+      { stream: false, needsApproval: true },
+    ])(
+      'continues after a declined computer safety check (stream=$stream, approval=$needsApproval)',
+      async ({ stream, needsApproval }) => {
+        const computer = new FakeComputer();
+        const click = vi.spyOn(computer, 'click');
+        const screenshot = vi.spyOn(computer, 'screenshot');
+        const dispose = vi.fn(async () => undefined);
+        const onSafetyCheck = vi.fn(async () => false);
+        const rejectionMessage = 'Review declined this action.';
+        const formatter = vi.fn(() => rejectionMessage);
+        const model = new ScriptedModel([
+          modelResponse({
+            output: [
+              {
+                type: 'computer_call',
+                callId: 'declined-call',
+                status: 'completed',
+                actions: [
+                  { type: 'click', x: 1, y: 1, button: 'left' },
+                  { type: 'screenshot' },
+                ],
+                providerData: {
+                  pending_safety_checks: [
+                    { id: 'check-1', code: 'sensitive_domain' },
+                  ],
+                },
+              },
+            ],
+            usage: new Usage(),
+          }),
+          modelResponse({
+            output: [fakeModelMessage('done')],
+            usage: new Usage(),
+          }),
+        ]);
+        const agent = new Agent({
+          name: 'SafetyCheckAgent',
+          model,
+          tools: [
+            computerTool({
+              computer: { create: async () => computer, dispose },
+              onSafetyCheck,
+              needsApproval,
+            }),
+          ],
+        });
+        const runner = new Runner({
+          tracingDisabled: true,
+          toolErrorFormatter: formatter,
+        });
+        const start = vi.fn();
+        const end = vi.fn();
+        runner.on('agent_tool_start', start);
+        runner.on('agent_tool_end', end);
+        const interrupted = needsApproval
+          ? await runner.run(agent, 'start')
+          : undefined;
+        if (interrupted) {
+          expect(interrupted.interruptions).toHaveLength(1);
+          expect(onSafetyCheck).not.toHaveBeenCalled();
+          expect(dispose).not.toHaveBeenCalled();
+          interrupted.state.approve(interrupted.interruptions[0]);
+        }
+        const input = interrupted?.state ?? 'start';
+        const result = stream
+          ? await runner.run(agent, input, { stream: true })
+          : await runner.run(agent, input);
+        if ('completed' in result) {
+          await result.completed;
+        }
+
+        expect(result.finalOutput).toBe('done');
+        expect(onSafetyCheck).toHaveBeenCalledTimes(1);
+        expect(click).not.toHaveBeenCalled();
+        expect(screenshot).not.toHaveBeenCalled();
+        expect(dispose).toHaveBeenCalledTimes(1);
+        expect(dispose).toHaveBeenCalledWith({
+          computer,
+          runContext: result.state._context,
+        });
+        expect(start).toHaveBeenCalledTimes(1);
+        expect(end).toHaveBeenCalledTimes(1);
+        expect(end.mock.calls[0][3]).toBe(rejectionMessage);
+        expect(formatter).toHaveBeenCalledTimes(1);
+        expect(model.calls).toHaveLength(2);
+        expect(model.calls[1].request.input).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: 'computer_call_result',
+              callId: 'declined-call',
+              output: expect.objectContaining({
+                type: 'computer_screenshot',
+                providerData: {
+                  approvalStatus: 'rejected',
+                  message: rejectionMessage,
+                },
+              }),
+            }),
+            expect.objectContaining(assistant(rejectionMessage)),
+          ]),
+        );
+        const outputItem = result.newItems.find(
+          (item) => item.rawItem.type === 'computer_call_result',
+        );
+        expect(
+          outputItem?.rawItem.providerData?.acknowledgedSafetyChecks,
+        ).toBeUndefined();
+      },
+    );
+
     it('disposes computer lifecycle initializers after a completed run', async () => {
       const createdComputer = new FakeComputer();
       const create = vi.fn(async () => createdComputer);
@@ -4153,10 +4824,9 @@ describe('Runner.run', () => {
       } catch (error) {
         resumedError = error;
       }
-      expect(resumedError).toBeInstanceOf(MaxTurnsExceededError);
-      expect((resumedError as MaxTurnsExceededError).state?._currentTurn).toBe(
-        1,
-      );
+      expect(resumedError).toBeInstanceOf(UserError);
+      expect((resumedError as Error).message).toMatch(/fresh run/i);
+      expect((resumedError as UserError).state?._currentTurn).toBe(1);
       expect(model.calls).toHaveLength(1);
     });
 
@@ -4719,6 +5389,7 @@ describe('Runner.run', () => {
       });
       const state = new RunState(new RunContext(), 'x', agent, 1);
       state._currentTurn = 1;
+      state._initialInputGuardrailsCompleted = true;
       state._currentTurnInProgress = true;
       const restored = await RunState.fromString(agent, state.toString());
 
@@ -5365,73 +6036,7 @@ describe('Runner.run', () => {
       );
     });
 
-    it('enforces maxTurns across resumed interruptions', async () => {
-      // Bug: After resuming from interruption, ALL subsequent calls are treated as same turn
-      // because _lastTurnResponse is still set. The first post-interruption call should NOT
-      // advance the turn, but the second call SHOULD advance the turn.
-      const testTool = tool({
-        name: 'test_tool',
-        description: 'A test tool',
-        parameters: z.object({}),
-        execute: async () => 'result',
-      });
-
-      const agent = new Agent({
-        name: 'ResumeTurnCounter',
-        model: new ScriptedModel([
-          modelResponse({
-            output: [
-              {
-                type: 'function_call',
-                id: 'fc_1',
-                callId: 'call_1',
-                name: 'test_tool',
-                status: 'completed',
-                arguments: '{}',
-                providerData: {},
-              } as protocol.FunctionCallItem,
-            ],
-            usage: new Usage(),
-          }),
-          modelResponse({
-            output: [fakeModelMessage('second')],
-            usage: new Usage(),
-          }),
-        ]),
-        tools: [testTool],
-        toolUseBehavior: 'run_llm_again',
-      });
-
-      // Simulate a resumed state after an interruption
-      const resumedState = new RunState(new RunContext(), 'x', agent, 1);
-      resumedState._currentTurn = 1;
-      resumedState._currentTurnPersistedItemCount = 0;
-      resumedState._currentStep = { type: 'next_step_run_again' };
-      // Set these to simulate a state that was resumed from interruption
-      resumedState._lastTurnResponse = {
-        output: [fakeModelMessage('previous')],
-        usage: new Usage(),
-      };
-      resumedState._lastProcessedResponse = {
-        newItems: [],
-        functions: [],
-        computerActions: [],
-        shellActions: [],
-        applyPatchActions: [],
-        handoffs: [],
-        mcpApprovalRequests: [],
-        toolsUsed: [],
-      } as any;
-
-      // With maxTurns=1, after the first post-interruption call completes and tries to make
-      // a second call, the turn should advance to 2 and then throw MaxTurnsExceededError.
-      // Currently fails because turn counter doesn't advance after first post-interruption call.
-      await expect(
-        run(agent, resumedState, { maxTurns: 1 }),
-      ).rejects.toBeInstanceOf(MaxTurnsExceededError);
-    });
-
-    it('does not advance the turn when resuming an interruption without persisted items', async () => {
+    it('counts the model call after resolving an interruption', async () => {
       const approvalTool = tool({
         name: 'get_weather',
         description: 'Gets weather for a city.',
@@ -5468,16 +6073,16 @@ describe('Runner.run', () => {
         toolUseBehavior: 'run_llm_again',
       });
 
-      let result = await run(agent, 'How is the weather?', { maxTurns: 1 });
+      let result = await run(agent, 'How is the weather?', { maxTurns: 2 });
       expect(result.interruptions).toHaveLength(1);
       expect(result.state._currentTurn).toBe(1);
       expect(result.state._currentTurnPersistedItemCount).toBe(0);
 
       result.state.approve(result.interruptions[0]);
 
-      result = await run(agent, result.state, { maxTurns: 1 });
+      result = await run(agent, result.state, { maxTurns: 2 });
       expect(result.finalOutput).toBe('All set.');
-      expect(result.state._currentTurn).toBe(1);
+      expect(result.state._currentTurn).toBe(2);
     });
 
     it('does nothing when no input guardrails are configured', async () => {
@@ -5672,7 +6277,7 @@ describe('Runner.run', () => {
 
       const firstRun = await run(agent, 'hello', {
         reasoningItemIdPolicy: 'omit',
-        maxTurns: 1,
+        maxTurns: 2,
       });
       expect(firstRun.interruptions).toHaveLength(1);
       firstRun.state.approve(firstRun.interruptions[0]);
@@ -5681,7 +6286,7 @@ describe('Runner.run', () => {
         agent,
         firstRun.state.toString(),
       );
-      const resumedRun = await run(agent, restoredState, { maxTurns: 1 });
+      const resumedRun = await run(agent, restoredState, { maxTurns: 2 });
 
       expect(resumedRun.finalOutput).toBe('done');
       expect(model.calls).toHaveLength(2);
@@ -7806,6 +8411,7 @@ describe('Runner.run', () => {
 
       const state = new RunState(new RunContext(), 'hi', agent, 1);
       state._currentTurn = 1;
+      state._initialInputGuardrailsCompleted = true;
       (state as any)._currentTurnInProgress = true;
       state._currentStep = { type: 'next_step_run_again' } as const;
 
@@ -7863,6 +8469,7 @@ describe('Runner.run', () => {
 
       const state = new RunState(new RunContext(), 'hi', agent, 2);
       state._currentTurn = 1;
+      state._initialInputGuardrailsCompleted = true;
       (state as any)._currentTurnInProgress = true;
       state._currentStep = { type: 'next_step_run_again' } as const;
       state._noActiveAgentRun = true;
@@ -7927,6 +8534,7 @@ describe('Runner.run', () => {
 
       const state = new RunState(new RunContext(), 'hi', agent, 2);
       state._currentTurn = 1;
+      state._initialInputGuardrailsCompleted = true;
       (state as any)._currentTurnInProgress = true;
       state._currentStep = { type: 'next_step_run_again' } as const;
       state._noActiveAgentRun = true;
@@ -8576,7 +9184,7 @@ describe('Runner.run', () => {
 
     beforeEach(() => {
       originalDefaultModel = process.env.OPENAI_DEFAULT_MODEL;
-      process.env.OPENAI_DEFAULT_MODEL = 'gpt-5o';
+      process.env.OPENAI_DEFAULT_MODEL = 'gpt-5.6-luna';
     });
 
     afterEach(() => {
@@ -8601,14 +9209,14 @@ describe('Runner.run', () => {
       };
     }
 
-    it('strips GPT-5-only settings when the RunConfig model is not a GPT-5 string', async () => {
+    it('preserves explicit settings for a model instance with no public name', async () => {
       const modelResponse: ModelResponse = {
-        output: [fakeModelMessage('Hello non GPT-5')],
+        output: [fakeModelMessage('Hello concrete model')],
         usage: new Usage(),
       };
       const inspectableModel = new InspectableModel(modelResponse);
       const agent = new Agent({
-        name: 'NonGpt5Runner',
+        name: 'ConcreteModelAgent',
         model: inspectableModel,
         modelSettings: createGpt5ModelSettings(),
       });
@@ -8616,20 +9224,36 @@ describe('Runner.run', () => {
       const runner = new Runner();
       const result = await runner.run(agent, 'hello');
 
-      expect(result.finalOutput).toBe('Hello non GPT-5');
+      expect(result.finalOutput).toBe('Hello concrete model');
       expect(inspectableModel.lastRequest).toBeDefined();
 
       const requestSettings = inspectableModel.lastRequest!.modelSettings;
-      expect(requestSettings.temperature).toBe(0.42);
-      expect(requestSettings.providerData?.keep).toBe('value');
-      expect(requestSettings.providerData?.reasoning).toBeUndefined();
-      expect(requestSettings.providerData?.text?.verbosity).toBeUndefined();
-      expect(
-        (requestSettings.providerData as any)?.reasoning_effort,
-      ).toBeUndefined();
-      expect(requestSettings.reasoning?.effort).toBeUndefined();
-      expect(requestSettings.reasoning?.summary).toBeUndefined();
-      expect(requestSettings.text?.verbosity).toBeUndefined();
+      expect(requestSettings).toEqual(createGpt5ModelSettings());
+      expect(agent.modelSettings).toEqual(createGpt5ModelSettings());
+    });
+
+    it('preserves explicit settings when a custom model has a descriptive name', async () => {
+      process.env.OPENAI_DEFAULT_MODEL = 'gpt-6-astra';
+      class EchoModel extends ScriptedModel {
+        name = 'Echo';
+      }
+      const model = new EchoModel([
+        modelResponse({
+          output: [fakeModelMessage('hello')],
+          usage: new Usage(),
+        }),
+      ]);
+      const agent = new Agent({
+        name: 'Custom model',
+        model,
+        modelSettings: createGpt5ModelSettings(),
+      });
+      const result = await new Runner().run(agent, 'hello');
+      expect(result.finalOutput).toBe('hello');
+      expect(model.lastCall?.request.modelSettings).toEqual(
+        createGpt5ModelSettings(),
+      );
+      expect(agent.modelSettings).toEqual(createGpt5ModelSettings());
     });
 
     it('keeps GPT-5-only settings when the agent relies on the default model', async () => {
@@ -8668,6 +9292,7 @@ describe('Runner.run', () => {
     it.each([
       ['gpt-5', 'low'],
       ['gpt-5.6', 'none'],
+      ['gpt-6-astra', 'low'],
     ] as const)(
       'uses model-specific defaults when the RunConfig model is %s',
       async (modelName, reasoningEffort) => {
@@ -9265,6 +9890,7 @@ describe('Runner.run', () => {
 
       state._currentAgent = agentB;
       state._currentTurn = 1;
+      state._initialInputGuardrailsCompleted = true;
       state._currentTurnInProgress = true;
       state._currentStep = { type: 'next_step_run_again' } as const;
       state._noActiveAgentRun = true;
@@ -9327,7 +9953,7 @@ describe('Runner.run', () => {
       ]);
     });
 
-    it('does not append ignored handoff acknowledgements after removeAllTools filters the handoff input', async () => {
+    it('rejects a selected removeAllTools handoff with server-managed history', async () => {
       const agentBModel = new TrackingModel([
         modelResponse(buildResponse([fakeModelMessage('done B')], 'resp-b')),
       ]);
@@ -9370,15 +9996,14 @@ describe('Runner.run', () => {
         handoffs: [handoffToB, handoffToC],
       });
 
-      const result = await new Runner().run(agentA, 'hi', {
-        previousResponseId: 'initial-response',
-      });
+      await expect(
+        new Runner().run(agentA, 'hi', {
+          previousResponseId: 'initial-response',
+        }),
+      ).rejects.toThrow(UserError);
 
-      expect(result.finalOutput).toBe('done B');
-      expect(agentBModel.requests).toHaveLength(1);
+      expect(agentBModel.requests).toHaveLength(0);
       expect(agentCModel.requests).toHaveLength(0);
-      expect(agentBModel.requests[0].previousResponseId).toBe('resp-a');
-      expect(agentBModel.requests[0].input).toEqual([]);
     });
 
     it('does not replay orphan hosted shell calls in default multi-turn runs', async () => {

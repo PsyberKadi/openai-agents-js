@@ -1,5 +1,156 @@
 # @openai/agents-openai
 
+## 0.21.0
+
+### Patch Changes
+
+- 989513a: fix: Preserve bounded nested numeric token usage breakdowns across streamed runs, usage accounting, and saved run state (schema 1.23, with backward reads of earlier snapshots; #2082); usage detail values now require narrowing to numbers before arithmetic.
+- 1163b0c: fix: Preserve image detail when reading user messages from OpenAI Conversations sessions (#2078).
+- Updated dependencies [989513a]
+- Updated dependencies [7b05470]
+- Updated dependencies [976579e]
+  - @openai/agents-core@0.21.0
+
+## 0.20.0
+
+### Patch Changes
+
+- Updated dependencies [40f7de2]
+- Updated dependencies [836cb50]
+- Updated dependencies [05241c7]
+- Updated dependencies [4137680]
+- Updated dependencies [8ee5055]
+- Updated dependencies [b89905c]
+- Updated dependencies [d8fa6c3]
+- Updated dependencies [9e32e88]
+- Updated dependencies [2f3591b]
+- Updated dependencies [8567e09]
+  - @openai/agents-core@0.20.0
+
+## 0.19.0
+
+### Patch Changes
+
+- c55d64d: fix: add an optional rollback item budget for Responses session compaction.
+- 817161d: build: Generate package metadata with native Node.js TypeScript support.
+- 194fea9: fix: omit supported generation reasoning from default OpenAI trace exports while preserving original spans and custom destinations
+- ec8bb33: fix: Preserve post-construction agent storage settings through model requests and cloning.
+- d0e5d43: fix: Keep parent transport overrides out of agent tool runs with an explicit Model while preserving common settings and explicit child overrides.
+- 3626398: fix: Honor sensitive-data tracing opt-out for Responses payloads and provider errors.
+- 24946f3: fix: omit tool content from strict Chat Completions mixed-output diagnostics.
+- 2127475: fix: preserve stored history excluded from the latest successful model exchange during automatic compaction.
+- 7f135af: fix: update compatible runtime and development dependencies.
+- 00eef0c: fix: Reject selected handoff input filters with server-managed conversationId or previousResponseId before handoff side effects; use client-managed history or a Session without continuation options instead.
+- 7efc536: fix: update compatible workspace dependencies while preserving supported provider and Expo versions.
+- 58b08f8: fix: Bound repeated trace truncation work and fall back to a preview for expensive fields.
+- 202563c: fix: Retry transient trace export failures with bounded server-directed delays and honor explicit retry advice.
+- a01f687: fix: remove unused dependency declarations while retaining shared logging through agents-core.
+- 06bbcc0: chore: migrate tracing test mocks to Vitest 5.
+- Updated dependencies [39d5e9e]
+- Updated dependencies [c55d64d]
+- Updated dependencies [c345409]
+- Updated dependencies [a0b1c6f]
+- Updated dependencies [9c94138]
+- Updated dependencies [f0f3066]
+- Updated dependencies [c3e02d2]
+- Updated dependencies [f80c91c]
+- Updated dependencies [3949bb1]
+- Updated dependencies [186f6ec]
+- Updated dependencies [fdaf0a6]
+- Updated dependencies [aeef9e1]
+- Updated dependencies [817161d]
+- Updated dependencies [20e5946]
+- Updated dependencies [39decd7]
+- Updated dependencies [ec8bb33]
+- Updated dependencies [9623a22]
+- Updated dependencies [58844c7]
+- Updated dependencies [d0e5d43]
+- Updated dependencies [2127475]
+- Updated dependencies [3515c29]
+- Updated dependencies [b9a4fb8]
+- Updated dependencies [7f135af]
+- Updated dependencies [ee65014]
+- Updated dependencies [00eef0c]
+- Updated dependencies [218a2b8]
+- Updated dependencies [8ac97df]
+- Updated dependencies [96aa754]
+- Updated dependencies [7efc536]
+- Updated dependencies [8a26e30]
+- Updated dependencies [4ef9008]
+- Updated dependencies [f507590]
+- Updated dependencies [d187747]
+- Updated dependencies [fc2d2a4]
+- Updated dependencies [0bdea85]
+- Updated dependencies [a9b543b]
+- Updated dependencies [06bbcc0]
+  - @openai/agents-core@0.19.0
+
+## 0.18.0
+
+### Patch Changes
+
+- b665b0e: fix: recover unloaded deferred calls through opt-in model-visible errors and built-in client search, with required Responses wire defaults, live source-Agent ownership, and server-side search preserved for deferred hosted MCP tools (#1855).
+- a3a9215: feat: support the image generation tool action option
+- Updated dependencies [b665b0e]
+- Updated dependencies [19d0b5f]
+- Updated dependencies [064fcb2]
+  - @openai/agents-core@0.18.0
+
+## 0.17.2
+
+### Patch Changes
+
+- 8d1f019: fix: preserve explicit settings for GPT-5-and-newer models and concrete model instances, default gpt-6-astra reasoning to low, and use adapter-declared prompt model selection when applying implicit defaults (#1849).
+- Updated dependencies [8d1f019]
+  - @openai/agents-core@0.17.2
+
+## 0.17.1
+
+### Patch Changes
+
+- 4351bd1: fix: honor OpenAIProvider client options over the default client
+- c25fede: fix: keep Conversations session history limits local
+- b1a41cf: fix: preserve concurrent wrapper writes by skipping automatic session compaction when the run no longer owns its history snapshot.
+- 02720cd: fix: preserve empty hosted MCP tool outputs during Responses conversion
+- 5e999b5: refactor: separate Responses item conversion from model transport execution without changing behavior.
+- eb690a4: fix: recover failed resumed Session writes before continuing runs
+- a8422bf: fix: restrict redacted trace response IDs to official OpenAI endpoints
+- c242bfb: fix: reject truncated empty Chat Completions
+- c3bfb2c: fix: reject unsuccessful OpenAI Responses terminal states without losing billed usage
+- 8a98743: fix(openai): reset compaction response state after clearing a session (#1821)
+- 82d6b59: fix(openai): reset compaction response state after popping local history (#1823)
+- 6b555c8: fix: merge streamed Chat Completions tool-call turns
+- 4b539bb: fix: preserve full tracing data when streamed response consumers stop at completion
+- 0035d33: fix: strip output-only created_by metadata at replay boundaries
+- 92d1d9c: fix: Preserve tool-search Agent attribution across handoffs and history replay; persisted discovery requires a unique logical Agent name, and unattributed or ambiguous history requires a new search.
+- ffaaba6: feat: support image results in web search tools
+- Updated dependencies [dd1becb]
+- Updated dependencies [0b94437]
+- Updated dependencies [d7ed6b2]
+- Updated dependencies [b09622f]
+- Updated dependencies [6721ccd]
+- Updated dependencies [c15c3ac]
+- Updated dependencies [3261264]
+- Updated dependencies [9be3e39]
+- Updated dependencies [b4fa898]
+- Updated dependencies [8e862b3]
+- Updated dependencies [05e5851]
+- Updated dependencies [0b949bc]
+- Updated dependencies [c0a6718]
+- Updated dependencies [b1a41cf]
+- Updated dependencies [5c3c3b4]
+- Updated dependencies [cd5a2c8]
+- Updated dependencies [e668ea1]
+- Updated dependencies [eb690a4]
+- Updated dependencies [c3bfb2c]
+- Updated dependencies [d364ef2]
+- Updated dependencies [0035d33]
+- Updated dependencies [d19101e]
+- Updated dependencies [a9e3214]
+- Updated dependencies [92d1d9c]
+- Updated dependencies [2dc21b6]
+  - @openai/agents-core@0.17.1
+
 ## 0.17.0
 
 ### Patch Changes

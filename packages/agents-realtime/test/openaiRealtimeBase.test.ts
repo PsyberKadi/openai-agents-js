@@ -1,3 +1,4 @@
+import type OpenAI from 'openai';
 import {
   describe,
   it,
@@ -15,13 +16,18 @@ import {
 } from '../src/openaiRealtimeBase';
 import logger from '../src/logger';
 import { responseDoneEventSchema } from '../src/openaiRealtimeEvents';
+import { hostedMcpTool, tool } from '@openai/agents-core';
+import { z } from 'zod';
+import { RealtimeAgent } from '../src/realtimeAgent';
+import { RealtimeSession } from '../src/realtimeSession';
+import type { RealtimeTransportLayer } from '../src/transportLayer';
 
 class TestBase extends OpenAIRealtimeBase {
   status: 'connected' | 'disconnected' | 'connecting' | 'disconnecting' =
     'connected';
   events: RealtimeClientMessage[] = [];
   afterAudioDoneCalled = 0;
-  connect = vi.fn(async () => {});
+  connect = vi.fn<RealtimeTransportLayer['connect']>(async () => {});
   sendEvent(event: RealtimeClientMessage) {
     this.events.push(event);
   }
@@ -84,6 +90,58 @@ describe('OpenAIRealtimeBase helpers', () => {
     expectTypeOf(transport).toMatchTypeOf<OpenAIRealtimeBase>();
   });
 
+  it.each([
+    'function_call',
+    'item_update',
+    'item_deleted',
+    'usage_update',
+    'turn_started',
+    'turn_done',
+    'mcp_tools_listed',
+    'mcp_approval_request',
+    'mcp_tool_call_completed',
+    'connected',
+    'disconnected',
+    'connection_change',
+    'audio',
+    'audio_done',
+    'audio_interrupted',
+    'audio_transcript_delta',
+    'output_text_delta',
+  ])('does not dispatch provider frames into the local %s channel', (type) => {
+    const base = new TestBase();
+    const raw = vi.fn();
+    const local = vi.fn();
+    base.on('*', raw);
+    base.on(type, local);
+    const payload = {
+      type,
+      id: 'i',
+      itemId: 'i',
+      responseId: 'r',
+      callId: 'c',
+      name: 'tool',
+      arguments: '{}',
+    };
+    (base as any)._onMessage({ data: JSON.stringify(payload) });
+    expect(raw).toHaveBeenCalledExactlyOnceWith(payload);
+    expect(local).not.toHaveBeenCalled();
+    expect(base.events).toEqual([]);
+  });
+
+  it('delivers future provider notifications without duplicating wildcard events', () => {
+    const base = new TestBase();
+    const raw = vi.fn();
+    const future = vi.fn();
+    base.on('*', raw);
+    base.on('future.notification', future);
+    const payload = { type: 'future.notification', extra: true };
+    (base as any)._onMessage({ data: JSON.stringify(payload) });
+    expect(future).toHaveBeenCalledExactlyOnceWith(payload);
+    (base as any)._onMessage({ data: JSON.stringify({ type: '*' }) });
+    expect(raw).toHaveBeenCalledTimes(2);
+  });
+
   it('isolates typed events from mutations to raw wildcard events', () => {
     const base = new TestBase();
     const typedEvents: any[] = [];
@@ -108,17 +166,7 @@ describe('OpenAIRealtimeBase helpers', () => {
     (base as any)._onMessage({ data: JSON.stringify(payload) });
 
     expect(rawListener).toHaveBeenCalledOnce();
-    expect(typedEvents).toEqual([
-      {
-        type: 'session.updated',
-        event_id: 'evt_1',
-        session: {
-          id: 'session_1',
-          instructions: 'original instructions',
-          provider_nested: { value: 'original value' },
-        },
-      },
-    ]);
+    expect(typedEvents).toEqual([payload]);
     expect((base as any)._rawSessionConfig).toEqual(payload.session);
   });
 
@@ -292,6 +340,232 @@ describe('OpenAIRealtimeBase helpers', () => {
     const session = (base.events[0] as any)?.session;
     expect(session?.audio?.output?.voice).toBe('echo');
   });
+
+  it('preserves released omission for empty tools and supports raw tool overrides', () => {
+    const base = new TestBase();
+    base.updateSessionConfig({ instructions: 'Updated instructions' });
+    expect(base.events[0]).toMatchObject({ type: 'session.update' });
+    expect(base.events[0]).toHaveProperty('session');
+    expect(base.events[0]).not.toHaveProperty('session.tools');
+
+    base.updateSessionConfig({ tools: [] });
+    expect(base.events[1]).not.toHaveProperty('session.tools');
+
+    base.updateSessionConfig({ tools: [], providerData: { tools: [] } });
+    expect(base.events[2]).toHaveProperty('session.tools', []);
+  });
+
+  it.each(['omitted', 'empty', 'disabled'] as const)(
+    'preserves initial tool configuration when tools are %s',
+    async (toolConfig) => {
+      const tools =
+        toolConfig === 'omitted'
+          ? undefined
+          : toolConfig === 'empty'
+            ? []
+            : [
+                tool({
+                  name: 'disabled',
+                  description: 'A disabled tool.',
+                  parameters: z.object({}),
+                  isEnabled: false,
+                  execute: async () => 'disabled',
+                }),
+              ];
+      const agent = new RealtimeAgent({
+        name: 'Prompt agent',
+        prompt: { promptId: 'pmpt_example' },
+        tools,
+      });
+      const transport = new TestBase();
+      transport.connect.mockImplementation(async (options) => {
+        transport.updateSessionConfig(options.initialSessionConfig ?? {});
+      });
+      const session = new RealtimeSession(agent, { transport });
+
+      try {
+        const initialConfig = await RealtimeSession.computeInitialSessionConfig(
+          agent,
+          { transport },
+        );
+        const initialPayload = transport.buildSessionPayload(initialConfig);
+        expect(initialPayload).toMatchObject({
+          prompt: { id: 'pmpt_example' },
+        });
+        expect(initialConfig.tools).toEqual([]);
+        expect(initialPayload).not.toHaveProperty('tools');
+
+        await session.connect({ apiKey: 'test-key' });
+        expect(transport.events[0]).toMatchObject({
+          type: 'session.update',
+          session: { prompt: { id: 'pmpt_example' } },
+        });
+        expect(transport.events[0]).not.toHaveProperty('session.tools');
+
+        await session.updateAgent(new RealtimeAgent({ name: 'Target' }));
+        expect(transport.events[1]).toMatchObject({
+          type: 'session.update',
+          session: { tools: [] },
+        });
+      } finally {
+        session.close();
+      }
+    },
+  );
+
+  describe.each(['updateAgent', 'handoff'] as const)(
+    '%s tool ownership',
+    (transition) => {
+      it.each([
+        {
+          label: 'tool-less',
+          prompt: undefined,
+          tools: undefined,
+          inherits: false,
+        },
+        {
+          label: 'prompt-owned',
+          prompt: async () => ({ promptId: 'pmpt_target' }),
+          tools: undefined,
+          inherits: true,
+        },
+        {
+          label: 'explicit empty',
+          prompt: { promptId: 'pmpt_target' },
+          tools: [],
+          inherits: true,
+        },
+        {
+          label: 'all disabled',
+          prompt: { promptId: 'pmpt_target' },
+          tools: [
+            tool({
+              name: 'disabled',
+              description: 'A disabled tool.',
+              parameters: z.object({}),
+              isEnabled: false,
+              execute: async () => 'disabled',
+            }),
+          ],
+          inherits: true,
+        },
+      ])(
+        'sends the expected tools for a $label target',
+        async ({ prompt, tools, inherits }) => {
+          const target = new RealtimeAgent({ name: 'Target', prompt, tools });
+          const source = new RealtimeAgent({
+            name: 'Source',
+            tools: [
+              hostedMcpTool({
+                serverLabel: 'example',
+                serverUrl: 'https://example.invalid/mcp',
+                requireApproval: 'always',
+              }),
+            ],
+            handoffs: [target],
+          });
+          // Mock network I/O while retaining the provider's session payload conversion.
+          const transport = new TestBase();
+          transport.connect.mockImplementation(async (options) => {
+            transport.updateSessionConfig(options.initialSessionConfig ?? {});
+          });
+          const session = new RealtimeSession(source, {
+            transport,
+            config: { providerData: { max_output_tokens: 256 } },
+          });
+
+          try {
+            await session.connect({ apiKey: 'test-key' });
+            expect(transport.events).toContainEqual(
+              expect.objectContaining({
+                type: 'session.update',
+                session: expect.objectContaining({
+                  tools: expect.arrayContaining([
+                    expect.objectContaining({
+                      type: 'mcp',
+                      server_label: 'example',
+                    }),
+                    expect.objectContaining({
+                      type: 'function',
+                      name: 'transfer_to_Target',
+                    }),
+                  ]),
+                }),
+              }),
+            );
+            transport.events.length = 0;
+
+            if (transition === 'updateAgent') {
+              await session.updateAgent(target);
+            } else {
+              transport.emit('function_call', {
+                type: 'function_call',
+                name: 'transfer_to_Target',
+                callId: 'handoff-call',
+                arguments: '{}',
+                responseId: 'handoff-response',
+              });
+              await vi.waitFor(() =>
+                expect(session.currentAgent === target).toBe(true),
+              );
+            }
+
+            const update = transport.events.find(
+              (event) => event.type === 'session.update',
+            );
+            expect(update).toBeDefined();
+            expect(update).toHaveProperty('session.max_output_tokens', 256);
+            if (prompt) {
+              expect(update).toHaveProperty('session.prompt', {
+                id: 'pmpt_target',
+              });
+            }
+            if (inherits) {
+              expect(update).not.toHaveProperty('session.tools');
+            } else {
+              expect(update).toHaveProperty('session.tools', []);
+
+              await session.updateAgent(
+                new RealtimeAgent({
+                  name: 'Prompt successor',
+                  prompt: { promptId: 'pmpt_successor' },
+                  tools: [],
+                }),
+              );
+              const successorUpdate = transport.events
+                .filter((event) => event.type === 'session.update')
+                .at(-1);
+              expect(successorUpdate).toHaveProperty(
+                'session.prompt.id',
+                'pmpt_successor',
+              );
+              expect(successorUpdate).not.toHaveProperty('session.tools');
+              expect(successorUpdate).toHaveProperty(
+                'session.max_output_tokens',
+                256,
+              );
+
+              await session.updateAgent(source);
+              const restoredUpdate = transport.events
+                .filter((event) => event.type === 'session.update')
+                .at(-1);
+              expect(restoredUpdate).toHaveProperty(
+                'session.tools',
+                expect.arrayContaining([
+                  expect.objectContaining({
+                    type: 'mcp',
+                    server_label: 'example',
+                  }),
+                ]),
+              );
+            }
+          } finally {
+            session.close();
+          }
+        },
+      );
+    },
+  );
 
   it('whitelists function tools in session payload', () => {
     const base = new TestBase();
@@ -551,10 +825,13 @@ describe('OpenAIRealtimeBase helpers', () => {
 
     expect(base.events[0]).toEqual({
       type: 'conversation.item.delete',
+      // Carried so a delete that ends in an error can be matched back to it.
+      event_id: expect.stringMatching(/^agents_delete_\d+$/),
       item_id: '1',
     });
     expect(base.events[1]).toEqual({
       type: 'conversation.item.create',
+      event_id: expect.stringMatching(/^agents_create_\d+$/),
       item: {
         id: '2',
         role: 'user',
@@ -584,6 +861,369 @@ describe('OpenAIRealtimeBase helpers', () => {
       'Function calls cannot be manually added or updated at the moment. Ignoring.',
     );
     expect(base.events).toHaveLength(0);
+  });
+
+  describe('resetHistory item placement', () => {
+    // `conversation.item.create` appends when `previous_item_id` is omitted, so
+    // a corrected or inserted item has to name the item it follows or it lands
+    // behind everything after it.
+    const message = (itemId: string, text: string) =>
+      ({
+        itemId,
+        type: 'message',
+        role: 'user',
+        status: 'completed',
+        content: [{ type: 'input_text', text }],
+      }) as any;
+
+    const functionCall = (itemId: string) =>
+      ({
+        itemId,
+        type: 'function_call',
+        name: 'f',
+        callId: itemId,
+        arguments: '{}',
+        status: 'completed',
+      }) as any;
+
+    function creates(oldHistory: any[], newHistory: any[]) {
+      const base = new TestBase();
+      base.resetHistory(oldHistory, newHistory);
+      return base.events
+        .filter((event: any) => event.type === 'conversation.item.create')
+        .map((event: any) =>
+          'previous_item_id' in event
+            ? `${event.item.id} after ${event.previous_item_id}`
+            : `${event.item.id} appended`,
+        );
+    }
+
+    it('anchors a corrected item to the one before it', () => {
+      expect(
+        creates(
+          [message('a', '1'), message('b', '2'), message('c', '3')],
+          [message('a', '1'), message('b', 'edited'), message('c', '3')],
+        ),
+      ).toEqual(['b after a']);
+    });
+
+    it('anchors an inserted item to the one before it', () => {
+      expect(
+        creates(
+          [message('a', '1'), message('c', '3')],
+          [message('a', '1'), message('b', '2'), message('c', '3')],
+        ),
+      ).toEqual(['b after a']);
+    });
+
+    it('chains consecutive corrections in history order', () => {
+      expect(
+        creates(
+          [
+            message('a', '1'),
+            message('b', '2'),
+            message('c', '3'),
+            message('d', '4'),
+          ],
+          [
+            message('a', '1'),
+            message('b', 'B'),
+            message('c', 'C'),
+            message('d', '4'),
+          ],
+        ),
+      ).toEqual(['b after a', 'c after b']);
+    });
+
+    it('places an item with nothing before it at the beginning', () => {
+      expect(
+        creates(
+          [message('a', '1'), message('b', '2')],
+          [message('a', 'edited'), message('b', '2')],
+        ),
+      ).toEqual(['a after root']);
+    });
+
+    it('does not anchor to a function call it could not create', () => {
+      expect(
+        creates(
+          [message('a', '1'), message('d', '4')],
+          [
+            message('a', '1'),
+            functionCall('f'),
+            message('c', '3'),
+            message('d', '4'),
+          ],
+        ),
+      ).toEqual(['c after a']);
+    });
+
+    it('anchors to a function call that is already in the conversation', () => {
+      expect(
+        creates(
+          [message('a', '1'), functionCall('f'), message('d', '4')],
+          [
+            message('a', '1'),
+            functionCall('f'),
+            message('c', '3'),
+            message('d', '4'),
+          ],
+        ),
+      ).toEqual(['c after f']);
+    });
+
+    it('does not anchor to a removed item', () => {
+      expect(
+        creates(
+          [message('a', '1'), message('b', '2'), message('d', '4')],
+          [message('a', '1'), message('c', '3'), message('d', '4')],
+        ),
+      ).toEqual(['c after a']);
+    });
+
+    // An anchor is only needed to sit in front of something the server keeps.
+    // Past the last of those, the plain append these always had is both correct
+    // and the only safe thing: the item a trailing create would name may be one
+    // the server has already dropped for a delete it has not acknowledged yet.
+    it('appends a trailing create without an anchor', () => {
+      expect(
+        creates(
+          [message('a', '1'), message('b', '2')],
+          [message('a', '1'), message('b', '2'), message('c', '3')],
+        ),
+      ).toEqual(['c appended']);
+    });
+
+    it('appends consecutive trailing creates in order', () => {
+      expect(
+        creates(
+          [message('a', '1')],
+          [message('a', '1'), message('b', '2'), message('c', '3')],
+        ),
+      ).toEqual(['b appended', 'c appended']);
+    });
+
+    it('appends a create that follows an unacknowledged deletion', () => {
+      // Local history still lists `b` because the deletion has not come back
+      // yet. Anchoring `c` to it would name an item the server has dropped.
+      expect(
+        creates(
+          [message('a', '1'), message('b', '2')],
+          [message('a', '1'), message('b', '2'), message('c', '3')],
+        ),
+      ).toEqual(['c appended']);
+    });
+
+    it('does not anchor a middle insert to an item awaiting deletion', () => {
+      // The delete for `b` went out on an earlier call and has not come back,
+      // so local history still lists it. Anchoring `x` to `b` names an item the
+      // conversation has already dropped and the create is refused.
+      const base = new TestBase();
+      base.resetHistory(
+        [message('a', '1'), message('b', '2'), message('c', '3')],
+        [message('a', '1'), message('c', '3')],
+      );
+      base.events.length = 0;
+      base.resetHistory(
+        [message('a', '1'), message('b', '2'), message('c', '3')],
+        [
+          message('a', '1'),
+          message('b', '2'),
+          message('x', 'X'),
+          message('c', '3'),
+        ],
+      );
+      expect(
+        base.events
+          .filter((event: any) => event.type === 'conversation.item.create')
+          .map((event: any) =>
+            'previous_item_id' in event
+              ? `${event.item.id} after ${event.previous_item_id}`
+              : `${event.item.id} appended`,
+          ),
+      ).toEqual(['x after a']);
+    });
+
+    it('anchors on an item awaiting deletion again once the server confirms it', () => {
+      const base = new TestBase();
+      base.resetHistory([message('a', '1')], [message('a', '1')]);
+      base.events.length = 0;
+      // A delete that was acknowledged leaves nothing in flight, so the item is
+      // gone from history and cannot be an anchor for the opposite reason.
+      base.resetHistory(
+        [message('a', '1'), message('b', '2'), message('c', '3')],
+        [message('a', '1'), message('c', '3')],
+      );
+      (base as any)._onMessage({
+        data: JSON.stringify({
+          type: 'conversation.item.deleted',
+          event_id: 'evt_deleted_b',
+          item_id: 'b',
+        }),
+      });
+      base.events.length = 0;
+      base.resetHistory(
+        [message('a', '1'), message('c', '3')],
+        [message('a', '1'), message('x', 'X'), message('c', '3')],
+      );
+      expect(
+        base.events
+          .filter((event: any) => event.type === 'conversation.item.create')
+          .map(
+            (event: any) => `${event.item.id} after ${event.previous_item_id}`,
+          ),
+      ).toEqual(['x after a']);
+    });
+
+    it('keeps an item excluded until every outstanding delete is acknowledged', () => {
+      // Correcting `b` removes and re-adds it; removing it afterwards queues a
+      // second delete. One acknowledgement must not make the id an anchor again
+      // while the other delete is still on its way.
+      const base = new TestBase();
+      let acks = 0;
+      const ack = (itemId: string) =>
+        (base as any)._onMessage({
+          data: JSON.stringify({
+            type: 'conversation.item.deleted',
+            event_id: `evt_deleted_${(acks += 1)}`,
+            item_id: itemId,
+          }),
+        });
+
+      base.resetHistory(
+        [message('a', '1'), message('b', '2'), message('c', '3')],
+        [message('a', '1'), message('b', 'corrected'), message('c', '3')],
+      );
+      base.resetHistory(
+        [message('a', '1'), message('b', 'corrected'), message('c', '3')],
+        [message('a', '1'), message('c', '3')],
+      );
+      ack('b');
+      base.events.length = 0;
+
+      base.resetHistory(
+        [message('a', '1'), message('b', 'corrected'), message('c', '3')],
+        [
+          message('a', '1'),
+          message('b', 'corrected'),
+          message('x', 'X'),
+          message('c', '3'),
+        ],
+      );
+      expect(
+        base.events
+          .filter((event: any) => event.type === 'conversation.item.create')
+          .map((event: any) =>
+            'previous_item_id' in event
+              ? `${event.item.id} after ${event.previous_item_id}`
+              : `${event.item.id} appended`,
+          ),
+      ).toEqual(['x after a']);
+    });
+
+    it('releases a delete that failed instead of being acknowledged', () => {
+      // Deleting an item the conversation has already dropped comes back as an
+      // error naming the request, not as conversation.item.deleted. Without
+      // that reply releasing the count, the id stays excluded as an anchor for
+      // the rest of the connection.
+      const base = new TestBase();
+      const errors: unknown[] = [];
+      base.on('error', (event) => errors.push(event));
+      const deleteIds = () =>
+        base.events
+          .filter((event: any) => event.type === 'conversation.item.delete')
+          .map((event: any) => event.event_id);
+
+      base.resetHistory(
+        [message('a', '1'), message('b', '2'), message('c', '3')],
+        [message('a', '1'), message('b', 'corrected'), message('c', '3')],
+      );
+      base.resetHistory(
+        [message('a', '1'), message('b', 'corrected'), message('c', '3')],
+        [message('a', '1'), message('c', '3')],
+      );
+      const [firstDelete, secondDelete] = deleteIds();
+      expect(firstDelete).toBeDefined();
+      expect(secondDelete).toBeDefined();
+
+      (base as any)._onMessage({
+        data: JSON.stringify({
+          type: 'conversation.item.deleted',
+          event_id: 'evt_deleted_b',
+          item_id: 'b',
+        }),
+      });
+      (base as any)._onMessage({
+        data: JSON.stringify({
+          type: 'error',
+          event_id: 'evt_error',
+          error: {
+            type: 'invalid_request_error',
+            code: 'item_not_found',
+            event_id: secondDelete,
+          },
+        }),
+      });
+      expect(errors).toHaveLength(1);
+      base.events.length = 0;
+
+      // `b` is restored, so it is a legitimate anchor again.
+      base.resetHistory(
+        [message('a', '1'), message('b', '2'), message('c', '3')],
+        [
+          message('a', '1'),
+          message('b', '2'),
+          message('x', 'X'),
+          message('c', '3'),
+        ],
+      );
+      expect(
+        base.events
+          .filter((event: any) => event.type === 'conversation.item.create')
+          .map(
+            (event: any) => `${event.item.id} after ${event.previous_item_id}`,
+          ),
+      ).toEqual(['x after b']);
+    });
+
+    it('forgets outstanding deletes when the connection ends', () => {
+      // The acknowledgement never arrives because the connection drops. The id
+      // belongs to that connection: carrying it into the next one would
+      // suppress an anchor the restored history legitimately has.
+      const base = new TestBase();
+      base.resetHistory(
+        [message('a', '1'), message('b', '2'), message('c', '3')],
+        [message('a', '1'), message('c', '3')],
+      );
+      (base as any)._onClose();
+      base.events.length = 0;
+
+      base.resetHistory(
+        [message('a', '1'), message('b', '2'), message('c', '3')],
+        [
+          message('a', '1'),
+          message('b', '2'),
+          message('x', 'X'),
+          message('c', '3'),
+        ],
+      );
+      expect(
+        base.events
+          .filter((event: any) => event.type === 'conversation.item.create')
+          .map(
+            (event: any) => `${event.item.id} after ${event.previous_item_id}`,
+          ),
+      ).toEqual(['x after b']);
+    });
+
+    it('still anchors when a surviving item has to stay behind the create', () => {
+      expect(
+        creates(
+          [message('a', '1'), message('c', '3')],
+          [message('a', '1'), message('b', '2'), message('c', '3')],
+        ),
+      ).toEqual(['b after a']);
+    });
   });
 
   it('sendMcpResponse emits approval response items', () => {
@@ -783,6 +1423,144 @@ describe('OpenAIRealtimeBase helpers', () => {
     expect(session.history[0]).toMatchObject({ status: 'in_progress' });
     expect(historyEvents.at(-1)?.map((item) => item.itemId)).toEqual(['u1']);
   });
+
+  it('retains input audio without a transcript in session history', async () => {
+    const transport = new TestBase();
+    const session = new RealtimeSession(new RealtimeAgent({ name: 'a' }), {
+      transport,
+    });
+    await session.connect({ apiKey: 'test' });
+    (transport as any)._onMessage({
+      data: JSON.stringify({
+        type: 'conversation.item.added',
+        event_id: 'audio_contract',
+        previous_item_id: null,
+        item: {
+          id: 'audio1',
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_audio' }],
+        },
+      }),
+    });
+    expect(session.history).toMatchObject([
+      {
+        itemId: 'audio1',
+        role: 'user',
+        content: [{ type: 'input_audio', transcript: null }],
+      },
+    ]);
+  });
+
+  it('preserves SDK image content through session history and replay', async () => {
+    const transport = new TestBase();
+    const session = new RealtimeSession(new RealtimeAgent({ name: 'a' }), {
+      transport,
+    });
+    await session.connect({ apiKey: 'test' });
+    const content = [
+      {
+        type: 'input_image' as const,
+        image_url: 'data:image/png;base64,abc',
+        detail: 'high' as const,
+      },
+    ];
+    const event = {
+      type: 'conversation.item.added',
+      event_id: 'image_event',
+      previous_item_id: null,
+      item: { id: 'image1', type: 'message', role: 'user', content },
+    } satisfies OpenAI.Realtime.ConversationItemAdded;
+    (transport as any)._onMessage({ data: JSON.stringify(event) });
+    expect(session.history).toMatchObject([{ itemId: 'image1', content }]);
+    transport.resetHistory([], session.history);
+    expect(transport.events.at(-1)).toMatchObject({
+      type: 'conversation.item.create',
+      item: { id: 'image1', content },
+    });
+    session.close();
+  });
+
+  it('preserves optional and nullable SDK MCP descriptions in discovery', async () => {
+    const transport = new TestBase();
+    const session = new RealtimeSession(
+      new RealtimeAgent({
+        name: 'a',
+        tools: [
+          hostedMcpTool({
+            serverLabel: 'server',
+            serverUrl: 'https://example.invalid/mcp',
+          }),
+        ],
+      }),
+      { transport },
+    );
+    await session.connect({ apiKey: 'test' });
+    const tools = [
+      { name: 'no_description', input_schema: {} },
+      {
+        name: 'null_description',
+        description: null,
+        input_schema: {},
+        annotations: { future: true },
+      },
+    ] satisfies OpenAI.Realtime.RealtimeMcpListTools.Tool[];
+    const event = {
+      type: 'conversation.item.done',
+      event_id: 'mcp_event',
+      item: { type: 'mcp_list_tools', server_label: 'server', tools },
+    } satisfies OpenAI.Realtime.ConversationItemDone;
+    (transport as any)._onMessage({ data: JSON.stringify(event) });
+    expect(session.availableMcpTools).toEqual(tools);
+    session.close();
+  });
+
+  it.each([
+    {
+      type: 'message',
+      id: 'bad',
+      role: 'user',
+      content: [{ type: 'future_content' }],
+    },
+    {
+      type: 'function_call',
+      id: 'bad',
+      status: 'completed',
+      name: 'run',
+      arguments: {},
+      call_id: 'call',
+    },
+    {
+      type: 'function_call',
+      id: 'bad',
+      status: 'completed',
+      name: 'run',
+      arguments: '{}',
+      call_id: 1,
+    },
+  ])(
+    'retains unsupported items as provider events without local actions: $type',
+    (item) => {
+      const base = new TestBase();
+      const raw = vi.fn();
+      const update = vi.fn();
+      const execute = vi.fn();
+      base.on('*', raw);
+      base.on('item_update', update);
+      base.on('function_call', execute);
+      const payload = {
+        type: 'response.output_item.done',
+        response_id: 'r',
+        item,
+      };
+      expect(() =>
+        (base as any)._onMessage({ data: JSON.stringify(payload) }),
+      ).not.toThrow();
+      expect(raw).toHaveBeenCalledWith(payload);
+      expect(update).not.toHaveBeenCalled();
+      expect(execute).not.toHaveBeenCalled();
+    },
+  );
 
   it('normalizes missing statuses and preserves explicit statuses', () => {
     const base = new TestBase();

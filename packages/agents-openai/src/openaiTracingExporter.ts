@@ -9,6 +9,10 @@ import {
 import { logModelAndToolActionError } from '@openai/agents-core/utils/internal';
 import { getTracingExportApiKey, HEADERS } from './defaults';
 import logger from './logger';
+import {
+  truncateSpanFieldValue,
+  sanitizeGenerationUsageForTracesIngest,
+} from './tracingFieldProcessing';
 
 /**
  * Options for OpenAITracingExporter.
@@ -23,18 +27,30 @@ export type OpenAITracingExporterOptions = {
   maxDelay: number;
 };
 
-type GenerationUsageData = NonNullable<GenerationSpanData['usage']>;
-type JsonCompatibleValue =
-  | null
-  | string
-  | number
-  | boolean
-  | JsonCompatibleValue[]
-  | { [key: string]: JsonCompatibleValue };
+const OPENAI_TRACING_INGEST_ENDPOINT =
+  'https://api.openai.com/v1/traces/ingest';
 
-const OPENAI_TRACING_MAX_FIELD_BYTES = 100_000;
-const OPENAI_TRACING_MAX_RECURSION_DEPTH = 1_000;
-const OPENAI_TRACING_STRING_TRUNCATION_SUFFIX = '... [truncated]';
+function retryAfterMs(headers: Headers): number | undefined {
+  const milliseconds = headers.get('retry-after-ms')?.trim();
+  if (milliseconds) {
+    const value = Number(milliseconds);
+    if (Number.isFinite(value) && value >= 0) {
+      return value;
+    }
+  }
+
+  const retryAfter = headers.get('retry-after')?.trim();
+  if (!retryAfter) {
+    return undefined;
+  }
+  const seconds = Number(retryAfter);
+  if (!Number.isNaN(seconds)) {
+    const value = seconds * 1000;
+    return Number.isFinite(value) && value >= 0 ? value : undefined;
+  }
+  const date = Date.parse(retryAfter);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+}
 
 async function sleepWithAbort(
   delayMs: number,
@@ -62,28 +78,9 @@ async function sleepWithAbort(
     signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
-const UNSERIALIZABLE = Symbol('openaiTracingExporter.unserializable');
-const textEncoder = new TextEncoder();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (!isRecord(value)) {
-    return false;
-  }
-
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-function hasToJSON(value: object): value is object & { toJSON: () => unknown } {
-  try {
-    return typeof (value as { toJSON?: unknown }).toJSON === 'function';
-  } catch {
-    return false;
-  }
 }
 
 function isGenerationSpanData(
@@ -92,464 +89,10 @@ function isGenerationSpanData(
   return spanData.type === 'generation';
 }
 
-function isGenerationUsageData(usage: unknown): usage is GenerationUsageData {
+function isGenerationUsageData(
+  usage: unknown,
+): usage is NonNullable<GenerationSpanData['usage']> {
   return isRecord(usage);
-}
-
-function isFiniteJsonNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value);
-}
-
-function valueJsonSizeBytes(value: unknown): number {
-  try {
-    const serialized = JSON.stringify(value);
-    if (serialized === undefined) {
-      return 0;
-    }
-    if (typeof serialized !== 'string') {
-      return OPENAI_TRACING_MAX_FIELD_BYTES + 1;
-    }
-    return textEncoder.encode(serialized).length;
-  } catch {
-    return OPENAI_TRACING_MAX_FIELD_BYTES + 1;
-  }
-}
-
-function truncateStringForJsonLimit(value: string, maxBytes: number): string {
-  const valueSize = valueJsonSizeBytes(value);
-  if (valueSize <= maxBytes) {
-    return value;
-  }
-
-  const suffixSize = valueJsonSizeBytes(
-    OPENAI_TRACING_STRING_TRUNCATION_SUFFIX,
-  );
-  if (suffixSize > maxBytes) {
-    return '';
-  }
-  if (suffixSize === maxBytes) {
-    return OPENAI_TRACING_STRING_TRUNCATION_SUFFIX;
-  }
-
-  const budgetWithoutSuffix = maxBytes - suffixSize;
-  let estimatedChars = Math.floor(
-    (value.length * budgetWithoutSuffix) / Math.max(valueSize, 1),
-  );
-  estimatedChars = Math.max(0, Math.min(value.length, estimatedChars));
-
-  let best =
-    value.slice(0, estimatedChars) + OPENAI_TRACING_STRING_TRUNCATION_SUFFIX;
-  let bestSize = valueJsonSizeBytes(best);
-  while (bestSize > maxBytes && estimatedChars > 0) {
-    const overflowRatio = (bestSize - maxBytes) / Math.max(bestSize, 1);
-    const trimChars = Math.max(
-      1,
-      Math.floor(estimatedChars * overflowRatio) + 1,
-    );
-    estimatedChars = Math.max(0, estimatedChars - trimChars);
-    best =
-      value.slice(0, estimatedChars) + OPENAI_TRACING_STRING_TRUNCATION_SUFFIX;
-    bestSize = valueJsonSizeBytes(best);
-  }
-
-  return best;
-}
-
-function sanitizeJsonCompatibleValue(
-  value: unknown,
-  seen: Set<object> = new Set(),
-  depth: number = 0,
-): JsonCompatibleValue | typeof UNSERIALIZABLE {
-  if (depth >= OPENAI_TRACING_MAX_RECURSION_DEPTH) {
-    return UNSERIALIZABLE;
-  }
-
-  if (
-    value === null ||
-    typeof value === 'string' ||
-    typeof value === 'boolean'
-  ) {
-    return value;
-  }
-
-  if (typeof value === 'number') {
-    return Number.isFinite(value) ? value : UNSERIALIZABLE;
-  }
-
-  if (value && typeof value === 'object' && hasToJSON(value)) {
-    if (seen.has(value)) {
-      return UNSERIALIZABLE;
-    }
-
-    seen.add(value);
-    try {
-      return sanitizeJsonCompatibleValue(value.toJSON(), seen, depth + 1);
-    } catch {
-      return UNSERIALIZABLE;
-    } finally {
-      seen.delete(value);
-    }
-  }
-
-  if (Array.isArray(value)) {
-    if (seen.has(value)) {
-      return UNSERIALIZABLE;
-    }
-
-    seen.add(value);
-    const sanitized: JsonCompatibleValue[] = [];
-    try {
-      for (const nestedValue of value) {
-        const sanitizedNested = sanitizeJsonCompatibleValue(
-          nestedValue,
-          seen,
-          depth + 1,
-        );
-        sanitized.push(
-          sanitizedNested === UNSERIALIZABLE ? null : sanitizedNested,
-        );
-      }
-    } finally {
-      seen.delete(value);
-    }
-
-    return sanitized;
-  }
-
-  if (value && typeof value === 'object') {
-    if (seen.has(value)) {
-      return UNSERIALIZABLE;
-    }
-
-    seen.add(value);
-    const sanitized: Record<string, JsonCompatibleValue> = {};
-    try {
-      for (const [key, nestedValue] of Object.entries(value)) {
-        const sanitizedNested = sanitizeJsonCompatibleValue(
-          nestedValue,
-          seen,
-          depth + 1,
-        );
-        if (sanitizedNested !== UNSERIALIZABLE) {
-          sanitized[key] = sanitizedNested;
-        }
-      }
-    } catch {
-      return UNSERIALIZABLE;
-    } finally {
-      seen.delete(value);
-    }
-
-    return sanitized;
-  }
-
-  return UNSERIALIZABLE;
-}
-
-function getValueTypeName(value: unknown): string {
-  if (value === null) {
-    return 'null';
-  }
-
-  if (typeof value !== 'object') {
-    return typeof value;
-  }
-
-  try {
-    return value.constructor?.name ?? 'Object';
-  } catch {
-    return 'Object';
-  }
-}
-
-function truncatedPreview(value: unknown): Record<string, JsonCompatibleValue> {
-  const typeName = getValueTypeName(value);
-  let preview = `<${typeName} truncated>`;
-
-  if (Array.isArray(value)) {
-    preview = `<${typeName} len=${value.length} truncated>`;
-  } else if (ArrayBuffer.isView(value)) {
-    preview = `<${typeName} bytes=${value.byteLength} truncated>`;
-  } else if (value instanceof ArrayBuffer) {
-    preview = `<${typeName} bytes=${value.byteLength} truncated>`;
-  } else if (value instanceof Map || value instanceof Set) {
-    preview = `<${typeName} len=${value.size} truncated>`;
-  } else if (isPlainObject(value)) {
-    preview = `<${typeName} len=${Object.keys(value).length} truncated>`;
-  }
-
-  let previewObject: Record<string, JsonCompatibleValue> = {
-    truncated: true,
-    original_type: typeName,
-    preview,
-  };
-
-  if (valueJsonSizeBytes(previewObject) <= OPENAI_TRACING_MAX_FIELD_BYTES) {
-    return previewObject;
-  }
-
-  const previewBudget = Math.max(
-    0,
-    OPENAI_TRACING_MAX_FIELD_BYTES -
-      valueJsonSizeBytes({
-        truncated: true,
-        original_type: typeName,
-        preview: '',
-      }),
-  );
-  previewObject = {
-    truncated: true,
-    original_type: typeName,
-    preview: truncateStringForJsonLimit(preview, previewBudget),
-  };
-
-  if (valueJsonSizeBytes(previewObject) <= OPENAI_TRACING_MAX_FIELD_BYTES) {
-    return previewObject;
-  }
-
-  const typeBudget = Math.max(
-    0,
-    OPENAI_TRACING_MAX_FIELD_BYTES -
-      valueJsonSizeBytes({
-        truncated: true,
-        original_type: '',
-        preview: previewObject.preview,
-      }),
-  );
-  previewObject = {
-    truncated: true,
-    original_type: truncateStringForJsonLimit(typeName, typeBudget),
-    preview: previewObject.preview,
-  };
-
-  if (valueJsonSizeBytes(previewObject) <= OPENAI_TRACING_MAX_FIELD_BYTES) {
-    return previewObject;
-  }
-
-  const finalPreviewBudget = Math.max(
-    0,
-    OPENAI_TRACING_MAX_FIELD_BYTES -
-      valueJsonSizeBytes({
-        truncated: true,
-        original_type: previewObject.original_type,
-        preview: '',
-      }),
-  );
-  return {
-    truncated: true,
-    original_type: previewObject.original_type,
-    preview: truncateStringForJsonLimit(
-      previewObject.preview as string,
-      finalPreviewBudget,
-    ),
-  };
-}
-
-function truncateJsonValueForLimit(
-  value: JsonCompatibleValue,
-  maxBytes: number,
-  depth: number = 0,
-): JsonCompatibleValue {
-  if (depth >= OPENAI_TRACING_MAX_RECURSION_DEPTH) {
-    return truncatedPreview(value);
-  }
-
-  if (valueJsonSizeBytes(value) <= maxBytes) {
-    return value;
-  }
-
-  if (typeof value === 'string') {
-    return truncateStringForJsonLimit(value, maxBytes);
-  }
-
-  if (Array.isArray(value)) {
-    return truncateListForJsonLimit(value, maxBytes, depth + 1);
-  }
-
-  if (isPlainObject(value)) {
-    return truncateMappingForJsonLimit(value, maxBytes, depth + 1);
-  }
-
-  return truncatedPreview(value);
-}
-
-function truncateMappingForJsonLimit(
-  value: Record<string, JsonCompatibleValue>,
-  maxBytes: number,
-  depth: number = 0,
-): Record<string, JsonCompatibleValue> {
-  const truncated = { ...value };
-  let currentSize = valueJsonSizeBytes(truncated);
-
-  while (Object.keys(truncated).length > 0 && currentSize > maxBytes) {
-    let largestKey: string | undefined;
-    let largestChildSize = -1;
-
-    for (const [key, child] of Object.entries(truncated)) {
-      const childSize = valueJsonSizeBytes(child);
-      if (childSize > largestChildSize) {
-        largestKey = key;
-        largestChildSize = childSize;
-      }
-    }
-
-    if (largestKey === undefined) {
-      break;
-    }
-
-    const child = truncated[largestKey];
-    const childBudget = Math.max(
-      0,
-      maxBytes - (currentSize - largestChildSize),
-    );
-    if (childBudget === 0) {
-      delete truncated[largestKey];
-      currentSize = valueJsonSizeBytes(truncated);
-      continue;
-    }
-
-    const truncatedChild = truncateJsonValueForLimit(
-      child,
-      childBudget,
-      depth + 1,
-    );
-    const truncatedChildSize = valueJsonSizeBytes(truncatedChild);
-
-    if (truncatedChild === child || truncatedChildSize >= largestChildSize) {
-      delete truncated[largestKey];
-    } else {
-      truncated[largestKey] = truncatedChild;
-    }
-
-    currentSize = valueJsonSizeBytes(truncated);
-  }
-
-  return truncated;
-}
-
-function truncateListForJsonLimit(
-  value: JsonCompatibleValue[],
-  maxBytes: number,
-  depth: number = 0,
-): JsonCompatibleValue[] {
-  const truncated = [...value];
-  let currentSize = valueJsonSizeBytes(truncated);
-
-  while (truncated.length > 0 && currentSize > maxBytes) {
-    let largestIndex = 0;
-    let largestChildSize = -1;
-
-    for (let index = 0; index < truncated.length; index += 1) {
-      const childSize = valueJsonSizeBytes(truncated[index]);
-      if (childSize > largestChildSize) {
-        largestIndex = index;
-        largestChildSize = childSize;
-      }
-    }
-
-    const child = truncated[largestIndex];
-    const childBudget = Math.max(
-      0,
-      maxBytes - (currentSize - largestChildSize),
-    );
-    if (childBudget === 0) {
-      truncated.splice(largestIndex, 1);
-      currentSize = valueJsonSizeBytes(truncated);
-      continue;
-    }
-
-    const truncatedChild = truncateJsonValueForLimit(
-      child,
-      childBudget,
-      depth + 1,
-    );
-    const truncatedChildSize = valueJsonSizeBytes(truncatedChild);
-
-    if (truncatedChild === child || truncatedChildSize >= largestChildSize) {
-      truncated.splice(largestIndex, 1);
-    } else {
-      truncated[largestIndex] = truncatedChild;
-    }
-
-    currentSize = valueJsonSizeBytes(truncated);
-  }
-
-  return truncated;
-}
-
-function exceedsNestingDepthLimit(value: unknown, maxDepth: number): boolean {
-  const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
-  const seen = new Set<object>();
-
-  while (stack.length > 0) {
-    const current = stack.pop();
-    if (!current) {
-      break;
-    }
-
-    if (current.depth >= maxDepth) {
-      return true;
-    }
-
-    if (!current.value || typeof current.value !== 'object') {
-      continue;
-    }
-
-    if (seen.has(current.value)) {
-      continue;
-    }
-    seen.add(current.value);
-
-    try {
-      if (hasToJSON(current.value)) {
-        stack.push({
-          value: current.value.toJSON(),
-          depth: current.depth + 1,
-        });
-        continue;
-      }
-
-      const nestedValues = Array.isArray(current.value)
-        ? current.value
-        : Object.values(current.value);
-      for (const nestedValue of nestedValues) {
-        stack.push({
-          value: nestedValue,
-          depth: current.depth + 1,
-        });
-      }
-    } catch {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function truncateSpanFieldValue(value: unknown): unknown {
-  if (valueJsonSizeBytes(value) <= OPENAI_TRACING_MAX_FIELD_BYTES) {
-    return value;
-  }
-
-  if (exceedsNestingDepthLimit(value, OPENAI_TRACING_MAX_RECURSION_DEPTH)) {
-    return truncatedPreview(value);
-  }
-
-  try {
-    const sanitizedValue = sanitizeJsonCompatibleValue(value);
-    if (sanitizedValue === UNSERIALIZABLE) {
-      return truncatedPreview(value);
-    }
-
-    return truncateJsonValueForLimit(
-      sanitizedValue,
-      OPENAI_TRACING_MAX_FIELD_BYTES,
-    );
-  } catch {
-    // Deeply nested or otherwise hostile values should degrade to a preview
-    // instead of failing the whole export batch.
-    return truncatedPreview(value);
-  }
 }
 
 function cloneRecordSafely(
@@ -568,53 +111,57 @@ function cloneRecordSafely(
   return clone;
 }
 
-export const _openAITracingExporterTestUtils = {
-  valueJsonSizeBytes,
-  truncateJsonValueForLimit,
-  truncateMappingForJsonLimit,
-  truncateListForJsonLimit,
-};
-
-function sanitizeGenerationUsageForTracesIngest(
-  usage: GenerationUsageData,
-): GenerationUsageData | undefined {
-  const inputTokens = usage.input_tokens;
-  const outputTokens = usage.output_tokens;
-
-  if (!isFiniteJsonNumber(inputTokens) || !isFiniteJsonNumber(outputTokens)) {
-    return undefined;
+function omitAssistantReasoning(value: unknown): unknown {
+  if (!isRecord(value) || value.role !== 'assistant') {
+    return value;
   }
 
-  const details: Record<string, JsonCompatibleValue> = {};
-  if (isPlainObject(usage.details)) {
-    for (const [key, value] of Object.entries(usage.details)) {
-      const sanitizedValue = sanitizeJsonCompatibleValue(value);
-      if (sanitizedValue !== UNSERIALIZABLE) {
-        details[key] = sanitizedValue;
+  const message = { ...value };
+  delete message.reasoning;
+  if (Array.isArray(message.content)) {
+    message.content = message.content
+      .filter((part) => !isRecord(part) || part.type !== 'reasoning')
+      .map((part) => {
+        if (
+          !isRecord(part) ||
+          (part.type !== 'text' && part.type !== 'refusal')
+        ) {
+          return part;
+        }
+        // Chat Completions replay copies message provider data onto these parts.
+        const content = { ...part };
+        delete content.reasoning;
+        return content;
+      });
+  }
+  return message;
+}
+
+/** Filter known generation shapes, without traversing user or tool JSON. */
+function omitGenerationReasoning(value: unknown): unknown {
+  if (!Array.isArray(value)) {
+    return value;
+  }
+
+  return value
+    .filter((item) => !isRecord(item) || item.type !== 'reasoning')
+    .map((item) => {
+      if (
+        isRecord(item) &&
+        item.object === 'chat.completion' &&
+        Array.isArray(item.choices)
+      ) {
+        return {
+          ...item,
+          choices: item.choices.map((choice) =>
+            isRecord(choice) && isRecord(choice.message)
+              ? { ...choice, message: omitAssistantReasoning(choice.message) }
+              : choice,
+          ),
+        };
       }
-    }
-  }
-
-  for (const [key, value] of Object.entries(usage)) {
-    if (
-      key === 'input_tokens' ||
-      key === 'output_tokens' ||
-      key === 'details' ||
-      value === undefined
-    ) {
-      continue;
-    }
-    const sanitizedValue = sanitizeJsonCompatibleValue(value);
-    if (sanitizedValue !== UNSERIALIZABLE) {
-      details[key] = sanitizedValue;
-    }
-  }
-
-  return {
-    input_tokens: inputTokens,
-    output_tokens: outputTokens,
-    ...(Object.keys(details).length > 0 ? { details } : {}),
-  };
+      return omitAssistantReasoning(item);
+    });
 }
 
 /**
@@ -624,6 +171,7 @@ function sanitizeGenerationUsageForTracesIngest(
  */
 function sanitizeSpanDataForTracesIngest(
   spanData: Record<string, unknown>,
+  omitReasoning: boolean,
 ): Record<string, unknown> {
   let sanitizedSpanData = spanData;
   let didMutate = false;
@@ -634,8 +182,15 @@ function sanitizeSpanDataForTracesIngest(
     }
 
     let fieldValue: unknown;
+    let exportValue: unknown;
     try {
       fieldValue = spanData[fieldName];
+      // Filter before truncation so reasoning does not consume the field budget.
+      // Work on export-only copies: custom processors retain the original spans.
+      exportValue =
+        omitReasoning && isGenerationSpanData(spanData)
+          ? omitGenerationReasoning(fieldValue)
+          : fieldValue;
     } catch {
       if (!didMutate) {
         sanitizedSpanData = cloneRecordSafely(spanData);
@@ -646,7 +201,7 @@ function sanitizeSpanDataForTracesIngest(
       continue;
     }
 
-    const sanitizedField = truncateSpanFieldValue(fieldValue);
+    const sanitizedField = truncateSpanFieldValue(exportValue);
     if (sanitizedField === fieldValue) {
       continue;
     }
@@ -689,6 +244,7 @@ function sanitizeSpanDataForTracesIngest(
 
 function sanitizePayloadItemForTracesIngest(
   payloadItem: Record<string, unknown>,
+  omitReasoning: boolean,
 ): Record<string, unknown> {
   if (payloadItem.object !== 'trace.span' || !isRecord(payloadItem.span_data)) {
     return payloadItem;
@@ -696,7 +252,10 @@ function sanitizePayloadItemForTracesIngest(
 
   return {
     ...payloadItem,
-    span_data: sanitizeSpanDataForTracesIngest(payloadItem.span_data),
+    span_data: sanitizeSpanDataForTracesIngest(
+      payloadItem.span_data,
+      omitReasoning,
+    ),
   };
 }
 
@@ -711,7 +270,7 @@ export class OpenAITracingExporter implements TracingExporter {
       apiKey: options.apiKey ?? undefined,
       organization: options.organization ?? '',
       project: options.project ?? '',
-      endpoint: options.endpoint ?? 'https://api.openai.com/v1/traces/ingest',
+      endpoint: options.endpoint ?? OPENAI_TRACING_INGEST_ENDPOINT,
       maxRetries: options.maxRetries ?? 3,
       baseDelay: options.baseDelay ?? 1000,
       maxDelay: options.maxDelay ?? 30000,
@@ -746,7 +305,13 @@ export class OpenAITracingExporter implements TracingExporter {
         .map((entry) => entry.toJSON())
         .filter((item) => !!item)
         .map((item) =>
-          isRecord(item) ? sanitizePayloadItemForTracesIngest(item) : item,
+          isRecord(item)
+            ? sanitizePayloadItemForTracesIngest(
+                item,
+                this.#options.endpoint.replace(/\/$/, '') ===
+                  OPENAI_TRACING_INGEST_ENDPOINT,
+              )
+            : item,
         );
       const payload = { data: payloadItems };
 
@@ -754,6 +319,7 @@ export class OpenAITracingExporter implements TracingExporter {
       let delay = this.#options.baseDelay;
 
       while (attempts < this.#options.maxRetries) {
+        let serverDelay: number | undefined;
         try {
           const response = await fetch(this.#options.endpoint, {
             method: 'POST',
@@ -772,28 +338,66 @@ export class OpenAITracingExporter implements TracingExporter {
             break;
           }
 
-          if (response.status >= 400 && response.status < 500) {
-            if (logger.dontLogModelData || logger.dontLogToolData) {
+          const retryAdvice = response.headers
+            ?.get('x-should-retry')
+            ?.trim()
+            .toLowerCase();
+          const clientError = response.status >= 400 && response.status < 500;
+          const shouldRetry =
+            retryAdvice === 'true' ||
+            (retryAdvice !== 'false' &&
+              (!clientError ||
+                response.status === 408 ||
+                response.status === 409 ||
+                response.status === 429));
+
+          if (!shouldRetry) {
+            if (clientError) {
+              if (logger.dontLogModelData || logger.dontLogToolData) {
+                try {
+                  await response.body?.cancel();
+                } catch {
+                  // Best-effort cleanup must not replace the tracing response error.
+                }
+                logger.error(
+                  `[non-fatal] Tracing client error ${response.status}. Response data is redacted.`,
+                );
+              } else {
+                try {
+                  logger.error(
+                    `[non-fatal] Tracing client error ${
+                      response.status
+                    }: ${await response.text()}`,
+                  );
+                } catch {
+                  logger.error(
+                    `[non-fatal] Tracing client error ${response.status}. Response data could not be read.`,
+                  );
+                }
+              }
+            } else {
               try {
                 await response.body?.cancel();
               } catch {
-                // Best-effort cleanup must not replace the tracing response error.
+                // Best-effort cleanup must not replace the server retry veto.
               }
               logger.error(
-                `[non-fatal] Tracing client error ${response.status}. Response data is redacted.`,
-              );
-            } else {
-              logger.error(
-                `[non-fatal] Tracing client error ${
-                  response.status
-                }: ${await response.text()}`,
+                `[non-fatal] Tracing: server forbade retry for ${response.status}.`,
               );
             }
             break;
           }
 
+          serverDelay = response.headers
+            ? retryAfterMs(response.headers)
+            : undefined;
+          try {
+            await response.body?.cancel();
+          } catch {
+            // Best-effort cleanup must not prevent retrying the batch.
+          }
           logger.warn(
-            `[non-fatal] Tracing: server error ${response.status}, retrying.`,
+            `[non-fatal] Tracing: ${clientError ? 'client' : 'server'} error ${response.status}, retrying.`,
           );
         } catch (error: any) {
           logModelAndToolActionError(
@@ -813,7 +417,13 @@ export class OpenAITracingExporter implements TracingExporter {
           break;
         }
 
-        const sleepTime = delay + Math.random() * 0.1 * delay; // 10% jitter
+        let sleepTime = delay + Math.random() * 0.1 * delay; // 10% jitter
+        if (serverDelay !== undefined) {
+          sleepTime = Math.min(
+            Math.max(sleepTime, serverDelay),
+            this.#options.maxDelay,
+          );
+        }
         const shouldContinue = await sleepWithAbort(sleepTime, signal);
         if (!shouldContinue) {
           logger.error('Tracing: request aborted');

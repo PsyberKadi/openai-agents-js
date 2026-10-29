@@ -263,6 +263,54 @@ export async function materializeLocalWorkspaceManifestMounts(
   }
 }
 
+/** Reapply manifest sticky intent without replacing snapshot contents or modes. */
+export async function restoreLocalWorkspaceManifestStickyPermissions(
+  manifest: Manifest,
+  workspaceRootPath: string,
+): Promise<void> {
+  for (const { logicalPath, entry } of manifest.iterEntries()) {
+    if (
+      isMount(entry) ||
+      !permissionsForSandboxEntry(entry.permissions).sticky
+    ) {
+      continue;
+    }
+    const destination = resolve(workspaceRootPath, logicalPath);
+    const info = await lstat(destination).catch((error: unknown) => {
+      // A snapshot may have replaced a manifest ancestor with a file.
+      if (
+        isSandboxPathNotFoundError(error) ||
+        (error as NodeJS.ErrnoException).code === 'ENOTDIR'
+      ) {
+        return null;
+      }
+      throw error;
+    });
+    if (info?.isDirectory()) {
+      await assertSafeMaterializationPath(
+        workspaceRootPath,
+        destination,
+        logicalPath,
+      );
+      const handle = await open(destination, LOCAL_SOURCE_DIRECTORY_READ_FLAGS);
+      try {
+        const openedInfo = await handle.stat();
+        if (
+          !openedInfo.isDirectory() ||
+          !sameFilesystemEntry(info, openedInfo)
+        ) {
+          throw new UserError(
+            `Sandbox sticky permission target changed during restore: ${logicalPath || '.'}`,
+          );
+        }
+        await handle.chmod((openedInfo.mode & 0o7777) | 0o1000);
+      } finally {
+        await handle.close();
+      }
+    }
+  }
+}
+
 export async function applyOwnershipRecursive(
   targetPath: string,
   uid: number,
@@ -1169,7 +1217,7 @@ async function cloneNamedRef(
   if (ref) {
     args.push('--branch', ref);
   }
-  args.push(repository, destination);
+  args.push('--', repository, destination);
   return await runSandboxProcess('git', args, {
     timeoutMs: GIT_CLONE_TIMEOUT_MS,
   });
@@ -1270,7 +1318,11 @@ function joinLogicalPath(parent: string, child: string): string {
   if (!parent || parent === '.') {
     return normalizedChild;
   }
-  return `${parent.replace(/\/+$/u, '')}/${normalizedChild}`;
+  let parentEnd = parent.length;
+  while (parentEnd > 0 && parent[parentEnd - 1] === '/') {
+    parentEnd--;
+  }
+  return `${parent.slice(0, parentEnd)}/${normalizedChild}`;
 }
 
 async function applyEntryPermissions(
@@ -1285,7 +1337,7 @@ async function applyEntryPermissions(
     logicalPath,
   );
   const permissions = permissionsForSandboxEntry(entry.permissions);
-  await chmod(destination, permissions.toMode() & 0o777);
+  await chmod(destination, permissions.toMode() & 0o1777);
 }
 
 function materializationEscapesWorkspaceError(logicalPath: string): UserError {

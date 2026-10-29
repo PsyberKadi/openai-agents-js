@@ -577,6 +577,19 @@ export const ToolSearchCallItem = ItemBase.extend({
 export type ToolSearchCallItem = z.infer<typeof ToolSearchCallItem>;
 
 export const ToolSearchOutputItem = ItemBase.extend({
+  /**
+   * SDK-only discovery attribution, excluded from provider requests. Names must identify the
+   * same logical Agent across reused history. Missing or ambiguous ownership requires a new
+   * search; this field does not grant tool execution permissions.
+   */
+  toolSearchAgentName: z.string().optional(),
+  /**
+   * SDK-only hosted MCP namespace identities established when this output was received.
+   * Excluded from provider requests. Older namespace outputs without this provenance
+   * require a new search; explicit MCP descriptors remain usable. This records discovery,
+   * not permission to execute a tool, and never overrides current caller/approval policy.
+   */
+  toolSearchMcpToolNames: z.array(z.string()).optional(),
   type: z.literal('tool_search_output'),
   call_id: z.string().nullable().optional(),
   callId: z.string().nullable().optional(),
@@ -917,12 +930,67 @@ export type ModelItem = z.infer<typeof ModelItem>;
 // Meta data types
 // ----------------------------
 
+/**
+ * JSON metadata returned by a model provider about token usage.
+ * Narrow individual values to numbers before performing arithmetic.
+ * Each record is limited to 32 container levels and 10,000 total entries.
+ */
+const TokenDetailsRecord = z.record(z.string(), z.json());
+export type TokenDetails = z.infer<typeof TokenDetailsRecord>;
+
+export const TokenDetails: z.ZodType<TokenDetails> = z
+  .unknown()
+  .superRefine((input, ctx) => {
+    // Bound untrusted structure before recursive validation and copying.
+    const pending = [{ value: input, depth: 1 }];
+    let entries = 0;
+    while (pending.length > 0) {
+      const { value, depth } = pending.pop()!;
+      if (typeof value !== 'object' || value === null) {
+        // The JSON schema reports invalid leaves without traversing them.
+        continue;
+      }
+      if (depth > 32) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Token details exceed 32 levels.',
+        });
+        return;
+      }
+      // Count array slots, including holes, before the JSON parser traverses them.
+      if (Array.isArray(value)) entries += value.length;
+      if (entries > 10_000) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Token details exceed 10000 entries.',
+        });
+        return;
+      }
+      for (const key in value) {
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+        if (!Array.isArray(value)) entries++;
+        if (entries > 10_000) {
+          ctx.addIssue({
+            code: 'custom',
+            message: 'Token details exceed 10000 entries.',
+          });
+          return;
+        }
+        const child = (value as Record<string, unknown>)[key];
+        if (typeof child === 'object' && child !== null) {
+          pending.push({ value: child, depth: depth + 1 });
+        }
+      }
+    }
+  })
+  .pipe(TokenDetailsRecord);
+
 export const RequestUsageData = z.object({
   inputTokens: z.number(),
   outputTokens: z.number(),
   totalTokens: z.number(),
-  inputTokensDetails: z.record(z.string(), z.number()).optional(),
-  outputTokensDetails: z.record(z.string(), z.number()).optional(),
+  inputTokensDetails: TokenDetails.optional(),
+  outputTokensDetails: TokenDetails.optional(),
   endpoint: z.string().optional(),
 });
 
@@ -933,17 +1001,9 @@ export const UsageData = z.object({
   inputTokens: z.number(),
   outputTokens: z.number(),
   totalTokens: z.number(),
-  inputTokensDetails: z
-    .union([
-      z.record(z.string(), z.number()),
-      z.array(z.record(z.string(), z.number())),
-    ])
-    .optional(),
+  inputTokensDetails: z.union([TokenDetails, z.array(TokenDetails)]).optional(),
   outputTokensDetails: z
-    .union([
-      z.record(z.string(), z.number()),
-      z.array(z.record(z.string(), z.number())),
-    ])
+    .union([TokenDetails, z.array(TokenDetails)])
     .optional(),
   requestUsageEntries: z.array(RequestUsageData).optional(),
 });

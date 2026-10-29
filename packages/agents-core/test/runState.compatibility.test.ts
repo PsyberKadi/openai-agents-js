@@ -120,6 +120,10 @@ describe('historical RunState compatibility corpus', () => {
       '1.17',
       '1.18',
       '1.19',
+      '1.20',
+      '1.21',
+      '1.22',
+      '1.23',
     ]);
     expect(
       manifest.schemas
@@ -130,7 +134,7 @@ describe('historical RunState compatibility corpus', () => {
       manifest.schemas
         .filter((entry) => entry.status === 'current_unreleased')
         .map((entry) => entry.schemaVersion),
-    ).toEqual(['1.20']);
+    ).toEqual(['1.24']);
   });
 
   it('pins every fixture to immutable bytes and complete writer provenance', () => {
@@ -184,7 +188,7 @@ describe('historical RunState compatibility corpus', () => {
           readJson('expected/v1.0-normalized-current.json'),
         );
       }
-      expect(firstRewrite.$schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+      expect(firstRewrite.$schemaVersion).toBe('1.23');
       expectJsonScalars(firstRewrite);
 
       const rewritten = await RunState.fromString(
@@ -194,6 +198,163 @@ describe('historical RunState compatibility corpus', () => {
       expect(JSON.parse(rewritten.toString())).toEqual(firstRewrite);
     },
   );
+
+  it.each(['aggregate', 'request'] as const)(
+    'rejects excessively nested %s usage in persisted state',
+    async (location) => {
+      const snapshot = readJson<any>('historical/v1.22-minimal.json');
+      snapshot.$schemaVersion = CURRENT_SCHEMA_VERSION;
+      let details: Record<string, unknown> = { count: 1 };
+      for (let i = 1; i < 4_000; i++) details = { nested: details };
+      if (location === 'aggregate') {
+        snapshot.context.usage.inputTokensDetails = [details];
+      } else {
+        snapshot.context.usage.requestUsageEntries = [
+          {
+            inputTokens: 1,
+            outputTokens: 0,
+            totalTokens: 1,
+            outputTokensDetails: details,
+          },
+        ];
+      }
+      await expect(
+        RunState.fromString(
+          new Agent({ name: 'HistoricalAgent' }),
+          JSON.stringify(snapshot),
+        ),
+      ).rejects.toThrow(/32 levels/);
+    },
+  );
+
+  it.each(['context', 'modelResponse', 'lastModelResponse'] as const)(
+    'chooses the writer version from all %s usage locations',
+    async (location) => {
+      const agent = new Agent({ name: 'HistoricalAgent' });
+      for (const requestEntry of [false, true]) {
+        for (const direction of [
+          'inputTokensDetails',
+          'outputTokensDetails',
+        ] as const) {
+          for (const value of [
+            42,
+            { nested: 42 },
+            'new',
+            true,
+            null,
+            [],
+            [42],
+          ]) {
+            const snapshot = readJson<any>('historical/v1.23-minimal.json');
+            const usage = { ...snapshot.context.usage };
+            const details = { provider: value };
+            if (requestEntry) {
+              usage.requestUsageEntries = [
+                {
+                  inputTokens: 1,
+                  outputTokens: 0,
+                  totalTokens: 1,
+                  [direction]: details,
+                },
+              ];
+            } else {
+              usage[direction] = [details];
+            }
+            if (location === 'context') snapshot.context.usage = usage;
+            else if (location === 'modelResponse')
+              snapshot.modelResponses = [{ usage, output: [] }];
+            else snapshot.lastModelResponse = { usage, output: [] };
+            const restored = await RunState.fromString(
+              agent,
+              JSON.stringify(snapshot),
+            );
+            const written = restored.toJSON();
+            const numeric =
+              typeof value === 'number' ||
+              (value !== null &&
+                !Array.isArray(value) &&
+                typeof value === 'object');
+            expect(written.$schemaVersion).toBe(numeric ? '1.23' : '1.24');
+            const rewritten = await RunState.fromString(
+              agent,
+              JSON.stringify(written),
+            );
+            expect(rewritten.toJSON()).toEqual(written);
+            const savedUsage =
+              location === 'context'
+                ? written.context.usage
+                : location === 'modelResponse'
+                  ? written.modelResponses[0].usage
+                  : written.lastModelResponse!.usage;
+            expect(
+              requestEntry
+                ? savedUsage.requestUsageEntries![0][direction]
+                : savedUsage[direction]![0],
+            ).toEqual(details);
+          }
+        }
+      }
+    },
+  );
+
+  it('propagates newer nested formats without rewriting nested snapshots', async () => {
+    const agent = new Agent({ name: 'HistoricalAgent' });
+    const makeState = () =>
+      RunState.fromString(agent, readFixture('historical/v1.23-minimal.json'));
+    const child = await makeState();
+    const parent = await makeState();
+    child.usage.inputTokensDetails = [{ cached: { tokens: 1 } }];
+    parent._pendingAgentToolRuns.set('child', child.toString());
+    expect(parent.toJSON().$schemaVersion).toBe('1.23');
+    child.usage.inputTokensDetails = [{ provider: 'rich' }];
+    const childBytes = child.toString();
+    parent._pendingAgentToolRuns.set('child', childBytes);
+    expect(parent.toJSON().$schemaVersion).toBe('1.24');
+    expect(parent.toJSON().pendingAgentToolRuns.child).toBe(childBytes);
+    const grandparent = await makeState();
+    grandparent._pendingAgentToolRuns.set('parent', parent.toString());
+    expect(grandparent.toJSON().$schemaVersion).toBe('1.24');
+    for (const opaque of [
+      'invalid',
+      'null',
+      '{}',
+      '{"$schemaVersion":"9.0"}',
+    ]) {
+      parent._pendingAgentToolRuns.set('child', opaque);
+      expect(parent.toJSON().$schemaVersion).toBe('1.24');
+      expect(parent.toJSON().pendingAgentToolRuns.child).toBe(opaque);
+    }
+  });
+
+  it('preserves flat usage when upgrading a schema 1.22 snapshot', async () => {
+    const historical = readJson<any>('historical/v1.22-minimal.json');
+    const entry = {
+      inputTokens: 100,
+      outputTokens: 20,
+      totalTokens: 120,
+      inputTokensDetails: { cached_tokens: 40, cache_write_tokens: 10 },
+      outputTokensDetails: { reasoning_tokens: 5 },
+      endpoint: 'responses.create',
+    };
+    historical.context.usage = {
+      ...entry,
+      requests: 1,
+      inputTokensDetails: [entry.inputTokensDetails],
+      outputTokensDetails: [entry.outputTokensDetails],
+      requestUsageEntries: [entry],
+    };
+    const restored = await RunState.fromString(
+      new Agent({ name: 'HistoricalAgent' }),
+      JSON.stringify(historical),
+    );
+    expect(restored.usage).toMatchObject({
+      requests: 1,
+      totalTokens: 120,
+      inputTokensDetails: [entry.inputTokensDetails],
+      requestUsageEntries: [entry],
+    });
+    expect(restored.toJSON().$schemaVersion).toBe('1.23');
+  });
 
   it('preserves released mid-turn server continuation identifiers', async () => {
     const restored = await RunState.fromString(
@@ -206,7 +367,7 @@ describe('historical RunState compatibility corpus', () => {
     expect(restored._previousResponseId).toBe('response-historical');
   });
 
-  it('approves and resumes a released nested-agent interruption', async () => {
+  it('requires a fresh run for released pending functions without input validation evidence', async () => {
     let executions = 0;
     const { outerAgent, outerModel } = createNestedApprovalAgents(() => {
       executions += 1;
@@ -219,15 +380,14 @@ describe('historical RunState compatibility corpus', () => {
     expect(approval?.agent.name).toBe('NestedAgent');
 
     restored.approve(approval!);
-    const result = await new Runner().run(outerAgent, restored);
-
-    expect(result.finalOutput).toBe('Outer done');
-    expect(result.interruptions).toEqual([]);
-    expect(executions).toBe(1);
-    expect(outerModel.requests).toHaveLength(1);
+    await expect(new Runner().run(outerAgent, restored)).rejects.toThrow(
+      /initial input guardrails is unverified/,
+    );
+    expect(executions).toBe(0);
+    expect(outerModel.requests).toHaveLength(0);
   });
 
-  it('rejects and resumes a released nested-agent interruption', async () => {
+  it('does not execute an unknown legacy parent even when its child was rejected', async () => {
     let executions = 0;
     const { outerAgent } = createNestedApprovalAgents(() => {
       executions += 1;
@@ -239,14 +399,35 @@ describe('historical RunState compatibility corpus', () => {
     const approval = restored.getInterruptions()[0];
 
     restored.reject(approval!);
-    const result = await new Runner().run(outerAgent, restored);
-
-    expect(result.finalOutput).toBe('Outer done');
-    expect(result.interruptions).toEqual([]);
+    await expect(new Runner().run(outerAgent, restored)).rejects.toThrow(
+      /initial input guardrails is unverified/,
+    );
     expect(executions).toBe(0);
   });
 
-  it('resumes after a released committed side effect without executing it again', async () => {
+  it('preserves a released pending child rejection but requires a fresh run', async () => {
+    let executions = 0;
+    const { nestedAgent } = createNestedApprovalAgents(() => {
+      executions += 1;
+    });
+    const snapshot = JSON.parse(
+      readFixture('historical/v1.2-nested-approval.json'),
+    );
+    const restored = await RunState.fromString(
+      nestedAgent,
+      snapshot.pendingAgentToolRuns['nested_tool:outer-call'],
+    );
+    restored.reject(restored.getInterruptions()[0], {
+      message: 'historical rejection',
+    });
+    await expect(
+      new Runner({ tracingDisabled: true }).run(nestedAgent, restored),
+    ).rejects.toThrow(/initial input guardrails is unverified/);
+    expect(executions).toBe(0);
+    expect(JSON.stringify(restored.toJSON())).toContain('historical rejection');
+  });
+
+  it('rejects a released checkpoint without replaying its committed side effect', async () => {
     let executions = 0;
     const finalModel = new QueueModel([[message('done')]]);
     const sideEffectTool = tool({
@@ -268,30 +449,14 @@ describe('historical RunState compatibility corpus', () => {
       readFixture('historical/v1.17-side-effect-committed.json'),
     );
 
-    const result = await new Runner().run(agent, restored);
-
-    expect(result.finalOutput).toBe('done');
+    await expect(new Runner().run(agent, restored)).rejects.toThrow(
+      /initial input guardrails is unverified/,
+    );
     expect(executions).toBe(0);
-    expect(finalModel.requests).toHaveLength(1);
-    const resumedInput = finalModel.requests[0]!.input;
-    expect(Array.isArray(resumedInput)).toBe(true);
-    if (!Array.isArray(resumedInput)) {
-      throw new Error('Expected resumed model input to be an item array.');
-    }
-    expect(
-      resumedInput.filter(
-        (item) =>
-          item.type === 'function_call' && item.callId === 'side-effect-call',
-      ),
-    ).toHaveLength(1);
-    expect(
-      resumedInput.filter(
-        (item) =>
-          item.type === 'function_call_result' &&
-          item.callId === 'side-effect-call' &&
-          item.output === 'side effect completed',
-      ),
-    ).toHaveLength(1);
+    expect(finalModel.requests).toHaveLength(0);
+    expect(JSON.stringify(restored.toJSON())).toContain(
+      'side effect completed',
+    );
   });
 
   it('honors an exact rejection from the released schema 1.18 writer', async () => {
@@ -343,7 +508,7 @@ describe('historical RunState compatibility corpus', () => {
         buildCall('other-call'),
       ),
     ).toBe(true);
-    expect(restored.toJSON().$schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(restored.toJSON().$schemaVersion).toBe('1.23');
   });
 
   it.each(manifest.negativeFixtures.filter((fixture) => fixture.expectedError))(
@@ -466,7 +631,7 @@ function createNestedApprovalAgents(onExecute: () => void) {
     tools: [nestedTool],
     modelSettings: { toolChoice: 'required' },
   });
-  return { outerAgent, outerModel };
+  return { outerAgent, outerModel, nestedAgent };
 }
 
 function message(text: string): ModelResponse['output'][number] {

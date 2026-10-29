@@ -1,6 +1,6 @@
 {
   "formatVersion": 1,
-  "currentSchemaAtCreation": "1.20",
+  "currentSchemaAtCreation": "1.24",
   "schemas": [
     {
       "schemaVersion": "1.0",
@@ -332,15 +332,79 @@
     },
     {
       "schemaVersion": "1.20",
+      "status": "published_writer",
+      "packageVersion": "0.18.0",
+      "tag": "v0.18.0",
+      "commit": "71abeaad1aac7b984ba4839a6453b36d30b9ecfd",
+      "npmIntegrity": "sha512-EMhTxl1iHX+bH3gGUnkSxU8l+fw36/+mjsvZH7zP3MyPBZ/4Zqtjg9oILcbZCkcLvii/+M+4ckck3MMdrpcWRA==",
+      "fixtures": [
+        {
+          "scenario": "minimal",
+          "kind": "minimal",
+          "path": "historical/v1.20-minimal.json",
+          "sha256": "d0b04e02da08785999fbdb02e2478903371358408015d112c6c0c663578d75cb"
+        }
+      ]
+    },
+    {
+      "schemaVersion": "1.21",
+      "status": "published_writer",
+      "packageVersion": "0.19.0",
+      "tag": "v0.19.0",
+      "commit": "5ef4f233425ebf3f000cef7491ebdd27bf45ddfc",
+      "npmIntegrity": "sha512-TCK6yEsTlpgCcKfQvqNWhWcWv56750tkDwlxLOY5rAujTIHWBoJ0eVrFoL1jxqcpxR3vAPt80qWJ2nCzRMvESQ==",
+      "fixtures": [
+        {
+          "scenario": "minimal",
+          "kind": "minimal",
+          "path": "historical/v1.21-minimal.json",
+          "sha256": "5cce048bd38ac9a27634e9cbcb6ec2af12778f8fd154fa179c166aa94f0b9e3b"
+        }
+      ]
+    },
+    {
+      "schemaVersion": "1.22",
+      "status": "published_writer",
+      "packageVersion": "0.20.0",
+      "tag": "v0.20.0",
+      "commit": "33e2741be9bb52c1d96a8b4dac0c68e46297b607",
+      "npmIntegrity": "sha512-9nJJ3iyQTwO2kmrZJPMqnHI61g3xp2DgtpW4V0cgNtYot5jocDqAMN5+dkjtsBo64U3Wbl7rIAV0q5kvycoIIA==",
+      "fixtures": [
+        {
+          "scenario": "minimal",
+          "kind": "minimal",
+          "path": "historical/v1.22-minimal.json",
+          "sha256": "bf3237949550f307b5903947b394e9a54de18717c8e3231bcff3007028c141bd"
+        }
+      ]
+    },
+    {
+      "schemaVersion": "1.23",
+      "status": "published_writer",
+      "packageVersion": "0.21.0",
+      "tag": "v0.21.0",
+      "commit": "304e436185ad5d7e54d240896efa728533147cf3",
+      "npmIntegrity": "sha512-P2jJhc85xrKpe9GUOHAVfPHqK52my49fD1CI0LnfYEvBUwZxJXQI6lgSwby9nWhvQECveM9OvBUglAXuArsHXw==",
+      "fixtures": [
+        {
+          "scenario": "minimal",
+          "kind": "minimal",
+          "path": "historical/v1.23-minimal.json",
+          "sha256": "a353188d411d534266b6c76992e7ff208ec8879c35eaac1a7f105be782789870"
+        }
+      ]
+    },
+    {
+      "schemaVersion": "1.24",
       "status": "current_unreleased",
-      "reason": "Supported on main but not emitted by the latest released package v0.17.0; adds sandbox envelope version 5 for Docker labels."
+      "reason": "Preserves bounded JSON token usage metadata and adds sandbox envelope version 6 for client-owned environment preparation."
     }
   ],
   "expectedNormalizedFixtures": [
     {
       "sourceSchemaVersion": "1.0",
       "path": "expected/v1.0-normalized-current.json",
-      "sha256": "d0b04e02da08785999fbdb02e2478903371358408015d112c6c0c663578d75cb"
+      "sha256": "d786cbafb734a9ed119bf268ccd759c947d1319b65acc55af8435223ca7250ae"
     }
   ],
   "negativeFixtures": [

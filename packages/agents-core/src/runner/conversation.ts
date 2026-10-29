@@ -1,6 +1,6 @@
 import { Agent, AgentOutputType } from '../agent';
 import { UserError } from '../errors';
-import { RunInputItem, RunItem } from '../items';
+import { RunInputItem, RunItem, RunToolSearchOutputItem } from '../items';
 import { ModelResponse } from '../model';
 import { RunContext } from '../runContext';
 import { AgentInputItem } from '../types';
@@ -353,6 +353,19 @@ function consumeCorrelationCount(
   return true;
 }
 
+// SDK discovery ownership does not change the item already stored by the provider.
+function getServerItemKey(item: AgentInputItem): string {
+  if (item.type === 'tool_search_output') {
+    const {
+      toolSearchAgentName: _owner,
+      toolSearchMcpToolNames: _provenance,
+      ...providerItem
+    } = item;
+    return getAgentInputItemKey(providerItem);
+  }
+  return getAgentInputItemKey(item);
+}
+
 /**
  * Tracks which items have already been sent to or received from the Responses API when the caller
  * supplies `conversationId`/`previousResponseId`. This ensures we only send the delta each turn.
@@ -425,7 +438,7 @@ export class ServerConversationTracker {
       for (const item of response.output) {
         if (item && typeof item === 'object') {
           this.serverItems.add(item);
-          serverItemKeys.add(getAgentInputItemKey(item as AgentInputItem));
+          serverItemKeys.add(getServerItemKey(item as AgentInputItem));
         }
       }
     }
@@ -452,7 +465,7 @@ export class ServerConversationTracker {
         if (!rawItem || typeof rawItem !== 'object') {
           continue;
         }
-        const rawItemKey = getAgentInputItemKey(rawItem as AgentInputItem);
+        const rawItemKey = getServerItemKey(rawItem as AgentInputItem);
         if (item instanceof RunInputItem) {
           this.sentItems.add(rawItem);
           continue;
@@ -479,13 +492,33 @@ export class ServerConversationTracker {
    * Records the raw items returned by the server so future delta calculations skip them.
    * Also captures the latest response identifier to chain follow-up calls when possible.
    */
-  trackServerItems(modelResponse: ModelResponse | undefined) {
+  trackServerItems(
+    modelResponse: ModelResponse | undefined,
+    processedItems: RunItem[] = [],
+  ) {
     if (!modelResponse) {
       return;
     }
     for (const item of modelResponse.output) {
       if (item && typeof item === 'object') {
         this.serverItems.add(item);
+      }
+    }
+    const searchOutputs = processedItems.filter(
+      (item): item is RunToolSearchOutputItem =>
+        item instanceof RunToolSearchOutputItem,
+    );
+    if (searchOutputs.length > 0) {
+      const serverSearchKeys = new Set(
+        modelResponse.output
+          .filter((item) => item.type === 'tool_search_output')
+          .map(getServerItemKey),
+      );
+      // A client-generated result is unsent unless the response actually contains that output.
+      for (const item of searchOutputs) {
+        if (serverSearchKeys.has(getServerItemKey(item.rawItem))) {
+          this.serverItems.add(item.rawItem);
+        }
       }
     }
     if (!this.conversationId && modelResponse.responseId) {

@@ -7,6 +7,7 @@ import { Code } from '@astrojs/starlight/components';
 import toolsFunctionExample from '../../../../../examples/docs/tools/functionTools.ts?raw';
 import toolsHostedToolsExample from '../../../../../examples/docs/tools/hostedTools.ts?raw';
 import localBuiltInToolsExample from '../../../../../examples/docs/tools/localBuiltInTools.ts?raw';
+import computerSafetyChecksExample from '../../../../../examples/docs/tools/computerSafetyChecks.ts?raw';
 import nonStrictSchemaTools from '../../../../../examples/docs/tools/nonStrictSchemaTools.ts?raw';
 import toolSearchExample from '../../../../../examples/docs/tools/toolSearch.ts?raw';
 import agentsAsToolsExample from '../../../../../examples/docs/tools/agentsAsTools.ts?raw';
@@ -54,14 +55,16 @@ The SDK provides helper functions that return hosted tool definitions:
 
 | Helper function | Notes |
 | --- | --- |
-| `webSearchTool(options?)` | JS-friendly options such as `searchContextSize`, `userLocation`, and `filters.allowedDomains`. |
+| `webSearchTool(options?)` | JS-friendly options such as `searchContextSize`, `userLocation`, `filters.allowedDomains`, `searchContentTypes`, and `imageSettings`. |
 | `fileSearchTool(ids, options?)` | Accepts one or more vector store IDs as the first argument, plus options like `maxNumResults`, `includeSearchResults`, `rankingOptions`, and filters. |
 | `codeInterpreterTool(options?)` | Defaults to an auto-managed container when no `container` is provided. |
 | `imageGenerationTool(options?)` | Supports image generation configuration such as `model`, `size`, `quality`, `background`, `inputFidelity`, `inputImageMask`, `moderation`, `outputCompression`, `partialImages`, and output format. |
 | `toolSearchTool(options?)` | Adds the built-in `tool_search` helper. Pair it with deferred function tools or hosted MCP tools that set `deferLoading: true`. Supports hosted execution by default or client execution with `execution: 'client'` plus `execute`. |
 | `programmaticToolCallingTool()` | Enables Programmatic Tool Calling. Pair it with tools whose `allowedCallers` includes `'programmatic'`. |
 
-These helpers map JavaScript/TypeScript-friendly option names to the underlying OpenAI Responses API tool payloads. Refer to the official [OpenAI tools guide](https://developers.openai.com/api/docs/guides/tools) for the full tool schemas and advanced options like ranking options or semantic filters, the official [Tool search guide](https://developers.openai.com/api/docs/guides/tools-tool-search) for the current built-in tool-search flow and model availability, and the official [Programmatic Tool Calling guide](https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling) for model support and wire-level behavior.
+These helpers map JavaScript/TypeScript-friendly option names to the underlying OpenAI Responses API tool payloads. To request image search results, include `'image'` in `webSearchTool({ searchContentTypes })`. Use `imageSettings.maxResults` to request a positive number of images and `imageSettings.caption` to request captions when available. The SDK requests raw web search results whenever `searchContentTypes` includes `'image'` and exposes the returned image URLs and metadata on the web search call item's `providerData.results`.
+
+Refer to the official [OpenAI tools guide](https://developers.openai.com/api/docs/guides/tools) for the full tool schemas and advanced options like ranking options or semantic filters, the official [Web search guide](https://developers.openai.com/api/docs/guides/tools-web-search#image-search-results) for image result fields, the official [Tool search guide](https://developers.openai.com/api/docs/guides/tools-tool-search) for the current built-in tool-search flow and model availability, and the official [Programmatic Tool Calling guide](https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling) for model support and wire-level behavior.
 
 ---
 
@@ -97,6 +100,31 @@ To use OpenAI's current computer-use path, set a computer-capable model such as 
 GA computer calls can contain batched `actions[]` in a single `computer_call`. The SDK executes them in order, evaluates `needsApproval` against each action, and returns the final screenshot as the tool output. If you build an approval UI from `interruption.rawItem`, read `actions` when present and fall back to `action` for legacy preview items.
 
 Use `needsApproval` when high-impact computer actions should pause for user review, and `onSafetyCheck` when you want to acknowledge or reject the pending safety checks reported for a computer call. For model-side guidance and migration details, see the official [OpenAI computer use guide](https://developers.openai.com/api/docs/guides/tools-computer-use/) and its [migration note](https://developers.openai.com/api/docs/guides/tools-computer-use/#migration-from-computer-use-preview).
+
+##### Pending computer safety checks
+
+The Responses API can include `pending_safety_checks` in a `computer_call` to flag concerns for your application to review. Each check has an `id` and optional `code` and `message` fields that describe the type of concern and provide details. These checks come from the API. See the [Responses API reference](https://developers.openai.com/api/reference/resources/responses/methods/create) for `pending_safety_checks` and `acknowledged_safety_checks`, and the [computer-use safety guidance](https://developers.openai.com/api/docs/guides/tools-computer-use#run-safely) for application-level precautions.
+
+Configure `computerTool({ onSafetyCheck })` to decide whether to proceed with a flagged computer call. The JavaScript SDK passes checks with non-empty `id` and `code` values to this callback and ignores checks missing either value. The SDK invokes the callback before executing the call's actions, only when at least one check meets these requirements.
+
+The callback receives `{ runContext, pendingSafetyChecks, toolCall }` and handles the checks passed in `pendingSafetyChecks`:
+
+- Return `true` to acknowledge all checks passed to the callback and allow execution.
+- Return `false` to reject the call before its actions or screenshot execute. The SDK returns a rejection result and lets the agent run continue.
+- Return an object containing `acknowledgedSafetyChecks` (or `acknowledged_safety_checks`) to acknowledge the supplied checks and allow execution. A partial or empty list does not reject the call.
+- Return `undefined` or no value to allow execution without acknowledgment.
+
+If `onSafetyCheck` is omitted, the SDK proceeds with execution and leaves the checks unacknowledged. The SDK does not prompt a person automatically. Configure the callback explicitly when your application requires review of the checks the SDK forwards. For example, this conservative policy rejects every call passed to the callback:
+
+<Code
+  lang="typescript"
+  code={computerSafetyChecksExample}
+  title="Reject flagged computer calls"
+/>
+
+To allow reviewed calls, replace the example callback with a callback that presents `pendingSafetyChecks` and the proposed `toolCall` to your application's reviewer, waits for a decision, and returns that decision. Treat unknown check codes as requiring review as well.
+
+Computer calls without pending checks do not invoke this callback. To collect a person's decision, your callback must arrange that interaction and return the decision; `onSafetyCheck` does not use the pause-and-resume flow described in [Human-in-the-loop](/openai-agents-js/guides/human-in-the-loop). Use `needsApproval` when your application requires that approval flow for computer actions, including calls that do not invoke `onSafetyCheck`.
 
 #### Shell tool specifics
 
@@ -160,6 +188,12 @@ You can turn **any** function into a tool with the `tool()` helper.
 | `inputGuardrails` | No | Guardrails that run before the tool executes; can reject or throw. See [Guardrails](/openai-agents-js/guides/guardrails#tool-guardrails). |
 | `outputGuardrails` | No | Guardrails that run after the tool executes; can reject or throw. See [Guardrails](/openai-agents-js/guides/guardrails#tool-guardrails). |
 
+#### Conditional tool availability
+
+Use `isEnabled` for request-scoped capability visibility, environment-specific availability, feature flags, or experiments. The runner evaluates the predicate while preparing the model-visible tool set for the current turn.
+
+`isEnabled` does not replace authorization that depends on the tool arguments or the resource being accessed, because the predicate runs before the model produces those arguments. Enforce argument- and resource-level authorization inside `execute`, or add [tool input guardrails](/openai-agents-js/guides/guardrails#tool-guardrails) and [approvals](/openai-agents-js/guides/human-in-the-loop) when appropriate. MCP servers must authorize their own protected operations. See [Context management](/openai-agents-js/guides/context#use-local-context-for-capability-visibility) for a pattern that applies one application policy across function tools, local MCP tools, and handoffs.
+
 Supported Standard Schema parameters are converted to JSON Schema for the model and validated locally before `execute` runs. The validation output type, including library transforms and defaults, becomes the inferred `execute` argument type. See [Schema validation](/openai-agents-js/guides/schemas) for a Valibot example and current limitations.
 
 #### SDK-only custom data
@@ -215,6 +249,7 @@ When you use tool search:
 - Leave `modelSettings.toolChoice` on `'auto'`. The SDK rejects forcing the built-in `tool_search` tool or a deferred function tool by name.
 - Hosted execution is the default. If you set `toolSearchTool({ execution: 'client', execute })`, the standard `run()` loop only supports the built-in `{ paths: string[] }` client query shape; custom client-side schemas require your own Responses loop.
 - A namespace can mix immediate and deferred members. Immediate members stay callable without tool search, while deferred members in the same namespace are loaded on demand.
+- Tool discovery belongs to the Agent that performed the search and does not transfer through a handoff. The SDK preserves discovery for the same logical Agent across history or Session replay when that Agent's name is unique in the run graph. Missing or ambiguous ownership requires a new search, so give Agents unique names when persisted discovery must survive reconstruction.
 - Deferred function tools and `toolNamespace()` are Responses-only. Chat Completions rejects them, and the AI SDK adapter does not support deferred Responses tool-loading flows.
 
 ---
@@ -357,7 +392,7 @@ Structured outputs also change failure handling:
 - To use `'error_as_result'`, provide a `timeoutErrorFunction` whose return value satisfies `outputSchema`.
 - A value substituted by an output guardrail must also satisfy `outputSchema`.
 
-Programmatic Tool Calling is Responses-only. Chat Completions, Realtime agents, and the AI SDK model adapter reject these options. When an eligible tool is deferred, tool search must load it before a later generated program can call it.
+Programmatic Tool Calling is Responses-only. Chat Completions, Voice agents, and the AI SDK model adapter reject these options. When an eligible tool is deferred, tool search must load it before a later generated program can call it.
 
 See [`examples/tools/programmatic-tool-calling.ts`](https://github.com/openai/openai-agents-js/tree/main/examples/tools/programmatic-tool-calling.ts) for a complete example.
 
